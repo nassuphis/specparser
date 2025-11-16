@@ -114,7 +114,7 @@ from itertools import product
 from typing import List, Tuple, Union, Iterable, Optional, Dict
 import operator as op
 import ast
-from simpleeval import SimpleEval
+from simpleeval import SimpleEval,  EvalWithCompoundTypes
 import numpy as np
 
 # =========================
@@ -618,13 +618,14 @@ FUNCS = {
 }
 
 # in expandspec.py, near top
-DEBUG_EVAL = True  # flip to True temporarily
+DEBUG_EVAL = False # flip to True temporarily
 
 # replace _eval_fcall_body with same body + debug prints
 def _eval_fcall_body(expr: str) -> Optional[list[str]]:
     s = expr.strip()
     try:
-        se = SimpleEval(names=NAMES, functions=FUNCS, operators=ALLOWED_OPS)
+        #se = SimpleEval(names=NAMES, functions=FUNCS, operators=ALLOWED_OPS)
+        se = EvalWithCompoundTypes(names=NAMES, functions=FUNCS, operators=ALLOWED_OPS)
         v = se.eval(s)
         if isinstance(v, str):
             return [v]

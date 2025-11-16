@@ -1,3 +1,10 @@
+# suff to exclude
+*.pdf 
+*.out 
+*.aux 
+*.log 
+*.tex 
+*.toc 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

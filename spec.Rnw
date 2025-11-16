@@ -1,0 +1,60 @@
+\documentclass{article}
+\usepackage[portrait, headheight = 0cm, margin=0.25cm, top = 0.25cm]{geometry} 
+\usepackage{graphicx}
+\usepackage[dvipsnames,table]{xcolor}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{pdfpages}
+\usepackage[export]{adjustbox} 
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{shadings,arrows.meta,positioning,calc,intersections}
+\usepackage{hyperref}
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true
+}
+\usepackage{array} % ensure m{} columns work
+\usepackage{enumitem}  % to control list spacing
+<<setup, include=FALSE>>=
+run_code <- FALSE   # or FALSE to disable execution
+@
+
+
+\title{
+\vskip 10cm
+{\bf\huge Spec Parser, Expander}
+\vskip 3cm
+}
+\author{Wigerich}
+
+\begin{document}
+\maketitle
+
+\newpage
+\tableofcontents
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newpage
+\section{{specexpander}}
+
+<<, engine='bash', echo=TRUE, eval=TRUE>>=
+./expandspec.py --selftest-verbose
+@
+
+\newpage
+\section{specparser}
+
+<<, engine='bash', echo=TRUE, eval=TRUE>>=
+./specparser.py --selftest-verbose
+@
+
+
+
+\end{document}
+
