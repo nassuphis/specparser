@@ -130,7 +130,7 @@ def _strip_nonfunctional_prefix(raw: str) -> str:
     s = raw.lstrip()
     return s[1:] if s.startswith("_") else raw
 
-def _split_top_level(s: str, sep: str) -> list[str]:
+def split_top_level(s: str, sep: str) -> list[str]:
     out, buf, depth = [], [], 0
     opens = "([{"; closes = ")]}"
     pairs = dict(zip(closes, opens))
@@ -153,7 +153,7 @@ def _split_top_level(s: str, sep: str) -> list[str]:
 def extract_used_names(chain: str) -> set[str]:
     if not chain.strip():
         return set()
-    items = _split_top_level(chain, ",")
+    items = split_top_level(chain, ",")
     return {item.split(":", 1)[0].lower() for item in items if item}
 
 
@@ -161,9 +161,9 @@ def split_chain(chain: str):
     out = {}
     if not chain.strip():
         return out
-    items = _split_top_level(chain, ",")
+    items = split_top_level(chain, ",")
     for item in items:
-        parts = _split_top_level(item, ":")  # colon only at top level
+        parts = split_top_level(item, ":")  # colon only at top level
         if not parts:
             continue
         name_raw = parts[0].strip()
@@ -178,9 +178,9 @@ def parse_chain(chain: str, MAXA: int = 12):
     out = []
     if not chain.strip():
         return out
-    items = _split_top_level(chain, ",")
+    items = split_top_level(chain, ",")
     for item in items:
-        parts = _split_top_level(item, ":")
+        parts = split_top_level(item, ":")
         if not parts:
             continue
         name_raw = parts[0].strip()
@@ -336,6 +336,7 @@ def main(argv=None) -> int:
         description="Parse pipeline spec 'op:arg1:arg2,op2:arg1,...' into names and complex args."
     )
     ap.add_argument("--spec", required=False, help="Spec string (no quoting/escaping).")
+    ap.add_argument("--split", required=False, help="Split only")
     ap.add_argument("--maxa", type=int, default=12, help="Max args per op (default: 12).")
     ap.add_argument(
         "--const", action="append", default=[],
@@ -353,6 +354,12 @@ def main(argv=None) -> int:
     if args.selftest or args.selftest_verbose:
         rc = _run_selftests(verbose=args.selftest_verbose)
         return rc
+    
+    if args.split:
+        ss = split_chain(args.split)
+        for i,(n,v) in enumerate(ss.items()):
+            print(f"{i} {n}:{v}")
+        return True
     
     # enforce --spec only if not selftesting
     if not args.spec:

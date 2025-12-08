@@ -604,17 +604,27 @@ def seq(start,end,num):
     out=[f"{x}" for x in vec]
     return out
 
+def seqi(start,end,num,i):
+    vec = np.linspace(start,end,num)
+    out=[f"{x}" for x in vec]
+    return out[i]
+
 def ctoi(z):
     return int(z.real)
 
 def rv(z):
     return z.real
 
+def istr(z):
+    return f"{int(z.real)}"
+
 FUNCS = {
     # pick only what you truly need
     "seq": seq, 
+    "seqi": seqi,
     "ctoi": ctoi,
     "rv": rv,
+    "istr": istr,
 }
 
 # in expandspec.py, near top
@@ -1134,7 +1144,7 @@ def _cli():
         prog="expandspec",
         description="Expand specs: lists [..], ranges {..}, selectors @{..}, refs #{n} (n is the list-like ordinal).",
     )
-    p.add_argument("--in", dest="spec", help="Spec string to expand. If omitted, read from stdin.")
+    p.add_argument("--spec", dest="spec", help="Spec string to expand. If omitted, read from stdin.")
     p.add_argument("--names", help="Path to names file (json or newline list) for @{...} selectors.")
     p.add_argument("--sep", default="\n", help="Separator used when printing results (default: newline).")
     p.add_argument("--json", action="store_true", help="Emit JSON array instead of joined text.")

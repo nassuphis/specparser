@@ -39,16 +39,526 @@ run_code <- FALSE   # or FALSE to disable execution
 \tableofcontents
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{Specification Expansion (\texttt{expandspec.py})}
+
+The file \texttt{expandspec.py} implements a compact, strictly–defined domain-specific
+language (DSL) for generating Cartesian products of symbolic parameters.  
+It is used throughout the toolchain to turn short, human-readable spec strings into
+enumerated lists of fully–expanded parameter combinations.
+
+\subsection*{Core Concepts}
+
+A spec string is composed of \emph{literals} and several structured constructs.  
+Left–to–right parsing identifies \emph{list–like units}. These units are expanded
+independently, and their Cartesian product defines the final output.  
+References (\verb|#{n}|) allow one list–like unit to mirror the selection of another.
+
+The supported constructs are:
+
+\begin{itemize}[itemsep=1ex]
+  \item \textbf{Cartesian list} \verb|[a,b,c]|  
+    Produces the union of items inside the brackets.  
+    Items may contain one numeric range \verb|{...}| or one dictionary selector
+    \verb|@{...}|. Nested brackets are not interpreted as lists.
+
+  \item \textbf{Progressive list} \verb|>[a,b,c]|  
+    Expands to prefix–accumulating lists:  
+    \verb|a|, \verb|a,b|, \verb|a,b,c|.  
+    Each item uses the same rules as a Cartesian list element.
+
+  \item \textbf{Numeric range} \verb|{a:b[:c]}|  
+    Produces a sequence of numeric values.  
+    The system supports integer ranges, integer or floating step sizes, and
+    “sample count” semantics when the third field is interpreted as a number of
+    evenly-spaced samples. Zero-padding is preserved when present.
+
+  \item \textbf{Dictionary selector} \verb|@{regex}|  
+    Expands to all names matching the regular expression.  
+    Full \verb|/pat/flags| syntax is supported, including \texttt{i} and \texttt{m}.  
+    If no names are supplied, the selector is left literal.
+
+  \item \textbf{Expression call} \verb|${ ... }|  
+    The body is evaluated using a restricted expression evaluator.  
+    The result must be a string or an iterable of values.  
+    These values become a list-like unit. Unknown or invalid expressions remain
+    literal.
+
+  \item \textbf{Reference} \verb|#{n}|  
+    Inserts the value chosen for the \(n\)-th list–like unit in the current Cartesian
+    combination.  
+    Referencing is \emph{ordinal only}: list–like units are numbered in the order in
+    which they appear in the spec.
+\end{itemize}
+
+\subsection*{Expansion Semantics}
+
+\begin{itemize}[itemsep=1ex]
+  \item All list-like units (ranges, lists, selectors, \verb|${...}| expressions)
+        become independent dimensions.
+  \item The final output is the full Cartesian product of all dimensions.
+  \item References \verb|#{n}| are resolved \emph{after} a specific combination (tuple
+        of choices) is selected.
+  \item Invalid constructs are preserved literally; the system does not abort.
+  \item No implicit zipping is performed. Zipping is achieved by referencing:
+        one unit can be forced to mirror another by using \verb|#{n}|.
+\end{itemize}
+
+\subsection*{Examples}
+
+\begin{itemize}[itemsep=1ex]
+  \item \verb|[a,b]{1:3}|  
+    expands to \verb|a1|, \verb|a2|, \verb|a3|, \verb|b1|, \verb|b2|, \verb|b3|.
+
+  \item \verb|a{1:3}[p,o,r]-->#{2}|  
+    The range and the list form two dimensions; \verb|#{2}| mirrors the choice from
+    the second one.
+
+  \item \verb|${["x","y"]}::{#{1}}|  
+    The expression produces the list \verb|["x","y"]|, becoming a list-like unit.
+    The reference reproduces the selected item.
+\end{itemize}
+
+\subsection*{CLI Features}
+
+\texttt{expandspec.py} provides a command-line interface with options for sorting,
+deduplication, limiting output, JSON formatting, injecting external name lists, and
+running a full built-in self-test suite.
+
+\medskip
+
+Overall, \texttt{expandspec.py} defines a small but expressive grammar designed to
+cleanly encode parameter sweeps, progressive expansions, symbolic references,
+and numeric grids, while preserving strict parsing rules and predictable Cartesian
+semantics.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \newpage
-\section{{specexpander}}
+\section{{\tt specexpander.py} self-test}
 
 <<, engine='bash', echo=TRUE, eval=TRUE>>=
 ./expandspec.py --selftest-verbose
 @
 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Specification parser}
+\label{sec:specparser}
+
+The file \texttt{specparser.py} implements a small, CLI-oriented parser for
+pipeline specifications of the form \texttt{op:arg1:arg2,op2:arg1,...}.
+The module deliberately keeps operation names as plain strings and only
+evaluates scalar arguments into complex numbers.  This makes it easy to
+plug into different execution back ends while remaining safe to use on
+untrusted command line input.
+
+The module exports the symbols
+\texttt{SpecParseError},
+\texttt{set\_const},
+\texttt{extract\_used\_names},
+\texttt{parse\_chain},
+\texttt{parse\_names\_and\_args} and
+\texttt{parse\_args\_only}.
+
+
+\subsection{Scalar expressions}
+
+Scalar arguments are parsed by a small expression engine built on
+\texttt{simpleeval}.  The helper
+\texttt{\_parse\_scalar(tok: str) -> complex} accepts a token, evaluates
+it in a restricted environment and always returns a Python
+\texttt{complex} number.  This layer supports
+
+\begin{itemize}
+  \item basic arithmetic operators: \texttt{+}, \texttt{-}, \texttt{*},
+        \texttt{/}, \texttt{//}, \texttt{\%\ }, exponentiation
+        \texttt{**} and unary plus and minus;
+  \item the named constants held in the dictionary \texttt{NAMES},
+        initialized with
+        \texttt{pi}, \texttt{tau}, \texttt{e}, \texttt{inf},
+        \texttt{nan}, \texttt{j}, \texttt{i}, \texttt{zero} and
+        \texttt{one};
+  \item the functions registered in \texttt{FUNCS}, namely
+        \texttt{sin}, \texttt{cos}, \texttt{tan},
+        \texttt{sqrt}, \texttt{log}, \texttt{exp},
+        \texttt{abs}, \texttt{min}, \texttt{max} and \texttt{lerp};
+  \item user defined constants added at run time via
+        \texttt{set\_const(name, value)}.
+\end{itemize}
+
+The \texttt{min} and \texttt{max} entries are backed by the helpers
+\texttt{real\_min} and \texttt{real\_max}, which compare only the real
+parts of their arguments, so expressions such as
+\texttt{max(3+4j, 1+100j)} return \texttt{3+0j}.
+
+If evaluation via \texttt{simpleeval} fails, \texttt{\_parse\_scalar}
+falls back to parsing the token as an exponential literal matching
+
+\begin{verbatim}
+[+-]?\d*\.?\d+(e[+-]?\d*\.?\d+)?
+\end{verbatim}
+
+For example, the string \verb|1e2.1| is not valid Python syntax but is
+accepted here and interpreted as \(10^{2.1}\).  On any error the
+function raises \texttt{SpecParseError}.
+
+All numerical results are explicitly converted to \texttt{complex}, so
+even purely real expressions produce values of the form \texttt{x+0j}.
+
+
+\subsection{Chain syntax and splitting}
+
+A specification \emph{chain} is a single string consisting of a
+comma-separated list of items, where each item has the form
+\texttt{name:arg1:arg2:...}.  The parser supports nested expressions in
+arguments, including function calls that contain their own commas, by
+splitting only at \emph{top level}.
+
+Top level splitting is implemented by
+\texttt{\_split\_top\_level(s, sep)}.  This helper scans the string
+character by character, maintains a nesting depth for the bracket pairs
+\texttt{()}, \texttt{[]}, \texttt{\{\}} and only treats the separator
+\texttt{sep} as active when the depth is zero.  As a result a chain such
+as
+
+\begin{verbatim}
+op:1:max(2,3):min(4,5),foo:sin(pi):cos(a)
+\end{verbatim}
+
+is correctly interpreted as two items \texttt{op} and \texttt{foo},
+even though the arguments contain internal commas.
+
+Each item starts with a raw name which is then normalised:
+
+\begin{itemize}
+  \item leading whitespace is ignored;
+  \item if the first non whitespace character is one of the
+        \emph{skip prefixes} in \texttt{SKIP\_PREFIXES} (currently just
+        \texttt{"!"}), the item is dropped completely; this is useful to
+        comment out operations inside a spec string;
+  \item a single leading underscore is removed by
+        \texttt{\_strip\_nonfunctional\_prefix}, so \texttt{\_Foo} and
+        \texttt{foo} refer to the same logical operation name;
+  \item finally, the resulting name is converted to lower case.
+\end{itemize}
+
+The light weight helper \texttt{extract\_used\_names(chain: str)} only
+performs top level comma splitting and returns the set of lowercased
+name fragments before the first colon.  It is intended for quick
+introspection and does not interpret skip prefixes or leading
+underscores.
+
+
+\subsection{Python API}
+
+On top of the scalar and chain helpers, the module provides a small
+Python facing API:
+
+\begin{description}
+  \item[\texttt{\_parse\_scalar(tok: str) -> complex}]%
+    Parse a single token as a scalar expression and return a
+    \texttt{complex} value, or raise \texttt{SpecParseError} if the
+    token is invalid.
+
+  \item[\texttt{split\_chain(chain: str) -> dict[str, list[str]]}]%
+    Split a chain into a dictionary that maps normalised operation names
+    to lists of \emph{raw} argument strings.  Arguments are not
+    evaluated at this stage; client code can inspect or parse them as
+    needed.
+
+  \item[\texttt{parse\_chain(chain: str, MAXA: int = 12)
+    -> list[tuple[str, tuple[complex, ...]]]}]%
+    Fully parse a chain into a list of \texttt{(name, args)} tuples,
+    where the name is normalised as described above and
+    \texttt{args} is a tuple of complex numbers.  At most
+    \texttt{MAXA} arguments are parsed for each item.
+
+  \item[\texttt{parse\_names\_and\_args(chain: str, MAXA: int = 12)}]%
+    Parse a chain and return the pair \texttt{(names, A)} where
+    \texttt{names} is a list of normalised operation names and
+    \texttt{A} is a NumPy array of shape \texttt{(K, MAXA)} with dtype
+    \texttt{np.complex128}.  Here \texttt{K} is the number of parsed
+    items.  Missing arguments are represented as \texttt{0+0j}.
+
+  \item[\texttt{parse\_args\_only(chain: str, MAXA: int = 12)}]%
+    Convenience wrapper that discards the names and returns only the
+    argument matrix \texttt{A}.
+\end{description}
+
+For example, the call
+
+\begin{verbatim}
+spec  = "op:1:max(2,3):min(4,5),foo:sin(pi):cos(a)"
+names, A = parse_names_and_args(spec, MAXA=12)
+\end{verbatim}
+
+produces the list \texttt{["op", "foo"]} and a matrix \texttt{A} whose
+first row corresponds to the arguments \texttt{1}, \texttt{3},
+\texttt{4} and whose second row starts with \texttt{sin(pi)} and
+\texttt{cos(a)} evaluated using the same scalar rules as for the CLI.
+
+
+\section{Command line interface and self tests}
+\label{sec:specparser-cli}
+
+When executed as a script, \texttt{specparser.py} exposes a small
+command line front end built on \texttt{argparse}.  The general usage
+is
+
+\begin{verbatim}
+specparser.py --spec "op:arg1:arg2,op2:arg3" [options...]
+\end{verbatim}
+
+The main options are:
+
+\begin{description}
+  \item[\texttt{--spec}]%
+    Specification string to parse.  This is required unless one of the
+    self test flags is given.
+
+  \item[\texttt{--maxa N}]%
+    Maximum number of arguments per operation (default \texttt{12}).
+    This controls the number of columns in the output argument matrix.
+
+  \item[\texttt{--const NAME=VALUE}]%
+    Add or override a constant visible to the scalar parser.  The value
+    is parsed using the same rules as normal arguments.  This option can
+    be repeated; each occurrence is processed by
+    \texttt{\_parse\_const\_kv} and \texttt{set\_const}.
+
+  \item[\texttt{--format \{pretty,json,args\}}]%
+    Select the output format (default \texttt{pretty}):
+    \begin{itemize}
+      \item \texttt{pretty}: prints the list of names and a compact
+            representation of the argument matrix.  Trailing all zero
+            columns are trimmed and each row is labelled as
+            \texttt{args[i]: [...]}.
+      \item \texttt{json}: prints a JSON object with a \texttt{"names"}
+            array and an \texttt{"args"} array of arrays, where each
+            complex number is represented as a small object
+            \verb|{"re": ..., "im": ...}|.
+      \item \texttt{args}: prints just the raw matrix, one row per line,
+            with complex entries formatted as described below.
+    \end{itemize}
+
+  \item[\texttt{--selftest}, \texttt{--selftest-verbose}]%
+    Run the built in test suite and exit.  The verbose variant prints
+    detailed expected versus actual values for each check.
+\end{description}
+
+Complex numbers on the command line are rendered by
+\texttt{\_complex\_to\_repr(z)}, which formats a value as
+
+\begin{center}
+  \texttt{<real><imag>j}
+\end{center}
+
+where the real and imaginary parts are printed with an explicit sign and
+up to twelve significant digits (format specifier \texttt{+.12g}).  For
+example, \texttt{1-2j} would be printed as something like
+\texttt{+1-2j}.
+
+If parsing the specification fails at the scalar level,
+\texttt{SpecParseError} is caught in \texttt{main} and an error message
+of the form \texttt{specparser error: ...} is written to
+\texttt{stderr}.  The program then exits with status code \texttt{2}.
+Errors while parsing \texttt{--const} arguments are reported as normal
+\texttt{argparse} usage errors.
+
+
+\subsection{Built in self tests}
+
+The helper \texttt{\_run\_selftests(verbose: bool = False) -> int}
+implements a small battery of tests that exercise
+
+\begin{itemize}
+  \item scalar parsing of constants and expressions such as
+        \texttt{pi}, \texttt{2**8} and \texttt{3+4j};
+  \item the exponential literal fallback, for example parsing
+        \verb|1e2.1|;
+  \item function evaluation, including user defined constants via
+        \texttt{set\_const} and nested calls like
+        \verb|max(sin(pi), cos(0))|;
+  \item chain splitting and argument evaluation through
+        \texttt{parse\_names\_and\_args};
+  \item name extraction via \texttt{extract\_used\_names}.
+\end{itemize}
+
+Each test uses \texttt{\_approx\_eq} to compare complex numbers within a
+tolerance of \(10^{-12}\) on both the real and imaginary parts.  The
+helper \texttt{\_check} returns a boolean flag and a textual message
+prefixed by a check mark or cross, and the overall function restores the
+global \texttt{NAMES} dictionary to its original contents before
+returning.  The exit code is \texttt{0} if all tests pass and
+\texttt{1} if any test fails; these values are passed through directly
+when the script is called with \texttt{--selftest} or
+\texttt{--selftest-verbose}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 \newpage
-\section{specparser}
+\section{\texttt{specparser.py}: Parsing Pipeline Specifications}
+\label{sec:specparser}
+
+The \texttt{specparser} module provides a minimal, CLI-safe parser for
+\emph{pipeline specifications} of the form
+\[
+  \texttt{"op:arg1:arg2,op2:arg1,op3:..."}\,.
+\]
+It is designed to be robust against shell quoting issues, to support a small,
+carefully restricted expression language (including complex numbers), and to
+produce a dense matrix of arguments suitable for numerical code.
+
+\subsection*{Scalar expression language}
+
+Each argument token \texttt{arg\_k} is parsed by \verb|_parse_scalar()| into a
+Python \verb|complex| value. Parsing is intentionally conservative and
+restricted:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Safe evaluation.} Expressions are evaluated with
+        \texttt{SimpleEval} using a whitelist of operators
+        (\verb|+|, \verb|-|, \verb|*|, \verb|/|, \verb|**|, floor division,
+        modulus) and no arbitrary Python access.
+  \item \textbf{Named constants.} The \verb|NAMES| dictionary provides:
+        \(\pi\), \(\tau\), \(e\), \texttt{inf}, \texttt{nan}, and several
+        complex shortcuts:
+        \texttt{j}, \texttt{i} (both \(= 1j\)), \texttt{zero} (\(0+0j\)),
+        \texttt{one} (\(1+1j\)).
+        Additional constants can be registered at runtime via
+        \verb|set_const(name, value)|.
+  \item \textbf{Functions.} The \verb|FUNCS| mapping exposes a small set of
+        complex-aware functions:
+        \(\sin, \cos, \tan, \sqrt, \log, \exp\) from \texttt{cmath},
+        plus \verb|abs|, \verb|min|, \verb|max| (acting on real parts),
+        and a linear interpolation helper \verb|lerp(start, end, i, n)|.
+  \item \textbf{Fractional exponent literals.} Tokens of the form
+        \texttt{base e exponent}, such as \texttt{1e2.1}, are handled by a
+        dedicated regular expression fallback. Python itself rejects
+        \texttt{1e2.1}, but \texttt{specparser} interprets it as
+        \(\text{base} \cdot 10^{\text{exponent}}\).
+\end{itemize}
+
+If a token cannot be parsed by either the safe expression evaluator or the
+fractional-exponent fallback, a \verb|SpecParseError| is raised.
+
+\subsection*{Chain structure and top-level splitting}
+
+A \emph{chain} is a comma-separated list of items,
+\[
+  \texttt{"name:arg1:arg2,\; name2:arg1,\; ..."}
+\]
+where commas and colons are treated as separators only at \emph{top level}.
+The helper \verb|_split_top_level(s, sep)| scans the string while tracking
+parenthesis, bracket, and brace depth:
+\begin{itemize}[leftmargin=*]
+  \item separators inside \verb|()|, \verb|[]|, or \verb|{}| are ignored,
+  \item malformed nesting is handled defensively (depth is never allowed to
+        go negative),
+  \item leading and trailing whitespace is stripped from each piece.
+\end{itemize}
+This allows nested function calls with commas (e.g.\ \texttt{max(2,3)}) to
+appear inside argument expressions without breaking the top-level structure.
+
+\subsection*{Operation names and skipping behaviour}
+
+Each chain item begins with a raw name, followed by zero or more argument
+tokens:
+\[
+  \texttt{"name\_raw:arg1:arg2:..."}\,.
+\]
+The following normalisation rules are applied:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Skipping.} Names starting with any \verb|SKIP_PREFIXES|
+        character (currently \verb|"!"|) are \emph{ignored completely} by
+        the parser. This allows the user to comment out or disable operations
+        in a spec string without editing the surrounding commas or arguments.
+  \item \textbf{Non-functional prefix.} A leading underscore is considered
+        non-functional; \verb|_strip_nonfunctional_prefix()| removes a single
+        leading ``\_'' while leaving the rest unchanged. This can be used to
+        mark variants without changing the logical operation name.
+  \item \textbf{Case normalisation.} After prefix handling, operation names
+        are converted to lowercase so that downstream code can perform
+        simple case-insensitive lookups.
+\end{itemize}
+
+The helper \verb|extract_used_names(chain)| returns the set of operation names
+appearing at top level (after normalisation), without inspecting or parsing
+their arguments. This is useful for pre-loading only the necessary kernels or
+operators.
+
+\subsection*{Parsed representation}
+
+The main programmatic entry points are:
+
+\begin{itemize}[leftmargin=*]
+  \item \verb|parse_chain(chain, MAXA=12)| \\
+        Returns a list of \verb|(name, args)| pairs, where \verb|name| is a
+        lowercase string and \verb|args| is a tuple of up to \verb|MAXA|
+        complex numbers. Skipped operations are omitted.
+  \item \verb|parse_names_and_args(chain, MAXA=12)| \\
+        Builds a pair \verb|(names, A)|:
+        \begin{itemize}
+          \item \verb|names| is a Python list of normalised operation names,
+          \item \verb|A| is a dense NumPy array of shape
+                \(\texttt{(K, MAXA)}\) with \verb|dtype=complex128|,
+                where \verb|K| is the number of parsed items. Missing
+                arguments are padded with \verb|0+0j|.
+        \end{itemize}
+        This representation is convenient for numerical kernels that expect a
+        fixed-width argument matrix.
+  \item \verb|parse_args_only(chain, MAXA=12)| \\
+        Convenience wrapper that returns only the argument matrix
+        \verb|A|, discarding the names.
+\end{itemize}
+
+\subsection*{Command-line interface}
+
+When executed as a script, \texttt{specparser.py} parses a chain provided via
+\verb|--spec| and prints the result in one of several formats:
+
+\begin{itemize}[leftmargin=*]
+  \item \verb|--spec| \texttt{"..."} \\
+        The raw pipeline specification string (required unless running
+        self-tests).
+  \item \verb|--maxa N| \\
+        Maximum number of arguments per operation (default: 12).
+  \item \verb|--const NAME=VALUE| \\
+        Registers or overrides a constant, using the same scalar rules as
+        normal arguments. May be given multiple times. Invalid values yield
+        an \texttt{argparse} error.
+  \item \verb|--format {pretty,json,args}| \\
+        Chooses the output format:
+        \begin{itemize}
+          \item \texttt{pretty}: prints the list of names and a compact view
+                of the argument matrix. Trailing all-zero columns are trimmed.
+                Complex numbers use a stable representation
+                \(\texttt{+re+imj}\) via \verb|_complex_to_repr()|.
+          \item \texttt{json}: emits a JSON object with fields
+                \texttt{"names"} and \texttt{"args"}, where each complex is
+                encoded as \verb|{"re": ..., "im": ...}|.
+          \item \texttt{args}: prints one line per operation, containing the
+                full row of arguments in the same \(\texttt{+re+imj}\)
+                representation.
+        \end{itemize}
+  \item \verb|--selftest|, \verb|--selftest-verbose| \\
+        Run the built-in self-test suite, which exercises scalar parsing,
+        function calls, constants, fractional exponent handling, top-level
+        splitting, and the chain layout. In verbose mode, each check reports
+        the expected and actual values.
+\end{itemize}
+
+Parsing errors at the scalar level raise \verb|SpecParseError| and cause the
+CLI to exit with a non-zero status. In this way, \texttt{specparser.py} acts
+as a strict, reproducible front-end for turning human-readable pipeline specs
+into a machine-friendly \emph{(names, argument matrix)} pair.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{{\tt specparser} self-test}
 
 <<, engine='bash', echo=TRUE, eval=TRUE>>=
 ./specparser.py --selftest-verbose
