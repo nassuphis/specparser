@@ -514,31 +514,53 @@ class _Ref(_Seg):
 def _split_list_items(s: str) -> List[str]:
     """
     Split the inner of [ ... ] on top-level commas only.
-    Ignores commas inside {...}, ${...}, @{...}.
+
+    Ignores commas inside:
+      - {...}  (numeric ranges, @{...}, ${...} bodies)
+      - (...)  (function calls like fun1(x,y))
     """
-    out, buf = [], []
-    depth = 0  # braces depth for {...}, @{...}, ${...}
+    out: List[str] = []
+    buf: List[str] = []
+
+    brace_depth = 0   # for {...}, @{...}, ${...}
+    paren_depth = 0   # for (...), e.g. fun1(x,y)
+
     i, n = 0, len(s)
     while i < n:
         ch = s[i]
+
         if ch == '{':
-            depth += 1
+            brace_depth += 1
             buf.append(ch)
         elif ch == '}':
-            if depth > 0:
-                depth -= 1
+            if brace_depth > 0:
+                brace_depth -= 1
             buf.append(ch)
-        elif ch == ',' and depth == 0:
+
+        elif ch == '(':
+            paren_depth += 1
+            buf.append(ch)
+        elif ch == ')':
+            if paren_depth > 0:
+                paren_depth -= 1
+            buf.append(ch)
+
+        elif ch == ',' and brace_depth == 0 and paren_depth == 0:
+            # top-level comma → end of item
             item = "".join(buf).strip()
             if item:
                 out.append(item)
             buf = []
         else:
             buf.append(ch)
+
         i += 1
+
+    # last item
     item = "".join(buf).strip()
     if item:
         out.append(item)
+
     return out
 
 def _split_fcall(text: str):
