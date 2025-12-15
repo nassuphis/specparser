@@ -37,7 +37,7 @@ from typing import List, Literal, Optional, Tuple, Union
 from collections.abc import Iterable
 from itertools import product
 import random
-
+from pathlib import Path
 from simpleeval import EvalWithCompoundTypes
 
 
@@ -60,7 +60,12 @@ class Dim:
 class Ref:
     key: str  # "row" or "1","2",...
 
-Segment = Union[Lit, Dim, Ref]
+@dataclass(frozen=True)
+class Init:
+    expr: str
+
+Segment = Union[Lit, Dim, Ref, Init]
+
 
 # ============================================================
 # The term dictionary
@@ -97,14 +102,29 @@ NAMES = {
     "pi": complex(math.pi),
 }
 
+# --- choice time functions
+
+def search_keys_expand(pat):
+    rx = re.compile(pat)
+    matches = [ k for k in DICT.keys() if rx.fullmatch(k) ]
+    return matches
+
+def search_values_expand(pat):
+    rx = re.compile(pat)   
+    matches = [ DICT[k] for k in DICT.keys() if rx.fullmatch(k) ]
+    return matches
+
 FUNCS: dict[str, object] = {
-    # add functions later if you want (seq, etc.)
+    "key": search_keys_expand,
+    "value": search_values_expand,
 }
+
+# --- render time functions
 
 def choose(*args):
     return random.choice(args)
 
-def search_keys(pat, exclude=None):
+def search_keys_ref(pat, exclude=None):
     rx = re.compile(pat)
     exc = None if exclude is None else str(exclude)
     matches = [
@@ -113,7 +133,7 @@ def search_keys(pat, exclude=None):
     ]
     return random.choice(matches) if matches else None
 
-def search_values(pat, exclude=None):
+def search_values_ref(pat, exclude=None):
     rx = re.compile(pat)
     exc = None if exclude is None else str(exclude)
     matches = [
@@ -142,8 +162,8 @@ def wat(seq, idx):
 
 REF_FUNCS: dict[str, object] = {
     "choose": choose,
-    "key": search_keys,
-    "value": search_values,
+    "key": search_keys_ref,
+    "value": search_values_ref,
     "rint": rint,
     "rfloat": rfloat,
     "num": num,
@@ -156,6 +176,70 @@ REF_FUNCS: dict[str, object] = {
     # add functions later if you want (seq, etc.)
 }
 
+# --- init time functions
+
+RNG = random.Random()
+
+def seed_init(x):
+    RNG.seed(int(x))
+    return int(x)
+
+def set_const_init(name, value):
+    NAMES[str(name)] = value
+    return value
+
+def set_dict_init(**kwargs):
+    """Replace DICT with provided key/value pairs."""
+    DICT.clear()
+    for k, v in kwargs.items():
+        DICT[str(k)] = str(v)
+    return len(DICT)
+
+def add_dict_init(**kwargs):
+    """Update DICT with provided key/value pairs."""
+    for k, v in kwargs.items():
+        DICT[str(k)] = str(v)
+    return len(kwargs)
+
+def load_init(path, *, mode="new", start=1, strip=True, skip_empty=False, encoding="utf-8"):
+    """
+    Load a text file into DICT:
+      key = str(line_number)
+      value = line (optionally stripped)
+
+    mode:
+      - "new": replace DICT
+      - "add": update DICT
+    """
+    p = Path(str(path))
+    lines = p.read_text(encoding=encoding).splitlines()
+
+    d = {}
+    i = int(start)
+    for line in lines:
+        s = line.strip() if strip else line
+        if skip_empty and s == "":
+            i += 1
+            continue
+        d[str(i)] = s
+        i += 1
+
+    if mode == "new":
+        DICT.clear()
+    elif mode != "add":
+        raise ValueError("mode must be 'new' or 'add'")
+
+    DICT.update(d)
+    return len(d)
+
+
+INIT_FUNCS = {
+    "seed": seed_init, 
+    "const": set_const_init, 
+    "new": set_dict_init,
+    "add": add_dict_init,
+    "load": load_init
+}
 
 # ============================================================
 # regexes
@@ -284,8 +368,20 @@ def scan_segments(spec: str) -> List[Segment]:
             if end is None:
                 segs.append(Lit(spec[i:]))
                 break
-            inner = spec[i+2:end-1]
+            inner = spec[i+2:end-1].strip()
             segs.append(Ref(inner))
+            i = end
+            continue
+
+        # --- INIT: !{...} ---
+        elif ch == "!" and i + 1 < n and spec[i + 1] == "{":
+            flush_lit()
+            end = _scan_balanced(spec, i + 1, "{", "}")
+            if end is None:
+                segs.append(Lit(spec[i:]))
+                break
+            expr = spec[i + 2 : end - 1].strip()
+            segs.append(Init(expr))
             i = end
             continue
 
@@ -832,6 +928,13 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     """
     segs = scan_segments(spec)
 
+    # init-time code (runs once)
+    init_names = dict(NAMES)
+    init_se = EvalWithCompoundTypes(names=init_names, functions=INIT_FUNCS, operators=ALLOWED_OPS)
+    for s in segs:
+        if isinstance(s, Init):
+            init_se.eval(s.expr) 
+
     dims: List[Dim] = [s for s in segs if isinstance(s, Dim)]
     dim_choices: List[List[str]] = [_realize_dim(d) for d in dims]
 
@@ -905,6 +1008,8 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
                     parts.append(str(se.eval(s.key)))
                 except Exception:
                     parts.append(f"#{{{s.key}}}")  # leave literal on eval failure
+            elif isinstance(s, Init):
+                continue
             else:
                 pass #should be error?
         
