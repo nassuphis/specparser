@@ -126,7 +126,8 @@ _brace_re = re.compile(r"^(?P<prefix>.*)\{(?P<body>[^{}]+)\}(?P<suffix>.*)$")
 _int_re = re.compile(r"^[+-]?\d+$")
 _dictsel_re = re.compile(r"^@\{(.+)\}$")              # whole-token @{...}
 _js_regex_re = re.compile(r"^/(.*?)/([im]*)$")        # /re/flags
-_ref_re = re.compile(r"#\{(\d+)\}")      # #{n} where n is digits only
+#_ref_re = re.compile(r"#\{(\d+)\}")      # #{n} where n is digits only
+_ref_re = re.compile(r"#\{(\d+|row)\}")  # #{n} or #{row}
 
 # =========================
 # Helpers
@@ -616,7 +617,9 @@ ALLOWED_OPS = {
     ast.Mod: op.mod
 }
 
-NAMES = {}
+NAMES = {
+    "pi": complex(np.pi)
+}
 
 def set_const(name: str, value: complex | float) -> None:
     NAMES[name.strip().lower()] = complex(value)
@@ -895,7 +898,7 @@ def expand_cartesian_lists(spec: str, *, names: Union[None, Iterable[str], dict]
             dims.append([None])
 
     results: List[str] = []
-    for combo in product(*dims):
+    for row_i, combo in enumerate(product(*dims), start=1):
         # Render immediate pieces (leave #{n} placeholders for a final pass)
         out_parts: List[str] = []
         for s, choice in zip(segs, combo):
@@ -913,6 +916,11 @@ def expand_cartesian_lists(spec: str, *, names: Union[None, Iterable[str], dict]
         # Final pass: resolve #{n} using ll_map and this combo
         def _ref_replace(m: re.Match) -> str:
             pid = m.group(1)  # numeric ordinal string
+
+            # special ref: #{row} = 1-based row number in enumeration order
+            if pid == "row":
+                return str(row_i)
+            
             if pid not in ll_map:
                 return m.group(0)
             kind, seg_ref, dim_index = ll_map[pid]
