@@ -78,7 +78,7 @@ def set_dict(d: dict[str, str]) -> None:
     DICT.update(d)
 
 # ============================================================
-# Simpleeval config for ${...}
+# Simpleeval config for ${...}, #{...}
 # ============================================================
 
 ALLOWED_OPS = {
@@ -130,16 +130,12 @@ REF_FUNCS: dict[str, object] = {
 }
 
 
-
-
 # ============================================================
 # regexes
 # ============================================================
 
 _INT_RE = re.compile(r"^[+-]?\d+$")
 _DICTSEL_RE = re.compile(r"^@\{(.+)\}$")
-_REF_WHOLE_RE = re.compile(r"^#\{(\d+|row)\}$")  # whole-token reference
-
 
 # ============================================================
 # Low-level scanners
@@ -778,6 +774,23 @@ def progressive_choices(inner: str) -> List[str]:
 # Cartesian product
 # ============================================================
 
+class DimSeries:
+    def __init__(self, choices: list[str], stride: int):
+        self._choices = choices
+        self._stride = int(stride)
+        self._n = len(choices)
+
+    def __getitem__(self, row_1based):
+        r = int(row_1based)
+        if r < 1:
+            raise IndexError("row is 1-based (>= 1)")
+        idx = ((r - 1) // self._stride) % self._n
+        return self._choices[idx]
+
+    def __len__(self):
+        return self._n
+    
+
 def _realize_dim(d: Dim) -> List[str]:
     return expand_list_choices(d.raw) if d.dim_kind == "LIST" else progressive_choices(d.raw)
 
@@ -795,18 +808,48 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     dims: List[Dim] = [s for s in segs if isinstance(s, Dim)]
     dim_choices: List[List[str]] = [_realize_dim(d) for d in dims]
 
+    sizes = [len(c) for c in dim_choices]
+    strides = []
+    acc = 1
+    for sz in reversed(sizes):
+        strides.append(acc)
+        acc *= sz
+    strides.reverse()
+
+    base_render_names = dict(NAMES)
+
+    # expose per-dimension choice lists: choices1, choices2, ...
+    for j, choices_j in enumerate(dim_choices, start=1):
+        base_render_names[f"choices{j}"] = choices_j
+
+    # expose row-aligned expanded dimension series: dim1, dim2, ...
+    for j, (choices_j, stride_j) in enumerate(zip(dim_choices, strides), start=1):
+        base_render_names[f"dim{j}"] = DimSeries(choices_j, stride_j)
+
+    # optional convenience
+    base_render_names["ndims"] = len(dim_choices)
+    base_render_names["nrows"] = acc  # total rows, product of sizes (can be big)
+
+
     if any(len(c) == 0 for c in dim_choices):
         return []
 
     out: List[str] = []
 
     if not dim_choices:
-        parts: List[str] = []
+        render_names = dict(base_render_names)
+        render_names["row"] = 1
+        se = EvalWithCompoundTypes(names=render_names, functions=REF_FUNCS, operators=ALLOWED_OPS)
+
+        parts = []
         for s in segs:
             if isinstance(s, Lit):
                 parts.append(s.text)
             elif isinstance(s, Ref):
-                parts.append("1" if s.key == "row" else f"#{{{s.key}}}")
+                try:
+                    parts.append(str(se.eval(s.key)))
+                except Exception:
+                    parts.append(f"#{{{s.key}}}")
         out.append("".join(parts))
         return out
 
@@ -814,7 +857,7 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     # Create a per-row evaluator with row + selected dimension values in `render_names`.
     # Do NOT mutate global NAMES; keep render context isolated.
     for row_i, picks in enumerate(product(*dim_choices), start=1):
-        render_names = dict(NAMES)
+        render_names = dict(base_render_names)
         render_names["row"] = row_i
         # Selected dimension values are exposed as d1, d2, ... for #{...} expressions.
         # (Values are strings; add helper funcs in REF_FUNCS if you want numeric ops.)
