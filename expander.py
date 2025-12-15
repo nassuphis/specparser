@@ -104,15 +104,23 @@ FUNCS: dict[str, object] = {
 def choose(*args):
     return random.choice(args)
 
-def search_keys(pat):
+def search_keys(pat, exclude=None):
     rx = re.compile(pat)
-    matches = [k for k in DICT.keys() if rx.fullmatch(k)]
-    return random.choice(matches)
+    exc = None if exclude is None else str(exclude)
+    matches = [
+        k for k in DICT.keys()
+        if rx.fullmatch(k) and (exc is None or k != exc)
+    ]
+    return random.choice(matches) if matches else None
 
-def search_values(pat):
+def search_values(pat, exclude=None):
     rx = re.compile(pat)
-    matches = [DICT[k] for k in DICT.keys() if rx.fullmatch(k)]
-    return random.choice(matches)
+    exc = None if exclude is None else str(exclude)
+    matches = [
+        DICT[k] for k in DICT.keys()
+        if rx.fullmatch(k) and (exc is None or DICT[k] != exc)
+    ]
+    return random.choice(matches) if matches else None
 
 def rint(N):
     return random.randint(1,N)
@@ -120,12 +128,31 @@ def rint(N):
 def rfloat(a,b):
     return random.uniform(a,b)
 
+def num(x): return float(x)
+def i(x): return int(float(x))
+def zfill(x, w): return str(x).zfill(int(w))
+def fmt(s, *args): return str(s).format(*args)
+def at(seq, idx): return seq[int(idx)]
+def wat(seq, idx):
+    i = int(idx)
+    n = len(seq)
+    if n == 0:
+        return None  # or raise
+    return seq[i % n]     # wrap-around
+
 REF_FUNCS: dict[str, object] = {
     "choose": choose,
-    "keys": search_keys,
-    "values": search_values,
+    "key": search_keys,
+    "value": search_values,
     "rint": rint,
     "rfloat": rfloat,
+    "num": num,
+    "i": i,
+    "zfill": zfill,
+    "fmt":  fmt,
+    "at": at,
+    "wat": wat,
+
     # add functions later if you want (seq, etc.)
 }
 
@@ -808,6 +835,9 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     dims: List[Dim] = [s for s in segs if isinstance(s, Dim)]
     dim_choices: List[List[str]] = [_realize_dim(d) for d in dims]
 
+    if any(len(c) == 0 for c in dim_choices):
+        return []
+
     sizes = [len(c) for c in dim_choices]
     strides = []
     acc = 1
@@ -829,10 +859,6 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     # optional convenience
     base_render_names["ndims"] = len(dim_choices)
     base_render_names["nrows"] = acc  # total rows, product of sizes (can be big)
-
-
-    if any(len(c) == 0 for c in dim_choices):
-        return []
 
     out: List[str] = []
 
