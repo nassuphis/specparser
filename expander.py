@@ -114,7 +114,15 @@ def search_values_expand(pat):
     matches = [ DICT[k] for k in DICT.keys() if rx.fullmatch(k) ]
     return matches
 
+def rint_expand(N):
+    return random.randint(1,N)
+
+def rfloat_expand(a,b):
+    return random.uniform(a,b)
+
 FUNCS: dict[str, object] = {
+    "rint": rint_expand,
+    "rfloat": rfloat_expand,
     "key": search_keys_expand,
     "value": search_values_expand,
 }
@@ -142,10 +150,14 @@ def search_values_ref(pat, exclude=None):
     ]
     return random.choice(matches) if matches else None
 
-def rint(N):
+def rvalues_ref():
+    vals = [DICT[k] for k in DICT.keys()]
+    return random.choice(vals) 
+
+def rint_ref(N):
     return random.randint(1,N)
 
-def rfloat(a,b):
+def rfloat_ref(a,b):
     return random.uniform(a,b)
 
 def num(x): return float(x)
@@ -160,19 +172,57 @@ def wat(seq, idx):
         return None  # or raise
     return seq[i % n]     # wrap-around
 
+# global cache
+line_dict_ref: dict[str, list[str]] = {}
+
+def line_ref(fn: str, lno: int) -> str:
+    """
+    Return line number lno (0-based) from file fn.
+    Caches file contents across calls.
+    """
+    global line_dict_ref
+
+    if fn not in line_dict_ref:
+        with open(fn, "r", encoding="utf-8") as f:
+            # keep lines without trailing newline
+            line_dict_ref[fn] = f.read().splitlines()
+
+    try:
+        return line_dict_ref[fn][lno]
+    except IndexError:
+        raise IndexError(f"line number {lno} out of range for file '{fn}'")
+
+def rline_ref(fn: str) -> str:
+    """
+    Return a random line from file fn.
+    Caches file contents across calls.
+    """
+    global line_dict_ref
+
+    if fn not in line_dict_ref:
+        with open(fn, "r", encoding="utf-8") as f:
+            line_dict_ref[fn] = f.read().splitlines()
+
+    if not line_dict_ref[fn]:
+        raise ValueError(f"file '{fn}' is empty")
+
+    return random.choice(line_dict_ref[fn])
+
 REF_FUNCS: dict[str, object] = {
     "choose": choose,
     "key": search_keys_ref,
     "value": search_values_ref,
-    "rint": rint,
-    "rfloat": rfloat,
+    "rval": rvalues_ref,
+    "rint": rint_ref,
+    "rfloat": rfloat_ref,
     "num": num,
     "i": i,
     "zfill": zfill,
     "fmt":  fmt,
     "at": at,
     "wat": wat,
-
+    "line": line_ref,
+    "rline": rline_ref,
     # add functions later if you want (seq, etc.)
 }
 
