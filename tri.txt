@@ -17,7 +17,6 @@ beauty_gucci_plum_powder
 beauty_gucci_rosewood_blush
 beauty_gucci_taupe_blush
 beauty_gucci_taupe_peach
-bp
 brutalist_concrete
 classic_gucci_green_lemon
 classic_gucci_green_pink
@@ -83,7 +82,6 @@ forest_tan_ink
 forest_tea_rose
 forest_warmwhite_fir
 forest_wasabi_cloud
-gc
 grayscale_magnitude
 greencopper
 impressionist_pastel
@@ -274,7 +272,6 @@ retro_sage_blue
 retro_sienna_sky
 retro_steel_pink
 retro_teal_coral
-rg
 rocket_control_room
 rocket_heatshield
 rocket_night_launch

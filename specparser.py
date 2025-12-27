@@ -11,6 +11,7 @@ import json
 import argparse
 import sys
 import numpy as np
+import random
 
 __all__ = [
     "SpecParseError",
@@ -68,7 +69,11 @@ def lerp(start,end,i,n):
     x=np.linspace(start,end,n)
     return x[i-1]
 
+def rint(N):
+    return random.randint(1,N)
 
+def rfloat(a,b):
+    return random.uniform(a,b)
 
 FUNCS = {
     # pick only what you truly need
@@ -82,6 +87,8 @@ FUNCS = {
     "min": real_min, 
     "max": real_max,
     "lerp": lerp,
+    "rint": rint,
+    "rfloat": rfloat,
 }
 
 def simple_eval_number(expr: str) -> complex:
@@ -207,6 +214,23 @@ def parse_names_and_args(chain: str, MAXA: int = 12):
 def parse_args_only(chain: str, MAXA: int = 12):
     _, A = parse_names_and_args(chain, MAXA=MAXA)
     return A
+
+# ---------- required specs ----------
+
+def get_required_arg(spec: str, key: str) -> str:
+    d = split_chain(spec)
+    vals = d.get(key)
+    if not vals or vals[0] is None or str(vals[0]).strip() == "":
+        raise ValueError(f"spec missing required '{key}': {spec}")
+    return str(vals[0]).strip()
+
+
+def slot_suffix(spec: str, width: int = 5) -> str:
+    s = get_required_arg(spec, "slot")
+    # numeric slot: pad for lexicographic ordering
+    if s.isdigit(): return s.zfill(width)
+    # otherwise use as-is (caller decides if allowed)
+    return s
 
 # ---------- CLI ----------
 

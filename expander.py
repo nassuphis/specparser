@@ -25,8 +25,24 @@ Choice expansion (union semantics inside a LIST/PLIST inner):
   - nested [...] inside list items:
       a[b,c]d -> abd, acd
 """
-
 from __future__ import annotations
+from pathlib import Path
+import importlib.util
+
+def _load_sibling_specparser():
+    sp_path = Path(__file__).resolve().with_name("specparser.py")
+    spec = importlib.util.spec_from_file_location("_specparser_local", sp_path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+if __name__ == "__main__" and (__package__ is None or __package__ == ""):
+    # running as a standalone script: python ../specparser/expander.py ...
+    sp = _load_sibling_specparser()
+else:
+    # imported as part of the specparser package: from specparser import expander
+    from . import specparser as sp
 
 import re
 import math
@@ -37,8 +53,14 @@ from typing import List, Literal, Optional, Tuple, Union
 from collections.abc import Iterable
 from itertools import product
 import random
+import secrets
 from pathlib import Path
 from simpleeval import EvalWithCompoundTypes
+
+
+
+
+
 
 
 # ============================================================
@@ -115,22 +137,88 @@ def search_values_expand(pat):
     return matches
 
 def rint_expand(N):
-    return random.randint(1,N)
+    return RNG.randint(1,N)
 
 def rfloat_expand(a,b):
-    return random.uniform(a,b)
+    return RNG.uniform(a,b)
+
+# global cache
+line_dict_expand: dict[str, list[str]] = {}
+
+def lines_expand(fn: str, lno: int):
+    global line_dict_expand
+
+    if fn not in line_dict_expand:
+        try:
+            with open(fn, "r", encoding="utf-8") as f:
+                line_dict_expand[fn] = f.read().splitlines()
+        except FileNotFoundError:
+            print(f"cant read from'{fn}'")
+            return None
+    if not line_dict_expand[fn]:
+        print(f"file is empty: '{fn}'")
+        return None
+    return RNG.choices(line_dict_expand[fn],k=lno)
+  
+    
+def lines2_expand(fn: str, lno: int,delim= ":"):
+    l1=lines_expand(fn,lno)
+    l2=lines_expand(fn,lno)
+    if l1 is None or l2 is None: return None
+    return [f"{a}{delim}{b}" for a, b in zip(l1, l2, strict=True)]
+
+def specs_expand(specfile: str):
+    try:
+        with open(specfile+".spec", "r", encoding="utf-8") as f:
+            specs = f.read().splitlines()
+    except FileNotFoundError:
+        print(f"cant read from'{specfile}'")
+        return None    
+    return specs
+
+def spec_expand(specfile: str, slots):
+    # normalize slots → set[str]
+    if isinstance(slots, Iterable) and not isinstance(slots, (str, bytes)):
+        want = {str(i) for i in slots}
+    else:
+        want = {str(slots)}
+
+    try:
+        with open(specfile + ".spec", "r", encoding="utf-8") as f:
+            specs = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+    out = []
+    for s in specs:
+        d = sp.split_chain(s)
+
+        slot_vals = d.get("slot")
+        if not slot_vals:
+            continue
+
+        # your grammar: slot is single-valued → slot_vals[0]
+        if slot_vals[0] in want:
+            out.append(s)
+
+    return out
 
 FUNCS: dict[str, object] = {
+    "range":range,
     "rint": rint_expand,
     "rfloat": rfloat_expand,
     "key": search_keys_expand,
     "value": search_values_expand,
+    "lines": lines_expand,
+    "lines2": lines2_expand,
+    "specs": specs_expand,
+    "spec": spec_expand,
 }
 
 # --- render time functions
 
 def choose(*args):
-    return random.choice(args)
+    return f"{RNG.choice(args)}"
 
 def search_keys_ref(pat, exclude=None):
     rx = re.compile(pat)
@@ -139,7 +227,7 @@ def search_keys_ref(pat, exclude=None):
         k for k in DICT.keys()
         if rx.fullmatch(k) and (exc is None or k != exc)
     ]
-    return random.choice(matches) if matches else None
+    return f"{RNG.choice(matches) if matches else None}"
 
 def search_values_ref(pat, exclude=None):
     rx = re.compile(pat)
@@ -148,17 +236,20 @@ def search_values_ref(pat, exclude=None):
         DICT[k] for k in DICT.keys()
         if rx.fullmatch(k) and (exc is None or DICT[k] != exc)
     ]
-    return random.choice(matches) if matches else None
+    return f"{RNG.choice(matches) if matches else None}"
 
 def rvalues_ref():
     vals = [DICT[k] for k in DICT.keys()]
-    return random.choice(vals) 
+    return f"{RNG.choice(vals)}"
 
 def rint_ref(N):
-    return random.randint(1,N)
+    return f"{RNG.randint(1,N)}"
 
 def rfloat_ref(a,b):
-    return random.uniform(a,b)
+    return f"{RNG.uniform(a,b)}"
+
+def rfloat3_ref(a,b):
+    return f"{round(RNG.uniform(a,b),3)}"
 
 def num(x): return float(x)
 def i(x): return int(float(x))
@@ -169,8 +260,8 @@ def wat(seq, idx):
     i = int(idx)
     n = len(seq)
     if n == 0:
-        return None  # or raise
-    return seq[i % n]     # wrap-around
+        return f"{None}"  # or raise
+    return f"{seq[i % n]}"     # wrap-around
 
 # global cache
 line_dict_ref: dict[str, list[str]] = {}
@@ -188,7 +279,7 @@ def line_ref(fn: str, lno: int) -> str:
             line_dict_ref[fn] = f.read().splitlines()
 
     try:
-        return line_dict_ref[fn][lno]
+        return f"{line_dict_ref[fn][lno]}"
     except IndexError:
         raise IndexError(f"line number {lno} out of range for file '{fn}'")
 
@@ -206,7 +297,17 @@ def rline_ref(fn: str) -> str:
     if not line_dict_ref[fn]:
         raise ValueError(f"file '{fn}' is empty")
 
-    return random.choice(line_dict_ref[fn])
+    return f"{RNG.choice(line_dict_ref[fn])}"
+
+def rline2_ref(fn: str, delim=":") -> str:
+    l1 = rline_ref(fn)
+    l2 = rline_ref(fn)
+    return f"{l1}{delim}{l2}"
+
+def r2line_ref(fn1: str, fn2: str, delim=":") -> str:
+    l1 = rline_ref(fn1)
+    l2 = rline_ref(fn2)
+    return f"{l1}{delim}{l2}"
 
 REF_FUNCS: dict[str, object] = {
     "choose": choose,
@@ -215,6 +316,7 @@ REF_FUNCS: dict[str, object] = {
     "rval": rvalues_ref,
     "rint": rint_ref,
     "rfloat": rfloat_ref,
+    "rfloat3": rfloat3_ref,
     "num": num,
     "i": i,
     "zfill": zfill,
@@ -223,16 +325,31 @@ REF_FUNCS: dict[str, object] = {
     "wat": wat,
     "line": line_ref,
     "rline": rline_ref,
+    "rline2": rline2_ref,
+    "r2line": r2line_ref,
+    "str": str,
     # add functions later if you want (seq, etc.)
 }
 
 # --- init time functions
 
-RNG = random.Random()
+#  RNG (single source of randomness) ---
+_DEFAULT_SEED = secrets.randbits(128)  # different each process run
+RNG = random.Random(_DEFAULT_SEED)
 
-def seed_init(x):
-    RNG.seed(int(x))
-    return int(x)
+def seed_init(x=None):
+    """
+    !{seed(123)}      -> deterministic seed
+    !{seed()}         -> reseed from OS entropy
+    !{seed("auto")}   -> same as seed()
+    !{seed(256)}      -> if you pass a large int, it's fine
+    """
+    if x is None or str(x).lower() in ("auto", "rand", "random", "entropy"):
+        s = secrets.randbits(128)
+    else:
+        s = int(x)
+    RNG.seed(s)
+    return s
 
 def set_const_init(name, value):
     NAMES[str(name)] = value
@@ -942,6 +1059,54 @@ def progressive_choices(inner: str) -> List[str]:
         out.append(",".join(acc))
     return out
 
+# ============================================================
+# Bozo Macros
+# ============================================================
+
+MACROS: dict[str, str] = {}
+_MACRO_KEY_RE = re.compile(r"^@[A-Z0-9]+$")
+
+def macro(s: str) -> str:
+    """
+    Simple macro expansion:
+    replace all occurrences of keys like @FOO with their values.
+    """
+    out = s
+    for k, v in MACROS.items():
+        if _MACRO_KEY_RE.fullmatch(k):
+            out = out.replace(k, v)
+    return out
+
+def macro_init(fn: str) -> bool:
+    """
+    Initialize global MACROS from a file with lines like:
+    @MACRO=value
+
+    Returns True on success, False on failure.
+    """
+    global MACROS
+
+    try:
+        with open(fn, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+
+                if _MACRO_KEY_RE.fullmatch(key):
+                    MACROS[key] = val
+
+        return True
+
+    except OSError as e:
+        print(f"failed to load macro file '{fn}': {e}")
+        return False
 
 # ============================================================
 # Cartesian product
@@ -1196,11 +1361,14 @@ def _main() -> int:
     p = argparse.ArgumentParser(description="expander core (scanner + choice expansion).")
     p.add_argument("spec", nargs="?", help="Input spec string")
     p.add_argument("--selftest", action="store_true", help="Run selftest and exit")
+    p.add_argument("--macro", action="store_true", help="Just expand macro")
     p.add_argument("--choices", action="store_true", help="Spec must be a single top-level [ ... ]; print its expanded choices")
     p.add_argument("--pchoices", action="store_true", help="Spec must be a single top-level >[ ... ]; print its progressive choices")
     p.add_argument("--expand", action="store_true", help="Expand full spec and print lines")
     p.add_argument("--limit", type=int, default=0, help="Limit printed expansion lines (0 = no limit)")
     args = p.parse_args()
+
+    macro_init("macros.txt")
 
     if args.selftest:
         _selftest()
@@ -1208,6 +1376,10 @@ def _main() -> int:
 
     if args.spec is None:
         p.error("spec is required unless --selftest is given")
+
+    if args.macro:
+        print(macro(args.spec))
+        return 0
 
     if args.choices:
         segs = scan_segments(args.spec)
@@ -1226,7 +1398,7 @@ def _main() -> int:
         return 0
 
     if args.expand:
-        for line in expand(args.spec, limit=args.limit):
+        for line in expand(macro(args.spec), limit=args.limit):
             print(line)
         return 0
 
