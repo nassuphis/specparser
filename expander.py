@@ -28,21 +28,30 @@ Choice expansion (union semantics inside a LIST/PLIST inner):
 from __future__ import annotations
 from pathlib import Path
 import importlib.util
+import sys  # <-- add
 
-def _load_sibling_specparser():
-    sp_path = Path(__file__).resolve().with_name("specparser.py")
-    spec = importlib.util.spec_from_file_location("_specparser_local", sp_path)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+parent = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(parent))
+
+def _load_sibling(name):
+    mod_path = Path(__file__).resolve().with_name(f"{name}.py")
+    mod_spec = importlib.util.spec_from_file_location(f"_{name}_local", mod_path)
+    assert mod_spec and mod_spec.loader
+    mod = importlib.util.module_from_spec(mod_spec)
+    # IMPORTANT: register before exec_module (dataclasses expects this)
+    sys.modules[mod_spec.name] = mod
+    mod_spec.loader.exec_module(mod)
     return mod
 
 if __name__ == "__main__" and (__package__ is None or __package__ == ""):
     # running as a standalone script: python ../specparser/expander.py ...
-    sp = _load_sibling_specparser()
+    sp = _load_sibling("specparser")
 else:
     # imported as part of the specparser package: from specparser import expander
     from . import specparser as sp
+
+
+from rasterizer import image2spec 
 
 import re
 import math
@@ -56,11 +65,6 @@ import random
 import secrets
 from pathlib import Path
 from simpleeval import EvalWithCompoundTypes
-
-
-
-
-
 
 
 # ============================================================
@@ -213,6 +217,7 @@ FUNCS: dict[str, object] = {
     "lines2": lines2_expand,
     "specs": specs_expand,
     "spec": spec_expand,
+    "img2spec": image2spec.read_spec_exiftool
 }
 
 # --- render time functions

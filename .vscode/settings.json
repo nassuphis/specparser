@@ -1,6 +1,4 @@
 {
-    "files.associations": {
-        "mps.h": "c"
-    }
+    "python.analysis.extraPaths": ["/Users/nicknassuphis/"]
 }
 
