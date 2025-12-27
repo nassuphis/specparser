@@ -207,6 +207,19 @@ def spec_expand(specfile: str, slots):
 
     return out
 
+def extract_image_spec(imgfile: str):
+    spec = image2spec.read_spec_exiftool(imgfile)
+    return spec
+
+
+def extract_image_spec_to_slot(imgfile: str,slot:int):
+    spec = image2spec.read_spec_exiftool(imgfile)
+    d = sp.split_chain(spec)
+    d["slot"]=[str(slot)]
+    spec=sp.concat_chain(d)
+    return spec
+
+
 FUNCS: dict[str, object] = {
     "range":range,
     "rint": rint_expand,
@@ -217,7 +230,8 @@ FUNCS: dict[str, object] = {
     "lines2": lines2_expand,
     "specs": specs_expand,
     "spec": spec_expand,
-    "img2spec": image2spec.read_spec_exiftool
+    "img2spec": extract_image_spec,
+    "img2slot": extract_image_spec_to_slot,
 }
 
 # --- render time functions

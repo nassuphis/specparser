@@ -181,6 +181,9 @@ def split_chain(chain: str):
         out[name] = parts[1:]
     return out
 
+def concat_chain(d: dict[str, list[str]]) -> str:
+    return ",".join( f"{k}:" + ":".join(v) for k, v in d.items() )
+
 def parse_chain(chain: str, MAXA: int = 12):
     out = []
     if not chain.strip():
