@@ -65,7 +65,7 @@ import random
 import secrets
 from pathlib import Path
 from simpleeval import EvalWithCompoundTypes
-
+import subprocess
 
 # ============================================================
 # Segments (scanner output)
@@ -171,54 +171,224 @@ def lines2_expand(fn: str, lno: int,delim= ":"):
     if l1 is None or l2 is None: return None
     return [f"{a}{delim}{b}" for a, b in zip(l1, l2, strict=True)]
 
-def specs_expand(specfile: str):
+
+# -------------------------------------
+# spec files
+# -------------------------------------
+
+# read the whole specfile
+def specfile(specfile: str): 
+    # normalize spec filename
+    p = Path(specfile)
+    if p.suffix != ".spec": p = p.with_suffix(".spec")
     try:
-        with open(specfile+".spec", "r", encoding="utf-8") as f:
-            specs = f.read().splitlines()
+        specs = p.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        print(f"cant read from'{specfile}'")
-        return None    
+        return []
     return specs
 
-def spec_expand(specfile: str, slots):
-    # normalize slots → set[str]
+# read specific slots from specfile
+def specfile_slots(specfile: str | Path, slots): # read specific slots
     if isinstance(slots, Iterable) and not isinstance(slots, (str, bytes)):
         want = {str(i) for i in slots}
     else:
         want = {str(slots)}
 
-    try:
-        with open(specfile + ".spec", "r", encoding="utf-8") as f:
-            specs = f.read().splitlines()
-    except FileNotFoundError:
-        return []
+    p = Path(specfile)
+    if p.suffix != ".spec": p = p.with_suffix(".spec")
+
+    try: specs = p.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError: return []
 
     out = []
     for s in specs:
         d = sp.split_chain(s)
-
-        slot_vals = d.get("slot")
-        if not slot_vals:
-            continue
-
-        # your grammar: slot is single-valued → slot_vals[0]
-        if slot_vals[0] in want:
-            out.append(s)
-
+        if "slot" not in d or not d["slot"]: continue
+        if d["slot"][0] in want: out.append(s)
     return out
 
-def extract_image_spec(imgfile: str):
-    spec = image2spec.read_spec_exiftool(imgfile)
-    return spec
 
 
-def extract_image_spec_to_slot(imgfile: str,slot:int):
-    spec = image2spec.read_spec_exiftool(imgfile)
+# -------------------------------------
+# slot management
+# -------------------------------------
+
+def used_files(schema: str) -> list[str]:
+    base = Path(schema)
+    dirpath = base.parent
+    stem = base.name
+
+    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
+    files: list[str] = []
+
+    for p in dirpath.iterdir():
+        if not p.is_file():
+            continue
+        if pat.match(p.name):
+            files.append(str(p))
+
+    return files
+
+def slots2jpegs(schema: str, slots: Iterable[int]) -> list[str]:
+    base = Path(schema)
+    dirpath = base.parent
+    stem = base.name
+    out: list[str] = []
+    for i in sorted(set(slots)):
+        p = dirpath / f"{stem}_{i:05d}.jpg"
+        if p.is_file():
+            out.append(str(p))
+    return out
+
+def slots2specs(schema: str, slots: Iterable[int]) -> list[str]:
+    base = Path(schema)
+    dirpath = base.parent
+    stem = base.name
+    out: list[str] = []
+    for i in sorted(set(slots)):
+        p = dirpath / f"{stem}_{i:05d}.spec"
+        if p.is_file():
+            out.append(str(p))
+    return out
+
+def used_slots(schema: str) -> list[int]:
+    base = Path(schema)
+    stem = base.name
+
+    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
+    used: set[int] = set()
+
+    for fname in used_files(schema):
+        p = Path(fname)
+        m = pat.match(p.name)
+        if m:
+            used.add(int(m.group(1)))
+
+    return list(used)
+
+def max_slot(schema: str) -> int | None:
+    used = set(used_slots(schema))
+    if not used: return None
+    return max(used)
+
+def first_free_slot(schema: str) -> int:
+    used = set(used_slots(schema))
+    if not used: return 1
+    universe = set(range(1,max(used)+2))
+    return min(universe - used)
+
+def free_slots(schema: str, required: int) -> list[int]:
+    used = set(used_slots(schema))
+    if not used: return list(range(1,required+1))
+    universe = set(range(1,max(used)+required+1)) # required slot count fits
+    free = universe - used
+    return sorted(free)[:required]
+
+# -------------------------------------
+# spec management
+# -------------------------------------
+
+def spec2slot(spec: str, slot: int) -> str:
     d = sp.split_chain(spec)
-    d["slot"]=[str(slot)]
+    d["slot"] = [str(slot)]
+    return sp.concat_chain(d)
+
+def spec2free(spec: str):
+    return spec2slot(spec,first_free_slot(DICT["outschema"]))
+
+def specs2free(specs: List[str]):
+    new_specs = []
+    for spec, slot in zip(specs, free_slots(DICT["outschema"], len(specs))): 
+        new_specs.append(spec2slot(spec,slot))
+    return new_specs
+
+# -------------------------------------
+#  spec files
+# -------------------------------------
+
+def specfile2free(specf: str):
+    specs = specfile(specf)
+    if not specs: return None  # or [] if you prefer
+    return specs2free(specs)
+
+def specfile_slots2free(specf: str, slots):
+    specs = specfile_slots(specf, slots)
+    if not specs: return None  # or [] if you prefer
+    return specs2free(specs)
+
+# -------------------------------------
+# images
+# -------------------------------------
+
+def image(imgfile: str):
+    return image2spec.read_spec_exiftool(imgfile)
+
+def image2free(imgfile: str):
+    return spec2free(image(imgfile))
+
+def image2slot(imgfile: str,slot:int):
+    return spec2slot(image(imgfile),slot)
+
+def images(
+    schema: str,              # "filedir/filestem"
+    suffices: Iterable[int],  # e.g. [1,3,4] or range(1,10)
+) -> list[str]:
+    used   = set(used_slots(schema))
+    wanted = set(suffices)
+    found  = used & wanted
+    if not found: return []
+    specs: list[str] = []
+    for fn in slots2jpegs(schema,found): specs.append(image(str(fn)))
+    return specs
+
+def images2free(
+    schema: str,              # "filedir/filestem"
+    suffices: Iterable[int],  # e.g. [1,3,4] or range(1,10)
+) -> list[str]:
+    print(f"images2free: {len(suffices)}")
+    return specs2free(images(schema,suffices))
+
+
+# -------------------------------------
+#  ocr
+# -------------------------------------
+
+SCRIPT = Path(__file__).resolve().parent.parent / "lyapunov" / "extract_spec.sh"
+
+def ocr(imagefile):
+    spec = subprocess.check_output(["bash", str(SCRIPT), imagefile],text=True)
+    print(f"OCR:{spec}")
+    d = sp.split_chain(spec)
+    d["source"]=[imagefile]
     spec=sp.concat_chain(d)
     return spec
 
+def ocr2free(imagefile):
+    return spec2free(ocr(imagefile))
+
+# -------------------------------------
+#  spec modifiers
+# -------------------------------------
+
+def rot_expand(spec,rot):
+    d = sp.split_chain(spec)
+    d["rot"]=[str(rot)]
+    spec=sp.concat_chain(d)
+    return spec
+
+def spec_replace_expand(
+    specs: list[str],
+    key: str,
+    old: str,
+    new: str,
+) -> list[str]:
+    out: list[str] = []
+    for spec in specs:
+        d = sp.split_chain(spec)
+        if key in d:
+            d[key] = [v.replace(old, new) for v in d[key]]
+        out.append(sp.concat_chain(d))
+    return out
 
 FUNCS: dict[str, object] = {
     "range":range,
@@ -228,10 +398,24 @@ FUNCS: dict[str, object] = {
     "value": search_values_expand,
     "lines": lines_expand,
     "lines2": lines2_expand,
-    "specs": specs_expand,
-    "spec": spec_expand,
-    "img2spec": extract_image_spec,
-    "img2slot": extract_image_spec_to_slot,
+    # individual specs
+    "spec": spec2free,
+    "specs": specs2free,
+    # specfiles
+    "specfile": specfile2free,
+    "specfile": specfile_slots2free,
+    #
+    "imgage": image2free,
+    "images": images2free,
+    #
+    "ocr": ocr_expand,
+    #
+    "rot": rot_expand,
+    "replace": spec_replace_expand,
+    #
+    "used_slots": used_slots,
+    "free_slots": free_slots,
+
 }
 
 # --- render time functions
