@@ -581,12 +581,24 @@ def render_r2line(fn1: str, fn2: str, delim=":") -> str:
 # -------------------------------------
 
 @with_render_ctx
+def render_lerp(ctx,start,end):
+    row = int(ctx["row"])
+    nrows = int(ctx["nrows"])
+    t = 0.0 if nrows <= 1 else (row - 1) / (nrows - 1)
+    value = float(start) + (float(end) - float(start)) * t
+    return f"{value}"
+
+@with_render_ctx
 def render_square(ctx,start,end):
     row = int(ctx["row"])
     nrows = int(ctx["nrows"])
     t = 0.0 if nrows <= 1 else (row - 1) / (nrows - 1)
     size = float(start) + (float(end) - float(start)) * t
     return f"-{size}:-{size}:{size}:{size}"
+
+# -------------------------------------
+#  function registry
+# -------------------------------------
 
 REF_FUNCS: dict[str, object] = {
     # randomized selections
@@ -615,6 +627,7 @@ REF_FUNCS: dict[str, object] = {
     "r2line":   render_r2line,
     # convenience functions
     "square":   render_square,
+    "lerp":     render_lerp,
     # add functions later if you want (seq, etc.)
     "first":     first_free_slot,
 }
