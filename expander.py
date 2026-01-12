@@ -7,7 +7,7 @@ Scanner + choice expansion core.
 Scanner output (structure, no expansion):
   - Lit(text)
   - Dim("LIST",  raw)   where raw is list-inner text OR a single-item sugar "{...}" / "${...}"
-  - Dim("PLIST", raw)   where raw is progressive-list inner text (same syntax as LIST)
+  - Dim("PLIST", raw)   where raw is progressive-list inner text (same syntax as LIST) but inside a  ">[ ... ]"
   - Ref(key)            render-time reference, key is "row" or a digit string ("1","2",...)
 
 Choice expansion (union semantics inside a LIST/PLIST inner):
@@ -55,10 +55,12 @@ from rasterizer import image2spec
 
 import re
 import math
+import numpy as np
 import ast
 import operator as op
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple, Union
+import contextvars
+from typing import List, Literal, Optional, Tuple, Union, Any
 from collections.abc import Iterable
 from itertools import product
 import random
@@ -66,6 +68,26 @@ import secrets
 from pathlib import Path
 from simpleeval import EvalWithCompoundTypes
 import subprocess
+
+# ============================================================
+# Context handler
+# ============================================================
+
+_RENDER_CTX: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "RENDER_CTX", default=None
+)
+
+def _render_ctx() -> dict[str, Any]:
+    ctx = _RENDER_CTX.get()
+    if ctx is None:
+        raise RuntimeError("render-time function called outside render context")
+    return ctx
+
+def with_render_ctx(fn):
+    """Decorator: inject current render_names as first arg (hidden from spec)."""
+    def wrapper(*args, **kwargs):
+        return fn(_render_ctx(), *args, **kwargs)
+    return wrapper
 
 # ============================================================
 # Segments (scanner output)
@@ -108,6 +130,7 @@ def set_dict(d: dict[str, str]) -> None:
     DICT.clear()
     DICT.update(d)
 
+
 # ============================================================
 # Simpleeval config for ${...}, #{...}
 # ============================================================
@@ -129,6 +152,12 @@ NAMES = {
 }
 
 # --- choice time functions
+# these are vectors, the cross product
+# of all is computed
+
+# -------------------------------------
+#  search dicr
+# -------------------------------------
 
 def search_keys_expand(pat):
     rx = re.compile(pat)
@@ -140,13 +169,29 @@ def search_values_expand(pat):
     matches = [ DICT[k] for k in DICT.keys() if rx.fullmatch(k) ]
     return matches
 
+# -------------------------------------
+#  random numbers
+# -------------------------------------
+
 def rint_expand(N):
     return RNG.randint(1,N)
 
 def rfloat_expand(a,b):
     return RNG.uniform(a,b)
 
-# global cache
+# -------------------------------------
+#  0 -> 1 steps
+# -------------------------------------
+
+def seq(num):
+    vec = np.linspace(0.0,1.0,num)
+    out=[f"{x}" for x in vec]
+    return out
+
+# -------------------------------------
+#  read files
+# -------------------------------------
+
 line_dict_expand: dict[str, list[str]] = {}
 
 def lines_expand(fn: str, lno: int):
@@ -284,6 +329,36 @@ def free_slots(schema: str, required: int) -> list[int]:
     free = universe - used
     return sorted(free)[:required]
 
+def slots(required: int) -> list[int]:
+    return free_slots(DICT["outschema"], required)
+
+
+# -------------------------------------
+#  spec modifiers
+# -------------------------------------
+
+def spec_rot(spec,rot):
+    d = sp.split_chain(spec)
+    d["rot"]=[str(rot)]
+    spec=sp.concat_chain(d)
+    return spec
+
+def specs_rot(specs: List[str],rot):
+    new_specs = []
+    for spec in specs: new_specs.append(spec_rot(spec,rot))
+    return new_specs
+
+
+def spec_replace(spec: str, key: str, old: str, new: str) -> str:
+    d = sp.split_chain(spec)
+    if key in d:
+        d[key] = [v.replace(old, new) for v in d[key]]
+    return sp.concat_chain(d)
+
+def specs_replace(specs: str | list[str], key: str, old: str, new: str) -> list[str]:
+    if isinstance(specs, str): specs = [specs]
+    return [spec_replace(s, key, old, new) for s in specs]
+
 # -------------------------------------
 # spec management
 # -------------------------------------
@@ -297,6 +372,7 @@ def spec2free(spec: str):
     return spec2slot(spec,first_free_slot(DICT["outschema"]))
 
 def specs2free(specs: List[str]):
+    if isinstance(specs, str): specs = [specs]
     new_specs = []
     for spec, slot in zip(specs, free_slots(DICT["outschema"], len(specs))): 
         new_specs.append(spec2slot(spec,slot))
@@ -326,19 +402,12 @@ def image(imgfile: str):
 def image2free(imgfile: str):
     return spec2free(image(imgfile))
 
-def image2slot(imgfile: str,slot:int):
-    return spec2slot(image(imgfile),slot)
-
 def images(
     schema: str,              # "filedir/filestem"
     suffices: Iterable[int],  # e.g. [1,3,4] or range(1,10)
 ) -> list[str]:
-    used   = set(used_slots(schema))
-    wanted = set(suffices)
-    found  = used & wanted
-    if not found: return []
     specs: list[str] = []
-    for fn in slots2jpegs(schema,found): specs.append(image(str(fn)))
+    for fn in slots2jpegs(schema,suffices): specs.append(image(str(fn)))
     return specs
 
 def images2free(
@@ -356,6 +425,7 @@ def images2free(
 SCRIPT = Path(__file__).resolve().parent.parent / "lyapunov" / "extract_spec.sh"
 
 def ocr(imagefile):
+    print(f"OCR file:{imagefile}")
     spec = subprocess.check_output(["bash", str(SCRIPT), imagefile],text=True)
     print(f"OCR:{spec}")
     d = sp.split_chain(spec)
@@ -366,64 +436,55 @@ def ocr(imagefile):
 def ocr2free(imagefile):
     return spec2free(ocr(imagefile))
 
-# -------------------------------------
-#  spec modifiers
-# -------------------------------------
-
-def rot_expand(spec,rot):
-    d = sp.split_chain(spec)
-    d["rot"]=[str(rot)]
-    spec=sp.concat_chain(d)
-    return spec
-
-def spec_replace_expand(
-    specs: list[str],
-    key: str,
-    old: str,
-    new: str,
-) -> list[str]:
-    out: list[str] = []
-    for spec in specs:
-        d = sp.split_chain(spec)
-        if key in d:
-            d[key] = [v.replace(old, new) for v in d[key]]
-        out.append(sp.concat_chain(d))
-    return out
+def ocrs2free(schema,slots):
+    specs=[]
+    for jpeg in slots2jpegs(schema,slots): specs.append(ocr(jpeg))
+    return specs2free(specs)
 
 FUNCS: dict[str, object] = {
-    "range":range,
-    "rint": rint_expand,
-    "rfloat": rfloat_expand,
-    "key": search_keys_expand,
-    "value": search_values_expand,
-    "lines": lines_expand,
-    "lines2": lines2_expand,
+    "range":        range,
+    "rint":         rint_expand,
+    "rfloat":       rfloat_expand,
+    "key":          search_keys_expand,
+    "value":        search_values_expand,
+    # sequence
+    "seq":          seq,
+    # files
+    "lines":        lines_expand,
+    "lines2":       lines2_expand,
+    # specs in files
+    "specf":        specfile_slots2free,
+    # specs in images
+    "img":          images2free,
+    # ocr files
+    "ocr":          ocr2free,
+    "ocrs":         ocrs2free,
     # individual specs
-    "spec": spec2free,
-    "specs": specs2free,
-    # specfiles
-    "specfile": specfile2free,
-    "specfile": specfile_slots2free,
-    #
-    "imgage": image2free,
-    "images": images2free,
-    #
-    "ocr": ocr_expand,
-    #
-    "rot": rot_expand,
-    "replace": spec_replace_expand,
-    #
-    "used_slots": used_slots,
-    "free_slots": free_slots,
-
+    "spec":         spec2free,
+    "rot":          specs_rot,
+    "swap":         specs_replace,
+    "free":         specs2free,
+    # utilities
+    "slots":        slots,
+    "used_slots":   used_slots,
+    "free_slots":   free_slots,
+    "slots2jpegs":  slots2jpegs,
+    "slots2specs":  slots2specs,
+    "first":        first_free_slot,
 }
 
-# --- render time functions
+#######################################
+#
+# render time functions
+#
+#######################################
 
-def choose(*args):
+# these need to be valies not vectors
+
+def render_choose(*args):
     return f"{RNG.choice(args)}"
 
-def search_keys_ref(pat, exclude=None):
+def render_search_keys(pat, exclude=None):
     rx = re.compile(pat)
     exc = None if exclude is None else str(exclude)
     matches = [
@@ -432,7 +493,7 @@ def search_keys_ref(pat, exclude=None):
     ]
     return f"{RNG.choice(matches) if matches else None}"
 
-def search_values_ref(pat, exclude=None):
+def render_search_values(pat, exclude=None):
     rx = re.compile(pat)
     exc = None if exclude is None else str(exclude)
     matches = [
@@ -441,52 +502,54 @@ def search_values_ref(pat, exclude=None):
     ]
     return f"{RNG.choice(matches) if matches else None}"
 
-def rvalues_ref():
+def render_rvalues():
     vals = [DICT[k] for k in DICT.keys()]
     return f"{RNG.choice(vals)}"
 
-def rint_ref(N):
+def render_rint(N):
     return f"{RNG.randint(1,N)}"
 
-def rfloat_ref(a,b):
+def render_rfloat(a,b):
     return f"{RNG.uniform(a,b)}"
 
-def rfloat3_ref(a,b):
+def render_rfloat3(a,b):
     return f"{round(RNG.uniform(a,b),3)}"
 
-def num(x): return float(x)
-def i(x): return int(float(x))
-def zfill(x, w): return str(x).zfill(int(w))
-def fmt(s, *args): return str(s).format(*args)
-def at(seq, idx): return seq[int(idx)]
-def wat(seq, idx):
+def render_num(x): return float(x)
+def render_i(x): return int(float(x))
+def render_zfill(x, w): return str(x).zfill(int(w))
+def render_fmt(s, *args): return str(s).format(*args)
+def render_at(seq, idx): return seq[int(idx)]
+def render_wat(seq, idx):
     i = int(idx)
     n = len(seq)
     if n == 0:
         return f"{None}"  # or raise
     return f"{seq[i % n]}"     # wrap-around
 
+# -------------------------------------
+#  render from file
+# -------------------------------------
+
 # global cache
 line_dict_ref: dict[str, list[str]] = {}
 
-def line_ref(fn: str, lno: int) -> str:
+def render_file_line(fn: str, lno: int) -> str:
     """
     Return line number lno (0-based) from file fn.
     Caches file contents across calls.
     """
     global line_dict_ref
-
     if fn not in line_dict_ref:
         with open(fn, "r", encoding="utf-8") as f:
             # keep lines without trailing newline
             line_dict_ref[fn] = f.read().splitlines()
-
     try:
         return f"{line_dict_ref[fn][lno]}"
     except IndexError:
         raise IndexError(f"line number {lno} out of range for file '{fn}'")
 
-def rline_ref(fn: str) -> str:
+def render_random_file_line(fn: str) -> str:
     """
     Return a random line from file fn.
     Caches file contents across calls.
@@ -502,36 +565,58 @@ def rline_ref(fn: str) -> str:
 
     return f"{RNG.choice(line_dict_ref[fn])}"
 
-def rline2_ref(fn: str, delim=":") -> str:
-    l1 = rline_ref(fn)
-    l2 = rline_ref(fn)
+def render_rline2(fn: str, delim=":") -> str:
+    l1 = render_random_file_line(fn)
+    l2 = render_random_file_line(fn)
     return f"{l1}{delim}{l2}"
 
-def r2line_ref(fn1: str, fn2: str, delim=":") -> str:
-    l1 = rline_ref(fn1)
-    l2 = rline_ref(fn2)
+def render_r2line(fn1: str, fn2: str, delim=":") -> str:
+    l1 = render_random_file_line(fn1)
+    l2 = render_random_file_line(fn2)
     return f"{l1}{delim}{l2}"
+
+
+# -------------------------------------
+#  convenience
+# -------------------------------------
+
+@with_render_ctx
+def render_square(ctx,start,end):
+    row = int(ctx["row"])
+    nrows = int(ctx["nrows"])
+    t = 0.0 if nrows <= 1 else (row - 1) / (nrows - 1)
+    size = float(start) + (float(end) - float(start)) * t
+    return f"-{size}:-{size}:{size}:{size}"
 
 REF_FUNCS: dict[str, object] = {
-    "choose": choose,
-    "key": search_keys_ref,
-    "value": search_values_ref,
-    "rval": rvalues_ref,
-    "rint": rint_ref,
-    "rfloat": rfloat_ref,
-    "rfloat3": rfloat3_ref,
-    "num": num,
-    "i": i,
-    "zfill": zfill,
-    "fmt":  fmt,
-    "at": at,
-    "wat": wat,
-    "line": line_ref,
-    "rline": rline_ref,
-    "rline2": rline2_ref,
-    "r2line": r2line_ref,
-    "str": str,
+    # randomized selections
+    "choose":   render_choose,
+    "rval":     render_rvalues,
+    "rint":     render_rint,
+    "rfloat":   render_rfloat,
+    "rfloat3":  render_rfloat3,
+    # search DICT
+    "key":      render_search_keys,
+    "value":    render_search_values,
+    # type conversions
+    "num":      render_num, # numeric
+    "i":        render_i, # integer
+    "str":      str,
+    # formatting
+    "zfill":    render_zfill, #
+    "fmt":      render_fmt,
+    # access dimensions
+    "at":       render_at,
+    "wat":      render_wat,
+    # file access
+    "line":     render_file_line,
+    "rline":    render_random_file_line,
+    "rline2":   render_rline2,
+    "r2line":   render_r2line,
+    # convenience functions
+    "square":   render_square,
     # add functions later if you want (seq, etc.)
+    "first":     first_free_slot,
 }
 
 # --- init time functions
@@ -1267,7 +1352,7 @@ def progressive_choices(inner: str) -> List[str]:
 # ============================================================
 
 MACROS: dict[str, str] = {}
-_MACRO_KEY_RE = re.compile(r"^@[A-Z0-9]+$")
+_MACRO_KEY_RE = re.compile(r"^@[A-Z0-9@]+$")
 
 def macro(s: str) -> str:
     """
@@ -1386,18 +1471,22 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     if not dim_choices:
         render_names = dict(base_render_names)
         render_names["row"] = 1
-        se = EvalWithCompoundTypes(names=render_names, functions=REF_FUNCS, operators=ALLOWED_OPS)
-
-        parts = []
-        for s in segs:
-            if isinstance(s, Lit):
-                parts.append(s.text)
-            elif isinstance(s, Ref):
-                try:
-                    parts.append(str(se.eval(s.key)))
-                except Exception:
-                    parts.append(f"#{{{s.key}}}")
-        out.append("".join(parts))
+        #NAMES.update(base_render_names)
+        tok = _RENDER_CTX.set(render_names)
+        try:
+            se = EvalWithCompoundTypes(names=render_names, functions=REF_FUNCS, operators=ALLOWED_OPS)
+            parts = []
+            for s in segs:
+                if isinstance(s, Lit):
+                    parts.append(s.text)
+                elif isinstance(s, Ref):
+                    try:
+                        parts.append(str(se.eval(s.key)))
+                    except Exception:
+                        parts.append(f"#{{{s.key}}}")
+            out.append("".join(parts))
+        finally:
+            _RENDER_CTX.reset(tok)
         return out
 
     # Render-time eval for #{...}:
@@ -1411,31 +1500,34 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
         for j, v in enumerate(picks, start=1):
             render_names[f"d{j}"] = v
 
-        se = EvalWithCompoundTypes(names=render_names, functions=REF_FUNCS, operators=ALLOWED_OPS)
-
-        parts = []
-        dim_i = 0
-        for s in segs:
-            if isinstance(s, Lit):
-                parts.append(s.text)
-            elif isinstance(s, Dim):
-                parts.append(picks[dim_i])
-                dim_i += 1
-            elif isinstance(s, Ref):
-                try:
-                    parts.append(str(se.eval(s.key)))
-                except Exception:
-                    parts.append(f"#{{{s.key}}}")  # leave literal on eval failure
-            elif isinstance(s, Init):
-                continue
-            else:
-                pass #should be error?
-        
-        # Important: append ONCE per row (after all segments are rendered),
-        # not once per segment.
-        out.append("".join(parts))
-        if limit and len(out) >= limit:
-            break
+        #NAMES.update(render_names)
+        tok = _RENDER_CTX.set(render_names)
+        try:
+            se = EvalWithCompoundTypes(names=render_names, functions=REF_FUNCS, operators=ALLOWED_OPS)
+            parts = []
+            dim_i = 0
+            for s in segs:
+                if isinstance(s, Lit):
+                    parts.append(s.text)
+                elif isinstance(s, Dim):
+                    parts.append(picks[dim_i])
+                    dim_i += 1
+                elif isinstance(s, Ref):
+                    try:
+                        parts.append(str(se.eval(s.key)))
+                    except Exception:
+                        parts.append(f"#{{{s.key}}}")  # leave literal on eval failure
+                elif isinstance(s, Init):
+                    continue
+                else:
+                    pass #should be error?
+            # Important: append ONCE per row (after all segments are rendered),
+            # not once per segment.
+            out.append("".join(parts))
+            if limit and len(out) >= limit:
+                break
+        finally:
+            _RENDER_CTX.reset(tok)
 
     return out
 
@@ -1544,7 +1636,7 @@ def _selftest() -> None:
 
     # --- full expand tests (cartesian + refs) ---
     assert expand("[1,2] #{row}") == ["1 1", "2 2"]
-    assert expand("[a,b]{1:2}::#{1}-#{2}-#{row}") == [
+    assert expand("[a,b]{1:2}::#{d1}-#{d2}-#{row}") == [
         "a1::a-1-1",
         "a2::a-2-2",
         "b1::b-1-3",

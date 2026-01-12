@@ -1,6 +1,24 @@
 #!/usr/bin/env python
 # specparser.py — minimal CLI-safe parser (names kept as strings)
 
+from __future__ import annotations
+from pathlib import Path
+import importlib.util
+import sys  # <-- add
+
+parent = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(parent))
+
+def _load_sibling(name):
+    mod_path = Path(__file__).resolve().with_name(f"{name}.py")
+    mod_spec = importlib.util.spec_from_file_location(f"_{name}_local", mod_path)
+    assert mod_spec and mod_spec.loader
+    mod = importlib.util.module_from_spec(mod_spec)
+    # IMPORTANT: register before exec_module (dataclasses expects this)
+    sys.modules[mod_spec.name] = mod
+    mod_spec.loader.exec_module(mod)
+    return mod
+
 import re
 import ast
 from simpleeval import SimpleEval, NameNotDefined, InvalidExpression, DEFAULT_OPERATORS
@@ -12,6 +30,8 @@ import argparse
 import sys
 import numpy as np
 import random
+from typing import List, Literal, Optional, Tuple, Union
+from collections.abc import Iterable
 
 __all__ = [
     "SpecParseError",
@@ -75,6 +95,60 @@ def rint(N):
 def rfloat(a,b):
     return random.uniform(a,b)
 
+# -------------------------------------
+# slot management
+# -------------------------------------
+
+def used_files(schema: str) -> list[str]:
+    base = Path(schema)
+    dirpath = base.parent
+    stem = base.name
+
+    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
+    files: list[str] = []
+
+    for p in dirpath.iterdir():
+        if not p.is_file():
+            continue
+        if pat.match(p.name):
+            files.append(str(p))
+
+    return files
+
+
+def used_slots(schema: str) -> list[int]:
+    base = Path(schema)
+    stem = base.name
+
+    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
+    used: set[int] = set()
+
+    for fname in used_files(schema):
+        p = Path(fname)
+        m = pat.match(p.name)
+        if m:
+            used.add(int(m.group(1)))
+
+    return list(used)
+
+def max_slot(schema: str) -> int | None:
+    used = set(used_slots(schema))
+    if not used: return None
+    return max(used)
+
+def first_free_slot(schema: str) -> int:
+    used = set(used_slots(schema))
+    if not used: return 1
+    universe = set(range(1,max(used)+2))
+    return min(universe - used)
+
+def free_slots(schema: str, required: int) -> list[int]:
+    used = set(used_slots(schema))
+    if not used: return list(range(1,required+1))
+    universe = set(range(1,max(used)+required+1)) # required slot count fits
+    free = universe - used
+    return sorted(free)[:required]
+
 FUNCS = {
     # pick only what you truly need
     "sin": cmath.sin, 
@@ -89,6 +163,9 @@ FUNCS = {
     "lerp": lerp,
     "rint": rint,
     "rfloat": rfloat,
+    "slotmax": max_slot,
+    "slotmin": first_free_slot,
+    "slots": free_slots,
 }
 
 def simple_eval_number(expr: str) -> complex:
@@ -228,12 +305,24 @@ def get_required_arg(spec: str, key: str) -> str:
     return str(vals[0]).strip()
 
 
+# ---------- slot suffix ----------
+
+def add_slot(spec: str) -> str:
+    d = split_chain(spec)
+    if "slot" in d: return spec
+    slot=str(first_free_slot(NAMES["outschema"]))
+    d["slot"]=[slot]
+    return concat_chain(d)
+
 def slot_suffix(spec: str, width: int = 5) -> str:
-    s = get_required_arg(spec, "slot")
-    # numeric slot: pad for lexicographic ordering
-    if s.isdigit(): return s.zfill(width)
-    # otherwise use as-is (caller decides if allowed)
-    return s
+    d = split_chain(spec)
+    if "slot" in d:
+        vals = d["slot"]
+        slot = str(vals[0].strip())
+        if slot.isdigit(): return slot.zfill(width)
+        return slot
+    slot=str(first_free_slot(NAMES["outschema"])).zfill(width)
+    return slot
 
 # ---------- CLI ----------
 

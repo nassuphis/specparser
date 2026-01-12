@@ -105,7 +105,6 @@ Error behavior
 - Invalid `{...}` body or malformed tokens are kept as literal text (no hard failure).
 - Unknown references (e.g., `#{99}`) are left as literal.
 """
-
 import re
 import math
 import json
