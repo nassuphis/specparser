@@ -1,3 +1,6 @@
+#
+uv.lock
+
 # suff to exclude
 *.pdf 
 *.out 

@@ -25,34 +25,15 @@ Choice expansion (union semantics inside a LIST/PLIST inner):
   - nested [...] inside list items:
       a[b,c]d -> abd, acd
 """
+
 from __future__ import annotations
 from pathlib import Path
-import importlib.util
-import sys  # <-- add
 
-parent = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(parent))
-
-def _load_sibling(name):
-    mod_path = Path(__file__).resolve().with_name(f"{name}.py")
-    mod_spec = importlib.util.spec_from_file_location(f"_{name}_local", mod_path)
-    assert mod_spec and mod_spec.loader
-    mod = importlib.util.module_from_spec(mod_spec)
-    # IMPORTANT: register before exec_module (dataclasses expects this)
-    sys.modules[mod_spec.name] = mod
-    mod_spec.loader.exec_module(mod)
-    return mod
-
-if __name__ == "__main__" and (__package__ is None or __package__ == ""):
-    # running as a standalone script: python ../specparser/expander.py ...
-    sp = _load_sibling("specparser")
-else:
-    # imported as part of the specparser package: from specparser import expander
-    from . import specparser as sp
-
-
-from rasterizer import image2spec 
-
+# Package data directory (relative to this file: src/specparser/expander.py -> data/)
+DATA_DIR = Path(__file__).parent.parent.parent / "data"
+from . import chain as sp
+from . import image2spec 
+from . import slots as slotfuns
 import re
 import math
 import numpy as np
@@ -253,84 +234,13 @@ def specfile_slots(specfile: str | Path, slots): # read specific slots
     return out
 
 
-
 # -------------------------------------
 # slot management
 # -------------------------------------
 
-def used_files(schema: str) -> list[str]:
-    base = Path(schema)
-    dirpath = base.parent
-    stem = base.name
-
-    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
-    files: list[str] = []
-
-    for p in dirpath.iterdir():
-        if not p.is_file():
-            continue
-        if pat.match(p.name):
-            files.append(str(p))
-
-    return files
-
-def slots2jpegs(schema: str, slots: Iterable[int]) -> list[str]:
-    base = Path(schema)
-    dirpath = base.parent
-    stem = base.name
-    out: list[str] = []
-    for i in sorted(set(slots)):
-        p = dirpath / f"{stem}_{i:05d}.jpg"
-        if p.is_file():
-            out.append(str(p))
-    return out
-
-def slots2specs(schema: str, slots: Iterable[int]) -> list[str]:
-    base = Path(schema)
-    dirpath = base.parent
-    stem = base.name
-    out: list[str] = []
-    for i in sorted(set(slots)):
-        p = dirpath / f"{stem}_{i:05d}.spec"
-        if p.is_file():
-            out.append(str(p))
-    return out
-
-def used_slots(schema: str) -> list[int]:
-    base = Path(schema)
-    stem = base.name
-
-    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
-    used: set[int] = set()
-
-    for fname in used_files(schema):
-        p = Path(fname)
-        m = pat.match(p.name)
-        if m:
-            used.add(int(m.group(1)))
-
-    return list(used)
-
-def max_slot(schema: str) -> int | None:
-    used = set(used_slots(schema))
-    if not used: return None
-    return max(used)
-
-def first_free_slot(schema: str) -> int:
-    used = set(used_slots(schema))
-    if not used: return 1
-    universe = set(range(1,max(used)+2))
-    return min(universe - used)
-
-def free_slots(schema: str, required: int) -> list[int]:
-    used = set(used_slots(schema))
-    if not used: return list(range(1,required+1))
-    universe = set(range(1,max(used)+required+1)) # required slot count fits
-    free = universe - used
-    return sorted(free)[:required]
 
 def slots(required: int) -> list[int]:
-    return free_slots(DICT["outschema"], required)
+    return slotfuns.slots(DICT["outschema"], required)
 
 
 # -------------------------------------
@@ -369,12 +279,12 @@ def spec2slot(spec: str, slot: int) -> str:
     return sp.concat_chain(d)
 
 def spec2free(spec: str):
-    return spec2slot(spec,first_free_slot(DICT["outschema"]))
+    return spec2slot(spec,slotfuns.first_free_slot(DICT["outschema"]))
 
 def specs2free(specs: List[str]):
     if isinstance(specs, str): specs = [specs]
     new_specs = []
-    for spec, slot in zip(specs, free_slots(DICT["outschema"], len(specs))): 
+    for spec, slot in zip(specs, slotfuns.free_slots(DICT["outschema"], len(specs))): 
         new_specs.append(spec2slot(spec,slot))
     return new_specs
 
@@ -407,7 +317,7 @@ def images(
     suffices: Iterable[int],  # e.g. [1,3,4] or range(1,10)
 ) -> list[str]:
     specs: list[str] = []
-    for fn in slots2jpegs(schema,suffices): specs.append(image(str(fn)))
+    for fn in slotfuns.slots2jpegs(schema,suffices): specs.append(image(str(fn)))
     return specs
 
 def images2free(
@@ -438,7 +348,7 @@ def ocr2free(imagefile):
 
 def ocrs2free(schema,slots):
     specs=[]
-    for jpeg in slots2jpegs(schema,slots): specs.append(ocr(jpeg))
+    for jpeg in slotfuns.slots2jpegs(schema,slots): specs.append(ocr(jpeg))
     return specs2free(specs)
 
 FUNCS: dict[str, object] = {
@@ -466,11 +376,11 @@ FUNCS: dict[str, object] = {
     "free":         specs2free,
     # utilities
     "slots":        slots,
-    "used_slots":   used_slots,
-    "free_slots":   free_slots,
-    "slots2jpegs":  slots2jpegs,
-    "slots2specs":  slots2specs,
-    "first":        first_free_slot,
+    "used_slots":   slotfuns.used_slots,
+    "free_slots":   slotfuns.free_slots,
+    "slots2jpegs":  slotfuns.slots2jpegs,
+    "slots2specs":  slotfuns.slots2specs,
+    "first":        slotfuns.first_free_slot,
 }
 
 #######################################
@@ -629,7 +539,7 @@ REF_FUNCS: dict[str, object] = {
     "square":   render_square,
     "lerp":     render_lerp,
     # add functions later if you want (seq, etc.)
-    "first":     first_free_slot,
+    "first":     slotfuns.first_free_slot,
 }
 
 # --- init time functions
@@ -1378,7 +1288,7 @@ def macro(s: str) -> str:
             out = out.replace(k, v)
     return out
 
-def macro_init(fn: str) -> bool:
+def macro_init(fn: str | Path) -> bool:
     """
     Initialize global MACROS from a file with lines like:
     @MACRO=value
@@ -1676,7 +1586,7 @@ def _main() -> int:
     p.add_argument("--limit", type=int, default=0, help="Limit printed expansion lines (0 = no limit)")
     args = p.parse_args()
 
-    macro_init("macros.txt")
+    macro_init(DATA_DIR / "macros.txt")
 
     if args.selftest:
         _selftest()

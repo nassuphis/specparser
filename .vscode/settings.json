@@ -1,4 +1,7 @@
 {
-    "python.analysis.extraPaths": ["/Users/nicknassuphis/"]
+    "python.analysis.extraPaths": [
+        "/Users/nicknassuphis/"
+    ],
+    "python-envs.pythonProjects": []
 }
 

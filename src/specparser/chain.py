@@ -5,20 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 import importlib.util
 import sys  # <-- add
-
-parent = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(parent))
-
-def _load_sibling(name):
-    mod_path = Path(__file__).resolve().with_name(f"{name}.py")
-    mod_spec = importlib.util.spec_from_file_location(f"_{name}_local", mod_path)
-    assert mod_spec and mod_spec.loader
-    mod = importlib.util.module_from_spec(mod_spec)
-    # IMPORTANT: register before exec_module (dataclasses expects this)
-    sys.modules[mod_spec.name] = mod
-    mod_spec.loader.exec_module(mod)
-    return mod
-
 import re
 import ast
 from simpleeval import SimpleEval, NameNotDefined, InvalidExpression, DEFAULT_OPERATORS
