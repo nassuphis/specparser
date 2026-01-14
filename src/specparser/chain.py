@@ -2,10 +2,10 @@
 # specparser.py — minimal CLI-safe parser (names kept as strings)
 
 from __future__ import annotations
-from pathlib import Path
 import importlib.util
 import sys  # <-- add
 import re
+from . import slots as slotfuns
 import ast
 from simpleeval import SimpleEval, NameNotDefined, InvalidExpression, DEFAULT_OPERATORS
 import operator as op
@@ -81,60 +81,6 @@ def rint(N):
 def rfloat(a,b):
     return random.uniform(a,b)
 
-# -------------------------------------
-# slot management
-# -------------------------------------
-
-def used_files(schema: str) -> list[str]:
-    base = Path(schema)
-    dirpath = base.parent
-    stem = base.name
-
-    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
-    files: list[str] = []
-
-    for p in dirpath.iterdir():
-        if not p.is_file():
-            continue
-        if pat.match(p.name):
-            files.append(str(p))
-
-    return files
-
-
-def used_slots(schema: str) -> list[int]:
-    base = Path(schema)
-    stem = base.name
-
-    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$")
-    used: set[int] = set()
-
-    for fname in used_files(schema):
-        p = Path(fname)
-        m = pat.match(p.name)
-        if m:
-            used.add(int(m.group(1)))
-
-    return list(used)
-
-def max_slot(schema: str) -> int | None:
-    used = set(used_slots(schema))
-    if not used: return None
-    return max(used)
-
-def first_free_slot(schema: str) -> int:
-    used = set(used_slots(schema))
-    if not used: return 1
-    universe = set(range(1,max(used)+2))
-    return min(universe - used)
-
-def free_slots(schema: str, required: int) -> list[int]:
-    used = set(used_slots(schema))
-    if not used: return list(range(1,required+1))
-    universe = set(range(1,max(used)+required+1)) # required slot count fits
-    free = universe - used
-    return sorted(free)[:required]
-
 FUNCS = {
     # pick only what you truly need
     "sin": cmath.sin, 
@@ -149,9 +95,9 @@ FUNCS = {
     "lerp": lerp,
     "rint": rint,
     "rfloat": rfloat,
-    "slotmax": max_slot,
-    "slotmin": first_free_slot,
-    "slots": free_slots,
+    "slotmax": slotfuns.max_slot,
+    "slotmin": slotfuns.first_free_slot,
+    "slots": slotfuns.free_slots,
 }
 
 def simple_eval_number(expr: str) -> complex:
@@ -296,7 +242,7 @@ def get_required_arg(spec: str, key: str) -> str:
 def add_slot(spec: str) -> str:
     d = split_chain(spec)
     if "slot" in d: return spec
-    slot=str(first_free_slot(NAMES["outschema"]))
+    slot=str(slotfuns.first_free_slot(NAMES["outschema"]))
     d["slot"]=[slot]
     return concat_chain(d)
 
@@ -307,7 +253,7 @@ def slot_suffix(spec: str, width: int = 5) -> str:
         slot = str(vals[0].strip())
         if slot.isdigit(): return slot.zfill(width)
         return slot
-    slot=str(first_free_slot(NAMES["outschema"])).zfill(width)
+    slot=str(slotfuns.first_free_slot(NAMES["outschema"])).zfill(width)
     return slot
 
 # ---------- CLI ----------
