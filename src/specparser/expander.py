@@ -34,6 +34,7 @@ DATA_DIR = Path(__file__).parent.parent.parent / "data"
 from . import chain as sp
 from . import image2spec 
 from . import slots as slotfuns
+from . import dates as datefuns
 import re
 import math
 import numpy as np
@@ -381,6 +382,9 @@ FUNCS: dict[str, object] = {
     "slots2jpegs":  slotfuns.slots2jpegs,
     "slots2specs":  slotfuns.slots2specs,
     "first":        slotfuns.first_free_slot,
+    # dates
+    "bizdays":      datefuns.good_days,
+
 }
 
 #######################################
