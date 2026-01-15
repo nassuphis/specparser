@@ -20,7 +20,7 @@ Choice expansion (union semantics inside a LIST/PLIST inner):
   - ${...} simpleeval:
       scalar -> single choice
       iterable -> multiple choices
-    always returns list[str] (never iterates over a string’s characters).
+    always returns list[str] (never iterates over a string's characters).
 
   - nested [...] inside list items:
       a[b,c]d -> abd, acd
@@ -29,92 +29,34 @@ Choice expansion (union semantics inside a LIST/PLIST inner):
 from __future__ import annotations
 from pathlib import Path
 
-# Package data directory (relative to this file: src/specparser/expander.py -> data/)
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
-from . import chain as sp
-from . import image2spec 
-from . import slots as slotfuns
-from . import dates as datefuns
 import re
 import math
-import numpy as np
 import ast
 import operator as op
 from dataclasses import dataclass
-import contextvars
-from typing import List, Literal, Optional, Tuple, Union, Any
+from typing import List, Literal, Optional, Tuple, Union
 from collections.abc import Iterable
 from itertools import product
-import random
-import secrets
-from pathlib import Path
 from simpleeval import EvalWithCompoundTypes
-import subprocess
 
-# ============================================================
-# Context handler
-# ============================================================
+# Package data directory (relative to this file: src/specparser/expander.py -> data/)
+DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
-_RENDER_CTX: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
-    "RENDER_CTX", default=None
-)
+# Import shared state and function registries
+from . import expander_state as state
+from .init_funcs import INIT_FUNCS
+from .expand_funcs import FUNCS
+from .render_funcs import REF_FUNCS, set_render_ctx, reset_render_ctx
 
-def _render_ctx() -> dict[str, Any]:
-    ctx = _RENDER_CTX.get()
-    if ctx is None:
-        raise RuntimeError("render-time function called outside render context")
-    return ctx
-
-def with_render_ctx(fn):
-    """Decorator: inject current render_names as first arg (hidden from spec)."""
-    def wrapper(*args, **kwargs):
-        return fn(_render_ctx(), *args, **kwargs)
-    return wrapper
-
-# ============================================================
-# Segments (scanner output)
-# ============================================================
-
-DimKind = Literal["LIST", "PLIST"]
-
-@dataclass(frozen=True)
-class Lit:
-    text: str
-
-@dataclass(frozen=True)
-class Dim:
-    dim_kind: DimKind
-    raw: str  # LIST/PLIST inner text; for implicit sugar, raw includes "{...}" or "${...}" or "@{...}"
-
-@dataclass(frozen=True)
-class Ref:
-    key: str  # "row" or "1","2",...
-
-@dataclass(frozen=True)
-class Init:
-    expr: str
-
-Segment = Union[Lit, Dim, Ref, Init]
+# Re-export for backwards compatibility
+DICT = state.DICT
+NAMES = state.NAMES
+RNG = state.RNG
+set_dict = state.set_dict
 
 
 # ============================================================
-# The term dictionary
-# ============================================================
-
-# User-populated registry for @{...}
-DICT: dict[str, str] = {
-    "aa": "X",
-    "ab": "Y",
-    "ba": "Z"
-}
-
-def set_dict(d: dict[str, str]) -> None:
-    DICT.clear()
-    DICT.update(d)
-
-
-# ============================================================
-# Simpleeval config for ${...}, #{...}
+# Simpleeval config
 # ============================================================
 
 ALLOWED_OPS = {
@@ -129,499 +71,37 @@ ALLOWED_OPS = {
     ast.Mod: op.mod,
 }
 
-NAMES = {
-    "pi": complex(math.pi),
-}
 
-# --- choice time functions
-# these are vectors, the cross product
-# of all is computed
+# ============================================================
+# Segments (scanner output)
+# ============================================================
 
-# -------------------------------------
-#  search dicr
-# -------------------------------------
+DimKind = Literal["LIST", "PLIST"]
 
-def search_keys_expand(pat):
-    rx = re.compile(pat)
-    matches = [ k for k in DICT.keys() if rx.fullmatch(k) ]
-    return matches
 
-def search_values_expand(pat):
-    rx = re.compile(pat)   
-    matches = [ DICT[k] for k in DICT.keys() if rx.fullmatch(k) ]
-    return matches
+@dataclass(frozen=True)
+class Lit:
+    text: str
 
-# -------------------------------------
-#  random numbers
-# -------------------------------------
 
-def rint_expand(N):
-    return RNG.randint(1,N)
+@dataclass(frozen=True)
+class Dim:
+    dim_kind: DimKind
+    raw: str  # LIST/PLIST inner text; for implicit sugar, raw includes "{...}" or "${...}" or "@{...}"
 
-def rfloat_expand(a,b):
-    return RNG.uniform(a,b)
 
-# -------------------------------------
-#  0 -> 1 steps
-# -------------------------------------
+@dataclass(frozen=True)
+class Ref:
+    key: str  # "row" or "1","2",...
 
-def seq(num):
-    vec = np.linspace(0.0,1.0,num)
-    out=[f"{x}" for x in vec]
-    return out
 
-# -------------------------------------
-#  read files
-# -------------------------------------
+@dataclass(frozen=True)
+class Init:
+    expr: str
 
-line_dict_expand: dict[str, list[str]] = {}
 
-def lines_expand(fn: str, lno: int):
-    global line_dict_expand
+Segment = Union[Lit, Dim, Ref, Init]
 
-    if fn not in line_dict_expand:
-        try:
-            with open(fn, "r", encoding="utf-8") as f:
-                line_dict_expand[fn] = f.read().splitlines()
-        except FileNotFoundError:
-            print(f"cant read from'{fn}'")
-            return None
-    if not line_dict_expand[fn]:
-        print(f"file is empty: '{fn}'")
-        return None
-    return RNG.choices(line_dict_expand[fn],k=lno)
-  
-    
-def lines2_expand(fn: str, lno: int,delim= ":"):
-    l1=lines_expand(fn,lno)
-    l2=lines_expand(fn,lno)
-    if l1 is None or l2 is None: return None
-    return [f"{a}{delim}{b}" for a, b in zip(l1, l2, strict=True)]
-
-
-# -------------------------------------
-# spec files
-# -------------------------------------
-
-# read the whole specfile
-def specfile(specfile: str): 
-    # normalize spec filename
-    p = Path(specfile)
-    if p.suffix != ".spec": p = p.with_suffix(".spec")
-    try:
-        specs = p.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    return specs
-
-# read specific slots from specfile
-def specfile_slots(specfile: str | Path, slots): # read specific slots
-    if isinstance(slots, Iterable) and not isinstance(slots, (str, bytes)):
-        want = {str(i) for i in slots}
-    else:
-        want = {str(slots)}
-
-    p = Path(specfile)
-    if p.suffix != ".spec": p = p.with_suffix(".spec")
-
-    try: specs = p.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError: return []
-
-    out = []
-    for s in specs:
-        d = sp.split_chain(s)
-        if "slot" not in d or not d["slot"]: continue
-        if d["slot"][0] in want: out.append(s)
-    return out
-
-
-# -------------------------------------
-# slot management
-# -------------------------------------
-
-
-def slots(required: int) -> list[int]:
-    return slotfuns.slots(DICT["outschema"], required)
-
-
-# -------------------------------------
-#  spec modifiers
-# -------------------------------------
-
-def spec_rot(spec,rot):
-    d = sp.split_chain(spec)
-    d["rot"]=[str(rot)]
-    spec=sp.concat_chain(d)
-    return spec
-
-def specs_rot(specs: List[str],rot):
-    new_specs = []
-    for spec in specs: new_specs.append(spec_rot(spec,rot))
-    return new_specs
-
-
-def spec_replace(spec: str, key: str, old: str, new: str) -> str:
-    d = sp.split_chain(spec)
-    if key in d:
-        d[key] = [v.replace(old, new) for v in d[key]]
-    return sp.concat_chain(d)
-
-def specs_replace(specs: str | list[str], key: str, old: str, new: str) -> list[str]:
-    if isinstance(specs, str): specs = [specs]
-    return [spec_replace(s, key, old, new) for s in specs]
-
-# -------------------------------------
-# spec management
-# -------------------------------------
-
-def spec2slot(spec: str, slot: int) -> str:
-    d = sp.split_chain(spec)
-    d["slot"] = [str(slot)]
-    return sp.concat_chain(d)
-
-def spec2free(spec: str):
-    return spec2slot(spec,slotfuns.first_free_slot(DICT["outschema"]))
-
-def specs2free(specs: List[str]):
-    if isinstance(specs, str): specs = [specs]
-    new_specs = []
-    for spec, slot in zip(specs, slotfuns.free_slots(DICT["outschema"], len(specs))): 
-        new_specs.append(spec2slot(spec,slot))
-    return new_specs
-
-# -------------------------------------
-#  spec files
-# -------------------------------------
-
-def specfile2free(specf: str):
-    specs = specfile(specf)
-    if not specs: return None  # or [] if you prefer
-    return specs2free(specs)
-
-def specfile_slots2free(specf: str, slots):
-    specs = specfile_slots(specf, slots)
-    if not specs: return None  # or [] if you prefer
-    return specs2free(specs)
-
-# -------------------------------------
-# images
-# -------------------------------------
-
-def image(imgfile: str):
-    return image2spec.read_spec_exiftool(imgfile)
-
-def image2free(imgfile: str):
-    return spec2free(image(imgfile))
-
-def images(
-    schema: str,              # "filedir/filestem"
-    suffices: Iterable[int],  # e.g. [1,3,4] or range(1,10)
-) -> list[str]:
-    specs: list[str] = []
-    for fn in slotfuns.slots2jpegs(schema,suffices): specs.append(image(str(fn)))
-    return specs
-
-def images2free(
-    schema: str,              # "filedir/filestem"
-    suffices: Iterable[int],  # e.g. [1,3,4] or range(1,10)
-) -> list[str]:
-    print(f"images2free: {len(suffices)}")
-    return specs2free(images(schema,suffices))
-
-
-# -------------------------------------
-#  ocr
-# -------------------------------------
-
-SCRIPT = Path(__file__).resolve().parent.parent / "lyapunov" / "extract_spec.sh"
-
-def ocr(imagefile):
-    print(f"OCR file:{imagefile}")
-    spec = subprocess.check_output(["bash", str(SCRIPT), imagefile],text=True)
-    print(f"OCR:{spec}")
-    d = sp.split_chain(spec)
-    d["source"]=[imagefile]
-    spec=sp.concat_chain(d)
-    return spec
-
-def ocr2free(imagefile):
-    return spec2free(ocr(imagefile))
-
-def ocrs2free(schema,slots):
-    specs=[]
-    for jpeg in slotfuns.slots2jpegs(schema,slots): specs.append(ocr(jpeg))
-    return specs2free(specs)
-
-FUNCS: dict[str, object] = {
-    "range":        range,
-    "rint":         rint_expand,
-    "rfloat":       rfloat_expand,
-    "key":          search_keys_expand,
-    "value":        search_values_expand,
-    # sequence
-    "seq":          seq,
-    # files
-    "lines":        lines_expand,
-    "lines2":       lines2_expand,
-    # specs in files
-    "specf":        specfile_slots2free,
-    # specs in images
-    "img":          images2free,
-    # ocr files
-    "ocr":          ocr2free,
-    "ocrs":         ocrs2free,
-    # individual specs
-    "spec":         spec2free,
-    "rot":          specs_rot,
-    "swap":         specs_replace,
-    "free":         specs2free,
-    # utilities
-    "slots":        slots,
-    "used_slots":   slotfuns.used_slots,
-    "free_slots":   slotfuns.free_slots,
-    "slots2jpegs":  slotfuns.slots2jpegs,
-    "slots2specs":  slotfuns.slots2specs,
-    "first":        slotfuns.first_free_slot,
-    # dates
-    "bizdays":      datefuns.good_days,
-
-}
-
-#######################################
-#
-# render time functions
-#
-#######################################
-
-# these need to be valies not vectors
-
-def render_choose(*args):
-    return f"{RNG.choice(args)}"
-
-def render_search_keys(pat, exclude=None):
-    rx = re.compile(pat)
-    exc = None if exclude is None else str(exclude)
-    matches = [
-        k for k in DICT.keys()
-        if rx.fullmatch(k) and (exc is None or k != exc)
-    ]
-    return f"{RNG.choice(matches) if matches else None}"
-
-def render_search_values(pat, exclude=None):
-    rx = re.compile(pat)
-    exc = None if exclude is None else str(exclude)
-    matches = [
-        DICT[k] for k in DICT.keys()
-        if rx.fullmatch(k) and (exc is None or DICT[k] != exc)
-    ]
-    return f"{RNG.choice(matches) if matches else None}"
-
-def render_rvalues():
-    vals = [DICT[k] for k in DICT.keys()]
-    return f"{RNG.choice(vals)}"
-
-def render_rint(N):
-    return f"{RNG.randint(1,N)}"
-
-def render_rfloat(a,b):
-    return f"{RNG.uniform(a,b)}"
-
-def render_rfloat3(a,b):
-    return f"{round(RNG.uniform(a,b),3)}"
-
-def render_num(x): return float(x)
-def render_i(x): return int(float(x))
-def render_zfill(x, w): return str(x).zfill(int(w))
-def render_fmt(s, *args): return str(s).format(*args)
-def render_at(seq, idx): return seq[int(idx)]
-def render_wat(seq, idx):
-    i = int(idx)
-    n = len(seq)
-    if n == 0:
-        return f"{None}"  # or raise
-    return f"{seq[i % n]}"     # wrap-around
-
-# -------------------------------------
-#  render from file
-# -------------------------------------
-
-# global cache
-line_dict_ref: dict[str, list[str]] = {}
-
-def render_file_line(fn: str, lno: int) -> str:
-    """
-    Return line number lno (0-based) from file fn.
-    Caches file contents across calls.
-    """
-    global line_dict_ref
-    if fn not in line_dict_ref:
-        with open(fn, "r", encoding="utf-8") as f:
-            # keep lines without trailing newline
-            line_dict_ref[fn] = f.read().splitlines()
-    try:
-        return f"{line_dict_ref[fn][lno]}"
-    except IndexError:
-        raise IndexError(f"line number {lno} out of range for file '{fn}'")
-
-def render_random_file_line(fn: str) -> str:
-    """
-    Return a random line from file fn.
-    Caches file contents across calls.
-    """
-    global line_dict_ref
-
-    if fn not in line_dict_ref:
-        with open(fn, "r", encoding="utf-8") as f:
-            line_dict_ref[fn] = f.read().splitlines()
-
-    if not line_dict_ref[fn]:
-        raise ValueError(f"file '{fn}' is empty")
-
-    return f"{RNG.choice(line_dict_ref[fn])}"
-
-def render_rline2(fn: str, delim=":") -> str:
-    l1 = render_random_file_line(fn)
-    l2 = render_random_file_line(fn)
-    return f"{l1}{delim}{l2}"
-
-def render_r2line(fn1: str, fn2: str, delim=":") -> str:
-    l1 = render_random_file_line(fn1)
-    l2 = render_random_file_line(fn2)
-    return f"{l1}{delim}{l2}"
-
-
-# -------------------------------------
-#  convenience
-# -------------------------------------
-
-@with_render_ctx
-def render_lerp(ctx,start,end):
-    row = int(ctx["row"])
-    nrows = int(ctx["nrows"])
-    t = 0.0 if nrows <= 1 else (row - 1) / (nrows - 1)
-    value = float(start) + (float(end) - float(start)) * t
-    return f"{value}"
-
-@with_render_ctx
-def render_square(ctx,start,end):
-    row = int(ctx["row"])
-    nrows = int(ctx["nrows"])
-    t = 0.0 if nrows <= 1 else (row - 1) / (nrows - 1)
-    size = float(start) + (float(end) - float(start)) * t
-    return f"-{size}:-{size}:{size}:{size}"
-
-# -------------------------------------
-#  function registry
-# -------------------------------------
-
-REF_FUNCS: dict[str, object] = {
-    # randomized selections
-    "choose":   render_choose,
-    "rval":     render_rvalues,
-    "rint":     render_rint,
-    "rfloat":   render_rfloat,
-    "rfloat3":  render_rfloat3,
-    # search DICT
-    "key":      render_search_keys,
-    "value":    render_search_values,
-    # type conversions
-    "num":      render_num, # numeric
-    "i":        render_i, # integer
-    "str":      str,
-    # formatting
-    "zfill":    render_zfill, #
-    "fmt":      render_fmt,
-    # access dimensions
-    "at":       render_at,
-    "wat":      render_wat,
-    # file access
-    "line":     render_file_line,
-    "rline":    render_random_file_line,
-    "rline2":   render_rline2,
-    "r2line":   render_r2line,
-    # convenience functions
-    "square":   render_square,
-    "lerp":     render_lerp,
-    # add functions later if you want (seq, etc.)
-    "first":     slotfuns.first_free_slot,
-}
-
-# --- init time functions
-
-#  RNG (single source of randomness) ---
-_DEFAULT_SEED = secrets.randbits(128)  # different each process run
-RNG = random.Random(_DEFAULT_SEED)
-
-def seed_init(x=None):
-    """
-    !{seed(123)}      -> deterministic seed
-    !{seed()}         -> reseed from OS entropy
-    !{seed("auto")}   -> same as seed()
-    !{seed(256)}      -> if you pass a large int, it's fine
-    """
-    if x is None or str(x).lower() in ("auto", "rand", "random", "entropy"):
-        s = secrets.randbits(128)
-    else:
-        s = int(x)
-    RNG.seed(s)
-    return s
-
-def set_const_init(name, value):
-    NAMES[str(name)] = value
-    return value
-
-def set_dict_init(**kwargs):
-    """Replace DICT with provided key/value pairs."""
-    DICT.clear()
-    for k, v in kwargs.items():
-        DICT[str(k)] = str(v)
-    return len(DICT)
-
-def add_dict_init(**kwargs):
-    """Update DICT with provided key/value pairs."""
-    for k, v in kwargs.items():
-        DICT[str(k)] = str(v)
-    return len(kwargs)
-
-def load_init(path, *, mode="new", start=1, strip=True, skip_empty=False, encoding="utf-8"):
-    """
-    Load a text file into DICT:
-      key = str(line_number)
-      value = line (optionally stripped)
-
-    mode:
-      - "new": replace DICT
-      - "add": update DICT
-    """
-    p = Path(str(path))
-    lines = p.read_text(encoding=encoding).splitlines()
-
-    d = {}
-    i = int(start)
-    for line in lines:
-        s = line.strip() if strip else line
-        if skip_empty and s == "":
-            i += 1
-            continue
-        d[str(i)] = s
-        i += 1
-
-    if mode == "new":
-        DICT.clear()
-    elif mode != "add":
-        raise ValueError("mode must be 'new' or 'add'")
-
-    DICT.update(d)
-    return len(d)
-
-
-INIT_FUNCS = {
-    "seed": seed_init, 
-    "const": set_const_init, 
-    "new": set_dict_init,
-    "add": add_dict_init,
-    "load": load_init
-}
 
 # ============================================================
 # regexes
@@ -629,6 +109,7 @@ INIT_FUNCS = {
 
 _INT_RE = re.compile(r"^[+-]?\d+$")
 _DICTSEL_RE = re.compile(r"^@\{(.+)\}$")
+
 
 # ============================================================
 # Low-level scanners
@@ -1113,7 +594,7 @@ def _to_str_list(v) -> List[str]:
 def _eval_fcall_body(expr: str) -> Optional[List[str]]:
     s = expr.strip()
     try:
-        se = EvalWithCompoundTypes(names=NAMES, functions=FUNCS, operators=ALLOWED_OPS)
+        se = EvalWithCompoundTypes(names=state.NAMES, functions=FUNCS, operators=ALLOWED_OPS)
         vals = _to_str_list(se.eval(s))
         return vals if vals else None
     except Exception:
@@ -1217,7 +698,7 @@ def expand_item_union(item: str) -> List[str]:
     while changed:
         changed = False
         next_pending: List[str] = []
-        # Expansion is sequential, not “cartesian within a single token”.
+        # Expansion is sequential, not "cartesian within a single token".
         # Order matters only for output ordering, not for the set of results.
         # Priority: nested [...] → ${...} → @{...} → {...}
         for tok in pending:
@@ -1274,12 +755,14 @@ def progressive_choices(inner: str) -> List[str]:
         out.append(",".join(acc))
     return out
 
+
 # ============================================================
 # Bozo Macros
 # ============================================================
 
 MACROS: dict[str, str] = {}
 _MACRO_KEY_RE = re.compile(r"^@[A-Z0-9@]+$")
+
 
 def macro(s: str) -> str:
     """
@@ -1291,6 +774,7 @@ def macro(s: str) -> str:
         if _MACRO_KEY_RE.fullmatch(k):
             out = out.replace(k, v)
     return out
+
 
 def macro_init(fn: str | Path) -> bool:
     """
@@ -1323,6 +807,7 @@ def macro_init(fn: str | Path) -> bool:
         print(f"failed to load macro file '{fn}': {e}")
         return False
 
+
 # ============================================================
 # Cartesian product
 # ============================================================
@@ -1342,7 +827,7 @@ class DimSeries:
 
     def __len__(self):
         return self._n
-    
+
 
 def _realize_dim(d: Dim) -> List[str]:
     return expand_list_choices(d.raw) if d.dim_kind == "LIST" else progressive_choices(d.raw)
@@ -1359,11 +844,11 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     segs = scan_segments(spec)
 
     # init-time code (runs once)
-    init_names = dict(NAMES)
+    init_names = dict(state.NAMES)
     init_se = EvalWithCompoundTypes(names=init_names, functions=INIT_FUNCS, operators=ALLOWED_OPS)
     for s in segs:
         if isinstance(s, Init):
-            init_se.eval(s.expr) 
+            init_se.eval(s.expr)
 
     dims: List[Dim] = [s for s in segs if isinstance(s, Dim)]
     dim_choices: List[List[str]] = [_realize_dim(d) for d in dims]
@@ -1379,7 +864,7 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
         acc *= sz
     strides.reverse()
 
-    base_render_names = dict(NAMES)
+    base_render_names = dict(state.NAMES)
 
     # expose per-dimension choice lists: choices1, choices2, ...
     for j, choices_j in enumerate(dim_choices, start=1):
@@ -1398,8 +883,7 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
     if not dim_choices:
         render_names = dict(base_render_names)
         render_names["row"] = 1
-        #NAMES.update(base_render_names)
-        tok = _RENDER_CTX.set(render_names)
+        tok = set_render_ctx(render_names)
         try:
             se = EvalWithCompoundTypes(names=render_names, functions=REF_FUNCS, operators=ALLOWED_OPS)
             parts = []
@@ -1413,7 +897,7 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
                         parts.append(f"#{{{s.key}}}")
             out.append("".join(parts))
         finally:
-            _RENDER_CTX.reset(tok)
+            reset_render_ctx(tok)
         return out
 
     # Render-time eval for #{...}:
@@ -1427,8 +911,7 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
         for j, v in enumerate(picks, start=1):
             render_names[f"d{j}"] = v
 
-        #NAMES.update(render_names)
-        tok = _RENDER_CTX.set(render_names)
+        tok = set_render_ctx(render_names)
         try:
             se = EvalWithCompoundTypes(names=render_names, functions=REF_FUNCS, operators=ALLOWED_OPS)
             parts = []
@@ -1447,14 +930,14 @@ def expand(spec: str, *, limit: int = 0) -> List[str]:
                 elif isinstance(s, Init):
                     continue
                 else:
-                    pass #should be error?
+                    pass  # should be error?
             # Important: append ONCE per row (after all segments are rendered),
             # not once per segment.
             out.append("".join(parts))
             if limit and len(out) >= limit:
                 break
         finally:
-            _RENDER_CTX.reset(tok)
+            reset_render_ctx(tok)
 
     return out
 

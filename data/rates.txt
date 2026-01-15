@@ -1,0 +1,23 @@
+BPSW10 Curncy
+BPSW30 Curncy
+EMB US Equity
+EUR2Y2Y
+EUR5Y5Y
+EUSA10 Curncy
+EUSA30 Curncy
+FV Comdty
+HYG US Equity
+IBOXHYSE Curncy
+IBOXUMAE Curncy
+ITRXEBE Curncy
+ITRXESE Curncy
+ITRXEXE Curncy
+LQD US Equity
+OE Comdty
+RX Comdty
+TY Comdty
+US Comdty
+USD2Y2Y
+USD5Y5Y
+USSWAP10 Curncy
+USSWAP30 Curncy

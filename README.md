@@ -19,7 +19,7 @@ Requires Python >= 3.13
 ```python
 from specparser.expander import expand
 
-# Simple list expansion (cartesian product)
+# Cartesian product of lists
 expand("[a,b][1,2]")
 # → ['a1', 'a2', 'b1', 'b2']
 
@@ -28,124 +28,87 @@ expand("file_{01:03}.jpg")
 # → ['file_01.jpg', 'file_02.jpg', 'file_03.jpg']
 
 # Ranges with step
-expand("value_{0:10:2}")
+expand("value_{0:10_2}")
 # → ['value_0', 'value_2', 'value_4', 'value_6', 'value_8', 'value_10']
-```
 
-## Spec Syntax
-
-| Pattern | Description | Example |
-|---------|-------------|---------|
-| `[a,b,c]` | Cartesian list | `[x,y][1,2]` → `x1, x2, y1, y2` |
-| `>[a,b,c]` | Progressive list | `>[a,b,c]` → `a`, `a,b`, `a,b,c` |
-| `{start:end}` | Numeric range | `{1:3}` → `1, 2, 3` |
-| `{start:end:step}` | Range with step | `{0:10:2}` → `0, 2, 4, 6, 8, 10` |
-| `{start:end:count}` | Linspace (floats) | `{0:1:5}` → `0, 0.25, 0.5, 0.75, 1` |
-| `@{regex}` | Dict selector | `@{/^A/}` matches keys starting with 'A' |
-| `${expr}` | Expression eval | `${2+2}` → `4` |
-| `#{n}` | Reference | `#{1}` references the 1st dimension |
-| `!{expr}` | Initialization | `!{seed(42)}` seeds RNG |
-
-## Modules
-
-### expander
-
-Core expansion engine with full DSL support:
-
-```python
-from specparser.expander import expand, expand_list_choices, progressive_choices
-
-# Full cartesian expansion
-specs = expand("prefix_[a,b]_{1:3}_suffix")
-
-# List-only expansion (union, not cartesian)
-expand_list_choices("[a,b,c]")  # → ['a', 'b', 'c']
-
-# Progressive accumulation
-progressive_choices(">[x,y,z]")  # → ['x', 'x,y', 'x,y,z']
-```
-
-### slots
-
-File slot management for organizing generated images:
-
-```python
-from specparser.slots import used_slots, first_free_slot, free_slots
-
-# Find used slot numbers for a schema
-used = used_slots("output")  # finds output_00001.jpg, output_00002.jpg, etc.
-
-# Get next available slot
-next_slot = first_free_slot("output")
-
-# Reserve N consecutive slots
-slots = free_slots("output", 10)
-```
-
-### image2spec
-
-Embed and extract specs from JPEG metadata:
-
-```python
-from specparser.image2spec import spec2image, read_spec_exiftool
-
-# Embed spec in image metadata
-spec2image("path/to/image.jpg", "my_spec_string")
-
-# Read spec back from image
-spec = read_spec_exiftool("path/to/image.jpg")
-```
-
-### chain
-
-Parse and manipulate colon/comma-separated key:value chains:
-
-```python
-from specparser.chain import split_chain, concat_chain
-
-# Parse chain format
-d = split_chain("key1:value1,key2:value2")
-# → {'key1': 'value1', 'key2': 'value2'}
-
-# Rebuild chain string
-s = concat_chain(d)
-# → 'key1:value1,key2:value2'
-```
-
-## Advanced Features
-
-### References
-
-Reference earlier dimensions in specs:
-
-```python
+# References to dimension values
 expand("[x,y]{1:2}::#{d1}-#{d2}")
 # → ['x1::x-1', 'x2::x-2', 'y1::y-1', 'y2::y-2']
 ```
 
-### Random Functions
+## Documentation
 
-Use render-time random selection:
+| Document | Description |
+|----------|-------------|
+| [DSL Syntax](docs/dsl-syntax.md) | Complete syntax reference for the spec language |
+| [Functions](docs/functions.md) | Available functions for init, expand, and render phases |
+| [Modules](docs/modules.md) | Package structure and module API reference |
 
-```python
-from specparser.expander import expand, DICT
+## Syntax Overview
 
-DICT['colors'] = ['red', 'green', 'blue']
-expand("color_#{choose(colors)}")  # randomly picks a color at render time
+| Pattern | Phase | Description |
+|---------|-------|-------------|
+| `[a,b,c]` | Expand | Cartesian product dimension |
+| `>[a,b,c]` | Expand | Progressive (accumulating) list |
+| `{1:10}` | Expand | Numeric range |
+| `{0:1_0.1}` | Expand | Range with step |
+| `{0:1\|5}` | Expand | Linspace (5 samples) |
+| `${expr}` | Expand | Expression evaluation |
+| `@{regex}` | Expand | Dict key selector |
+| `#{expr}` | Render | Per-row reference |
+| `!{expr}` | Init | One-time setup |
+
+See [DSL Syntax](docs/dsl-syntax.md) for complete documentation.
+
+## Package Structure
+
+```
+specparser/
+├── expander.py          # DSL core: scanner, parser, expansion
+├── expander_state.py    # Shared state: DICT, NAMES, RNG
+├── init_funcs.py        # Init-time functions (!{...})
+├── expand_funcs.py      # Expand-time functions (${...})
+├── render_funcs.py      # Render-time functions (#{...})
+├── chain.py             # Key:value chain parsing
+├── chain_state.py       # Chain parser state: NAMES, FUNCS
+├── files.py             # File reading utilities
+├── dates.py             # Exchange calendar utilities
+├── slots.py             # Slot management for images
+└── image2spec.py        # Image metadata handling
 ```
 
-### Custom Functions
+See [Modules](docs/modules.md) for detailed API documentation.
 
-Register custom expansion and render-time functions:
+## CLI Usage
 
-```python
-from specparser.expander import FUNCS, REF_FUNCS
+```bash
+# Run self-test
+python -m specparser.expander --selftest
 
-# Expansion-time function
-FUNCS['double'] = lambda x: [str(int(x) * 2)]
+# Expand a spec
+python -m specparser.expander "[a,b]{1:3}" --expand
 
-# Render-time function
-REF_FUNCS['upper'] = lambda ctx, s: s.upper()
+# List trading days
+python -m specparser.dates 2024-01
+
+# Read file lines
+python -m specparser.files myfile.txt -r 5
+```
+
+## Testing
+
+```bash
+# Install dev dependencies
+pip install specparser[dev]
+
+# Run all tests
+pytest
+
+# Run with verbose output
+pytest -v
+
+# Run specific test file
+pytest tests/test_expander.py
 ```
 
 ## Dependencies
@@ -153,6 +116,7 @@ REF_FUNCS['upper'] = lambda ctx, s: s.upper()
 - `numpy` - numeric operations
 - `pyvips` - image manipulation
 - `simpleeval` - safe expression evaluation
+- `exchange_calendars` - trading day calculations
 
 ## License
 

@@ -1,0 +1,16 @@
+AS51 Index
+CAC Index
+DAX Index
+EEM US Equity
+EWZ US Equity
+FTSEMIB Index
+FXI US Equity
+IWM US Equity
+KOSPI2 Index
+NIFTY Index
+NKY Index
+QQQ US Equity
+SMI Index
+SPY US Equity
+SX5E Index
+UKX Index

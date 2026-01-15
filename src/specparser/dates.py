@@ -74,7 +74,8 @@ def holidays(month_str: str, calendar: str = _DEFAULT_CALENDAR) -> list[str]:
     cal = xcals.get_calendar(calendar)
 
     all_days = _all_days_in_month(first_day, last_day)
-    sessions = set(cal.sessions_in_range(first_day, last_day))
+    # Convert Timestamps to date objects for comparison
+    sessions = set(d.date() for d in cal.sessions_in_range(first_day, last_day))
 
     non_trading = [d for d in all_days if d not in sessions]
     return [d.strftime("%Y-%m-%d") for d in non_trading]
@@ -96,7 +97,8 @@ def weekday_holidays(month_str: str, calendar: str = _DEFAULT_CALENDAR) -> list[
     cal = xcals.get_calendar(calendar)
 
     all_days = _all_days_in_month(first_day, last_day)
-    sessions = set(cal.sessions_in_range(first_day, last_day))
+    # Convert Timestamps to date objects for comparison
+    sessions = set(d.date() for d in cal.sessions_in_range(first_day, last_day))
 
     # Weekdays are Monday (0) through Friday (4)
     weekday_non_trading = [

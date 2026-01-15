@@ -17,14 +17,14 @@ RNW_PATH=$(cd "$(dirname "$RNW_FILE")" && pwd)
 RNW_BASE=$(basename "$RNW_FILE" .Rnw)
 TEX_FILE="$RNW_PATH/$RNW_BASE.tex"
 
-# --------------- 2. Knit (Rnw → tex) --------------
-echo "Knitting $RNW_FILE → $TEX_FILE"
+# --------------- 2. Knit (Rnw -> tex) --------------
+echo "Knitting $RNW_FILE -> $TEX_FILE"
 Rscript --vanilla -e "knitr::knit('$RNW_FILE', output='$TEX_FILE')"
 
 # --------------- 3. LuaLaTeX (2 passes)------------
-echo "Running LuaLaTeX (pass 1)…"
-lualatex -interaction=nonstopmode -halt-on-error "$TEX_FILE" >/dev/null
-echo "Running LuaLaTeX (pass 2)…"
-lualatex -interaction=nonstopmode -halt-on-error "$TEX_FILE" >/dev/null
+echo "Running LuaLaTeX (pass 1)..."
+lualatex -interaction=nonstopmode -halt-on-error -output-directory="$RNW_PATH" "$TEX_FILE" >/dev/null
+echo "Running LuaLaTeX (pass 2)..."
+lualatex -interaction=nonstopmode -halt-on-error -output-directory="$RNW_PATH" "$TEX_FILE" >/dev/null
 
-echo "Success – produced ${RNW_BASE}.pdf"
+echo "Success - produced $RNW_PATH/$RNW_BASE.pdf"
