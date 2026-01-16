@@ -7,6 +7,7 @@ from specparser.dates import (
     holidays,
     weekday_holidays,
     calendars,
+    expiry,
 )
 
 
@@ -109,3 +110,139 @@ class TestCalendars:
     def test_non_empty(self):
         cals = calendars()
         assert len(cals) > 10  # Should have many exchanges
+
+
+class TestExpiry:
+    """Tests for expiry function."""
+
+    # --- BD (Business Day) patterns ---
+
+    def test_bd1_first_business_day(self):
+        """BD1 should return first business day of month."""
+        # Jan 1, 2024 is holiday, so BD1 is Jan 2
+        assert expiry(2024, 1, "BD1") == "2024-01-02"
+
+    def test_bd5_fifth_business_day(self):
+        """BD5 should return 5th business day."""
+        assert expiry(2024, 1, "BD5") == "2024-01-08"
+
+    def test_bd15_fifteenth_business_day(self):
+        """BD15 should return 15th business day."""
+        assert expiry(2024, 1, "BD15") == "2024-01-23"
+
+    def test_bd_case_insensitive(self):
+        """Descriptor should be case insensitive."""
+        assert expiry(2024, 1, "bd1") == expiry(2024, 1, "BD1")
+
+    def test_bd_out_of_range(self):
+        """BD with n > business days in month should raise."""
+        with pytest.raises(ValueError, match="out of range"):
+            expiry(2024, 1, "BD50")
+
+    # --- LBD (Last Business Day) patterns ---
+
+    def test_lbd_last_business_day(self):
+        """LBD should return last business day of month."""
+        assert expiry(2024, 1, "LBD") == "2024-01-31"
+
+    def test_lbd1_same_as_lbd(self):
+        """LBD1 should be same as LBD."""
+        assert expiry(2024, 1, "LBD1") == expiry(2024, 1, "LBD")
+
+    def test_lbd2_second_to_last(self):
+        """LBD2 should return 2nd-to-last business day."""
+        assert expiry(2024, 1, "LBD2") == "2024-01-30"
+
+    def test_lbd3_third_to_last(self):
+        """LBD3 should return 3rd-to-last business day."""
+        assert expiry(2024, 1, "LBD3") == "2024-01-29"
+
+    # --- Weekday patterns (F, W, T, M) ---
+
+    def test_f3_third_friday(self):
+        """F3 should return 3rd Friday of month."""
+        # Jan 2024: Fridays are 5, 12, 19, 26
+        assert expiry(2024, 1, "F3") == "2024-01-19"
+
+    def test_f1_first_friday(self):
+        """F1 should return 1st Friday of month."""
+        assert expiry(2024, 1, "F1") == "2024-01-05"
+
+    def test_w1_first_wednesday(self):
+        """W1 should return 1st Wednesday of month."""
+        # Jan 2024: First Wednesday is Jan 3
+        assert expiry(2024, 1, "W1") == "2024-01-03"
+
+    def test_t2_second_thursday(self):
+        """T2 should return 2nd Thursday of month."""
+        # Jan 2024: Thursdays are 4, 11, 18, 25
+        assert expiry(2024, 1, "T2") == "2024-01-11"
+
+    def test_m1_first_monday(self):
+        """M1 should return 1st Monday of month."""
+        # Jan 2024: First Monday is Jan 1 (but it's a holiday)
+        assert expiry(2024, 1, "M1") == "2024-01-01"
+
+    def test_weekday_out_of_range(self):
+        """Weekday pattern with n too large should raise."""
+        with pytest.raises(ValueError, match="No 6th occurrence"):
+            expiry(2024, 1, "F6")  # No 6th Friday in any month
+
+    # --- MF (Modified Following) weekday patterns ---
+
+    def test_mff3_third_friday_modified(self):
+        """MFF3 when 3rd Friday is trading day should return same."""
+        # Jan 19, 2024 is a trading day
+        assert expiry(2024, 1, "MFF3") == "2024-01-19"
+
+    def test_mf_rolls_forward_on_holiday(self):
+        """MF should roll forward when date is a holiday."""
+        # Good Friday 2024 is March 29 (F5 in March, 5th Friday)
+        # March 29, 2024 is Good Friday (NYSE closed)
+        result = expiry(2024, 3, "MFF5")
+        # Should roll to next business day (April 1, 2024)
+        # But since April is next month, should roll backward to March 28
+        assert result == "2024-03-28"
+
+    # --- MFBD (Modified Following Business Day) patterns ---
+
+    def test_mfbd1_first_calendar_day_adjusted(self):
+        """MFBD1 on holiday should roll to next business day."""
+        # Jan 1, 2024 is holiday, should roll to Jan 2
+        assert expiry(2024, 1, "MFBD1") == "2024-01-02"
+
+    def test_mfbd_on_weekend_rolls_forward(self):
+        """MFBD on weekend should roll to Monday."""
+        # Feb 3, 2024 is Saturday, should roll to Feb 5 (Monday)
+        assert expiry(2024, 2, "MFBD3") == "2024-02-05"
+
+    # --- MPBD (Modified Preceding Business Day) patterns ---
+
+    def test_mpbd_on_weekend_rolls_backward(self):
+        """MPBD on weekend should roll backward to Friday."""
+        # Feb 3, 2024 is Saturday, should roll to Feb 2 (Friday)
+        assert expiry(2024, 2, "MPBD3") == "2024-02-02"
+
+    # --- Edge cases ---
+
+    def test_invalid_descriptor_raises(self):
+        """Invalid descriptor should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid expiry descriptor"):
+            expiry(2024, 1, "INVALID")
+
+    def test_different_calendar(self):
+        """Expiry should work with different calendars."""
+        # London calendar
+        result = expiry(2024, 1, "BD1", calendar="XLON")
+        assert result == "2024-01-02"  # Same as NYSE for this date
+
+    def test_february_leap_year(self):
+        """Test expiry in February of leap year."""
+        # 2024 is a leap year, Feb has 29 days
+        lbd = expiry(2024, 2, "LBD")
+        assert lbd == "2024-02-29"
+
+    def test_december_year_end(self):
+        """Test expiry at year end."""
+        lbd = expiry(2024, 12, "LBD")
+        assert lbd == "2024-12-31"

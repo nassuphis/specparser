@@ -14,6 +14,7 @@ from typing import Any
 from . import expander_state as state
 from . import slots as slotfuns
 from . import files as filefuns
+from . import dates as datefuns
 
 
 # ============================================================
@@ -212,4 +213,7 @@ REF_FUNCS: dict[str, object] = {
     "lerp": render_lerp,
     # slot utilities
     "first": slotfuns.first_free_slot,
+    # date utilities
+    "expiry": datefuns.expiry,
+    "entry": datefuns.entry,
 }
