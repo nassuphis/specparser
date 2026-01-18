@@ -1,0 +1,6 @@
+#!/usr/bin/env mlr -s
+#
+# miller scripting test
+#
+ --tsv cut -x -f weight_cap 
+ then filter '$asset =~"EUR"'

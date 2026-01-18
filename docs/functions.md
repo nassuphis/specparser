@@ -204,6 +204,31 @@ These are evaluated per row during rendering. They return scalar values (strings
 | `lerp` | `lerp(start, end)` | Linear interpolation based on row position |
 | `square` | `square(start, end)` | Generate square coordinates interpolated |
 
+### Date Calculations
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `expiry` | `expiry(year, month, descriptor, calendar="XNYS")` | Expiry date for descriptor |
+| `entry` | `entry(year, month, descriptor, near_far, calendar="XNYS")` | Entry date (1-2 months before expiry) |
+
+**Expiry descriptors:**
+
+| Pattern | Description |
+|---------|-------------|
+| `BD{n}` | Nth business day (BD1, BD5, BD15) |
+| `LBD` | Last business day |
+| `LBD{n}` | Nth-to-last business day |
+| `F{n}` | Nth Friday (F3 = 3rd Friday) |
+| `W{n}` | Nth Wednesday |
+| `T{n}` | Nth Thursday |
+| `M{n}` | Nth Monday |
+| `MFBD{n}` | Modified following Nth business day |
+| `MF{W}{n}` | Modified following Nth weekday |
+
+**Entry near_far values:**
+- `"N"` (Near): Entry is 1 month before expiry
+- `"F"` (Far): Entry is 2 months before expiry
+
 ### Utilities
 
 | Function | Signature | Description |
@@ -228,6 +253,13 @@ expand("[x,y]{1:2} -> #{d1}#{d2}")
 # Format with zero-padding
 expand("{1:3} file_#{zfill(d1, 4)}.jpg")
 # → ['1 file_0001.jpg', '2 file_0002.jpg', '3 file_0003.jpg']
+
+# Date calculations
+expand("[2024][1,2,3] expiry=#{expiry(d1, d2, 'F3')}")
+# → ['20241 expiry=2024-01-19', ...]  (3rd Friday of each month)
+
+expand("[2024][6] entry=#{entry(d1, d2, 'F3', 'N')}")
+# → ['20246 entry=2024-05-17']  (entry date 1 month before June expiry)
 ```
 
 ---

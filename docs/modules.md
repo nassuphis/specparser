@@ -16,7 +16,9 @@ src/specparser/
 ├── files.py             # File reading utilities
 ├── dates.py             # Exchange calendar utilities
 ├── slots.py             # Slot management for images
-└── image2spec.py        # Image metadata (spec embedding)
+├── image2spec.py        # Image metadata (spec embedding)
+├── amt.py               # AMT YAML processing and schedule expansion
+└── storage.py           # DuckDB/Parquet storage utilities
 ```
 
 ---
@@ -256,3 +258,68 @@ chain_state.py     ← slots (no circular deps, base state for chain)
 Utility modules (`files`, `dates`, `slots`, `image2spec`) have minimal dependencies and can be used standalone.
 
 The `chain` module has its own state (`chain_state.py`) separate from the expander's state (`expander_state.py`). Both are independent subsystems.
+
+---
+
+## AMT Module
+
+### amt.py
+
+Process AMT (Asset Management Table) YAML files for expiry schedules.
+
+**Key exports:**
+```python
+from specparser.amt import (
+    load_amt, clear_cache,           # Loading and caching
+    get_value, get_aum, get_leverage,# Value extraction
+    get_asset, find_by_underlying,   # Asset queries
+    list_assets, get_schedule,       # Asset and schedule lookups
+    get_table, format_table,         # Table utilities
+    assets, live_assets,             # Asset tables
+    live_class, live_table, live_group,  # Asset class, generic table, and group info
+    live_schedules, fix_expiry,      # Schedule processing
+    expand_schedules,                # Schedule expansion (raw)
+    expand_schedules_fixed,          # Schedule expansion (with fix_expiry)
+    pack_straddle,                   # Pack into straddle strings
+)
+```
+
+**CLI:**
+```bash
+uv run python -m specparser.amt data/amt.yml --get "Asset Name"
+uv run python -m specparser.amt data/amt.yml --expand 2024 2025
+uv run python -m specparser.amt data/amt.yml --pack 2024 2025
+uv run python -m specparser.amt data/amt.yml --aum
+uv run python -m specparser.amt data/amt.yml --leverage
+uv run python -m specparser.amt data/amt.yml --value backtest.aum
+uv run python -m specparser.amt data/amt.yml --group
+```
+
+See [AMT Reference](amt.md) for detailed documentation.
+
+---
+
+## Storage Module
+
+### storage.py
+
+DuckDB and Parquet storage utilities for persisting tables.
+
+**Key exports:**
+```python
+from specparser.storage import (
+    table_to_parquet,    # Write table to Parquet file
+    parquet_to_table,    # Read Parquet file into table
+    query_parquet,       # Run SQL query on Parquet file
+    table_to_duckdb,     # Write table to DuckDB database
+    query_duckdb,        # Run SQL query on DuckDB database
+)
+```
+
+**CLI:**
+```bash
+uv run python -m specparser.storage --amt data/amt.yml --expand 2024 2025 --to-parquet schedules.parquet
+uv run python -m specparser.storage --parquet schedules.parquet --query "SELECT DISTINCT asset FROM data"
+```
+
+See [Storage Reference](storage.md) for detailed documentation.

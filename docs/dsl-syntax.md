@@ -203,7 +203,7 @@ Available init functions:
 
 ## Macros
 
-Macros are simple text replacements defined in `data/macros.txt`:
+Macros are simple text replacements defined in a macro file (e.g., `data/macros.txt`):
 
 ```
 @OUTDIR=/path/to/output
@@ -218,6 +218,32 @@ expand("@OUTDIR/@PREFIX_{1:3}.jpg")
 ```
 
 Macro keys must match pattern `@[A-Z0-9@]+`.
+
+### Single-Pass Expansion
+
+Macros are expanded in a **single pass from first line to last**. Each macro is substituted into the text in order, so:
+
+1. Top-level/document macros go **first** (they contain references to other macros)
+2. Component macros go **later** (they replace the references left behind)
+3. Simplest/leaf macros go **last**
+
+```
+# Correct order - top-level first, components later:
+@DOCUMENT@=@INTRO@@CHAPTERS@@EPILOGUE@
+@INTRO@=@DEDICATION@@PREFACE@
+@CHAPTERS@=Chapter 1...
+@EPILOGUE@=The End
+@DEDICATION@=To my family
+@PREFACE@=This book...
+
+# For paths:
+@SPEC@=@OUTDIR@/file_@ID@.jpg    # top-level, substituted first
+@OUTDIR@=@BASE@/output           # substituted second
+@BASE@=/data/project             # substituted last (leaf)
+@ID@=001
+```
+
+This single-pass behavior means the first macro's value gets transformed by all subsequent macro substitutions.
 
 ---
 
