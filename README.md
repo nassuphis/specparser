@@ -160,7 +160,12 @@ specparser/
 ├── dates.py             # Exchange calendar utilities
 ├── slots.py             # Slot management for images
 ├── image2spec.py        # Image metadata handling
-├── amt.py               # AMT YAML processing and schedule expansion
+├── amt/                 # AMT YAML processing (subpackage)
+│   ├── __init__.py      # Re-exports all public functions
+│   ├── __main__.py      # CLI entry point
+│   ├── loader.py        # Loading, caching, asset queries
+│   ├── tickers.py       # Ticker extraction and expansion
+│   └── schedules.py     # Schedule expansion and straddle building
 └── storage.py           # DuckDB/Parquet storage utilities
 ```
 
