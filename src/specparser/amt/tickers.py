@@ -36,6 +36,82 @@ def _split_ticker(ticker: str, param: str) -> list[tuple[str, str]]:
     return [(ticker, param)]
 
 
+def _format_ticker_spec(row: dict) -> str:
+    """
+    Format a ticker row as source:ticker:field spec string.
+
+    For CV source, the ticker is in the field column and field becomes "none".
+    For other sources, format is source:ticker:field.
+
+    Args:
+        row: Dict with keys 'source', 'ticker', 'field'
+
+    Returns:
+        Formatted spec string like "BBG:CL1 Comdty:PX_LAST"
+    """
+    if row["source"] == "CV":
+        return f"{row['source']}:{row['field']}:none"
+    return f"{row['source']}:{row['ticker']}:{row['field']}"
+
+
+def _parse_ticker_spec(spec: str) -> tuple[str, str, str]:
+    """
+    Parse a source:ticker:field spec string.
+
+    For CV source, field "none" is normalized.
+
+    Args:
+        spec: Spec string like "BBG:CL1 Comdty:PX_LAST"
+
+    Returns:
+        Tuple of (source, ticker, field)
+    """
+    parts = spec.split(":")
+    if len(parts) < 3:
+        return ("", "", "")
+    source = parts[0]
+    ticker = parts[1]
+    field = parts[2]
+    # For CV source, normalize field to "none"
+    if source == "CV":
+        field = "none"
+    return (source, ticker, field)
+
+
+def _parse_date_constraint(param: str) -> tuple[str, tuple[int, int] | None, bool]:
+    """
+    Parse a param string with optional date constraint.
+
+    Constraints are encoded as:
+    - param<YYYY-MM: valid before that date
+    - param>YYYY-MM: valid after that date
+
+    Args:
+        param: Param string, possibly with date constraint
+
+    Returns:
+        Tuple of (clean_param, (year, month) or None, is_before)
+        - clean_param: param without the date constraint
+        - date tuple: (year, month) if constraint present, else None
+        - is_before: True if '<' constraint (valid before), False if '>' (valid after)
+    """
+    if "<" in param:
+        clean_param, date_str = param.split("<", 1)
+        try:
+            year, month = map(int, date_str.split("-"))
+            return (clean_param, (year, month), True)
+        except ValueError:
+            return (param, None, True)
+    elif ">" in param:
+        clean_param, date_str = param.split(">", 1)
+        try:
+            year, month = map(int, date_str.split("-"))
+            return (clean_param, (year, month), False)
+        except ValueError:
+            return (param, None, False)
+    return (param, None, True)
+
+
 def asset_tickers(path: str | Path, underlying: str) -> dict[str, Any]:
     """
     Get all tickers for an asset by its Underlying value.
@@ -429,13 +505,7 @@ def asset_straddle(
             # Vol tickers - only include the one matching ntrc (Near for N, Far for F)
             if param != vol_param:
                 continue
-            # Format: source:ticker:field
-            # For CV source, the ticker is in the field column and field should be "none"
-            if row['source'] == "CV":
-                value = f"{row['source']}:{row['field']}:none"
-            else:
-                value = f"{row['source']}:{row['ticker']}:{row['field']}"
-            rows.append(["vol", value])
+            rows.append(["vol", _format_ticker_spec(row)])
 
         elif ticker_type == "Hedge":
             if source == "BBGfc":
@@ -445,44 +515,28 @@ def asset_straddle(
                 target_param = f"hedgeX{xpry}-{xprm:02d}"
                 for exp_row in expanded:
                     if exp_row["param"] == target_param:
-                        value = f"{exp_row['source']}:{exp_row['ticker']}:{exp_row['field']}"
-                        # Strip date suffix from param (hedgeXYYYY-MM -> hedge)
-                        clean_param = "hedge"
-                        rows.append([clean_param, value])
+                        rows.append(["hedge", _format_ticker_spec(exp_row)])
             elif source == "BBG":
                 # Check for split tickers and apply date filter
                 expanded = _expand_split_ticker_row(row)
                 for exp_row in expanded:
-                    exp_param = exp_row["param"]
-                    # For split tickers with date constraints, check if valid for expiry
+                    clean_param, constraint, is_before = _parse_date_constraint(exp_row["param"])
                     include = True
-                    clean_param = exp_param  # Default to unchanged
-                    if "<" in exp_param:
-                        # param<YYYY-MM means valid before that date
-                        clean_param, date_str = exp_param.split("<", 1)
-                        try:
-                            limit_year, limit_month = map(int, date_str.split("-"))
+                    if constraint is not None:
+                        limit_year, limit_month = constraint
+                        if is_before:
+                            # valid before that date
                             if (xpry, xprm) >= (limit_year, limit_month):
                                 include = False
-                        except ValueError:
-                            pass  # Keep the ticker if date parsing fails
-                    elif ">" in exp_param:
-                        # param>YYYY-MM means valid after that date
-                        clean_param, date_str = exp_param.split(">", 1)
-                        try:
-                            limit_year, limit_month = map(int, date_str.split("-"))
+                        else:
+                            # valid after that date
                             if (xpry, xprm) <= (limit_year, limit_month):
                                 include = False
-                        except ValueError:
-                            pass  # Keep the ticker if date parsing fails
-
                     if include:
-                        value = f"{exp_row['source']}:{exp_row['ticker']}:{exp_row['field']}"
-                        rows.append([clean_param, value])
+                        rows.append([clean_param, _format_ticker_spec(exp_row)])
             else:
                 # Other hedge sources - include as-is
-                value = f"{row['source']}:{row['ticker']}:{row['field']}"
-                rows.append([param, value])
+                rows.append([param, _format_ticker_spec(row)])
 
     return {
         "columns": ["name", "value"],
@@ -554,28 +608,15 @@ def straddle_days(table: dict[str, Any], prices_parquet: str | Path) -> dict[str
     start_date = f"{ntry}-{ntrm:02d}-01"
     end_date = f"{ntry}-{ntrm:02d}-{num_days:02d}"
 
-    def parse_ticker_spec(spec: str) -> tuple[str, str]:
-        """Parse source:ticker:field spec and return (ticker, field)."""
-        parts = spec.split(":")
-        if len(parts) < 3:
-            return ("", "")
-        source = parts[0]
-        ticker = parts[1]
-        field = parts[2]
-        # For CV source, use "none" as field
-        if source == "CV":
-            field = "none"
-        return (ticker, field)
-
     # Collect all ticker/field pairs to query
     ticker_field_pairs = []  # List of (ticker, field) tuples
-    vol_ticker, vol_field = parse_ticker_spec(vol_spec)
+    _, vol_ticker, vol_field = _parse_ticker_spec(vol_spec)
     if vol_ticker:
         ticker_field_pairs.append((vol_ticker, vol_field))
 
     hedge_ticker_fields = []  # Keep track of hedge ticker/field for result mapping
     for _, hedge_spec in hedge_specs:
-        hedge_ticker, hedge_field = parse_ticker_spec(hedge_spec)
+        _, hedge_ticker, hedge_field = _parse_ticker_spec(hedge_spec)
         hedge_ticker_fields.append((hedge_ticker, hedge_field))
         if hedge_ticker:
             ticker_field_pairs.append((hedge_ticker, hedge_field))
