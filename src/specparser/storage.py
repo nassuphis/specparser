@@ -71,23 +71,25 @@ def query_parquet(path: str | Path, sql: str) -> dict[str, Any]:
     """
     Run a SQL query on a Parquet file.
 
-    The table can be referenced as 'data' in the SQL query.
+    The table is named after the file stem (e.g., "prices.parquet" -> "prices").
 
     Args:
         path: Path to the Parquet file
-        sql: SQL query (use 'data' as table name)
+        sql: SQL query (use file stem as table name, e.g., "SELECT * FROM prices")
 
     Returns:
         Dict with 'columns' (list) and 'rows' (list of lists)
 
     Example:
-        >>> query_parquet("schedules.parquet", "SELECT DISTINCT asset FROM data")
+        >>> query_parquet("schedules.parquet", "SELECT DISTINCT asset FROM schedules")
+        >>> query_parquet("data/prices.parquet", "DESCRIBE prices;")
     """
     path = Path(path)
+    table_name = path.stem
 
     con = duckdb.connect()
-    # Create a view named 'data' for the parquet file
-    con.execute(f"CREATE VIEW data AS SELECT * FROM '{path}'")
+    # Create a view named after the file stem
+    con.execute(f"CREATE VIEW {table_name} AS SELECT * FROM '{path}'")
     result = con.execute(sql).fetchall()
     columns = [desc[0] for desc in con.description]
     con.close()
@@ -154,6 +156,41 @@ def query_duckdb(db_path: str | Path, sql: str) -> dict[str, Any]:
     }
 
 
+def parquet_dir_to_duckdb(parquet_dir: str | Path, db_path: str | Path) -> list[str]:
+    """
+    Load all Parquet files from a directory into a DuckDB database.
+
+    Each Parquet file becomes a table named after its file stem
+    (e.g., "prices.parquet" -> table "prices").
+
+    Args:
+        parquet_dir: Directory containing Parquet files
+        db_path: Path to the DuckDB database file
+
+    Returns:
+        List of table names that were created
+
+    Example:
+        >>> tables = parquet_dir_to_duckdb("data/parquet/", "data.duckdb")
+        >>> tables
+        ['prices', 'schedules', 'straddles']
+    """
+    parquet_dir = Path(parquet_dir)
+    db_path = Path(db_path)
+
+    con = duckdb.connect(str(db_path))
+    tables = []
+
+    for parquet_file in sorted(parquet_dir.glob("*.parquet")):
+        table_name = parquet_file.stem
+        con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM '{parquet_file}'")
+        tables.append(table_name)
+
+    con.close()
+    return tables
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -166,21 +203,19 @@ def _main() -> int:
         description="DuckDB/Parquet storage utilities.",
     )
     p.add_argument("--amt", metavar="PATH", help="Path to AMT YAML file")
-    p.add_argument("--expand", nargs=2, type=int, metavar=("START_YEAR", "END_YEAR"), help="Expand schedules for year range")
-    p.add_argument("--pack", action="store_true", help="Pack into straddle format")
+    p.add_argument("--expand", nargs=2, type=int, metavar=("START_YEAR", "END_YEAR"), help="Expand schedules into straddle strings")
     p.add_argument("--to-parquet", "-o", metavar="PATH", help="Write to Parquet file")
     p.add_argument("--to-duckdb", nargs=2, metavar=("DB_PATH", "TABLE"), help="Write to DuckDB table")
     p.add_argument("--query", "-q", metavar="SQL", help="Run SQL query on Parquet file")
     p.add_argument("--parquet", "-p", metavar="PATH", help="Parquet file to query")
     p.add_argument("--db", "-d", metavar="PATH", help="DuckDB file to query")
+    p.add_argument("--load-dir", nargs=2, metavar=("PARQUET_DIR", "DB_PATH"), help="Load all Parquet files from directory into DuckDB")
     args = p.parse_args()
 
     # Generate table from AMT
     if args.amt and args.expand:
         start_year, end_year = args.expand
-        table = amt.expand_live_schedules_fixed(args.amt, start_year, end_year)
-        if args.pack:
-            table = amt.pack_straddle(table)
+        table = amt.expand(args.amt, start_year, end_year)
 
         if args.to_parquet:
             table_to_parquet(table, args.to_parquet)
@@ -203,6 +238,13 @@ def _main() -> int:
             p.error("--query requires --parquet or --db")
             return 1
         amt.print_table(table)
+        return 0
+
+    # Load directory of Parquet files into DuckDB
+    if args.load_dir:
+        parquet_dir, db_path = args.load_dir
+        tables = parquet_dir_to_duckdb(parquet_dir, db_path)
+        print(f"Loaded {len(tables)} tables into {db_path}: {', '.join(tables)}")
         return 0
 
     p.print_help()

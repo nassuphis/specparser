@@ -38,13 +38,13 @@ Write a table dict to a Parquet file.
 
 ```python
 from specparser.storage import table_to_parquet
-from specparser.amt import expand_schedules_fixed
+from specparser.amt import expand
 
-# Generate table
-table = expand_schedules_fixed("data/amt.yml", 2024, 2025)
+# Generate table (straddle strings)
+table = expand("data/amt.yml", 2024, 2025)
 
 # Write to Parquet
-table_to_parquet(table, "schedules.parquet")
+table_to_parquet(table, "straddles.parquet")
 ```
 
 **Parameters:**
@@ -70,13 +70,13 @@ print(f"Rows: {len(table['rows'])}")
 
 Run a SQL query on a Parquet file.
 
-The table is available as `data` in the SQL query.
+The table is named after the file stem (e.g., `prices.parquet` → `prices`).
 
 ```python
 from specparser.storage import query_parquet
 
-# Get distinct assets
-result = query_parquet("schedules.parquet", "SELECT DISTINCT asset FROM data ORDER BY asset")
+# Get distinct assets (file: schedules.parquet → table: schedules)
+result = query_parquet("schedules.parquet", "SELECT DISTINCT asset FROM schedules ORDER BY asset")
 print(result['columns'])  # ['asset']
 for row in result['rows'][:5]:
     print(row[0])
@@ -84,16 +84,19 @@ for row in result['rows'][:5]:
 # Aggregate query
 result = query_parquet("schedules.parquet", """
     SELECT asset, COUNT(*) as cnt
-    FROM data
+    FROM schedules
     GROUP BY asset
     ORDER BY cnt DESC
     LIMIT 10
 """)
+
+# Describe table structure
+result = query_parquet("data/prices.parquet", "DESCRIBE prices;")
 ```
 
 **Parameters:**
 - `path`: Parquet file path
-- `sql`: SQL query (use `data` as the table name)
+- `sql`: SQL query (use file stem as table name, e.g., `prices.parquet` → `prices`)
 
 **Returns:** Dict with `columns` (list) and `rows` (list of lists)
 
@@ -107,10 +110,10 @@ Write a table dict to a DuckDB database.
 
 ```python
 from specparser.storage import table_to_duckdb
-from specparser.amt import expand_schedules_fixed
+from specparser.amt import expand
 
-table = expand_schedules_fixed("data/amt.yml", 2024, 2025)
-table_to_duckdb(table, "data.duckdb", "schedules")
+table = expand("data/amt.yml", 2024, 2025)
+table_to_duckdb(table, "data.duckdb", "straddles")
 ```
 
 **Parameters:**
@@ -153,27 +156,24 @@ The storage module provides a CLI for common operations.
 ### Writing Tables
 
 ```bash
-# Write expanded schedules to Parquet
-uv run python -m specparser.storage --amt data/amt.yml --expand 2024 2025 --to-parquet schedules.parquet
-
-# Write packed straddles to Parquet
-uv run python -m specparser.storage --amt data/amt.yml --expand 2024 2025 --pack --to-parquet straddles.parquet
+# Write expanded straddles to Parquet
+uv run python -m specparser.storage --amt data/amt.yml --expand 2024 2025 --to-parquet straddles.parquet
 
 # Write to DuckDB database
-uv run python -m specparser.storage --amt data/amt.yml --expand 2024 2025 --to-duckdb data.duckdb schedules
-
-# Write packed straddles to DuckDB
-uv run python -m specparser.storage --amt data/amt.yml --expand 2024 2025 --pack --to-duckdb data.duckdb straddles
+uv run python -m specparser.storage --amt data/amt.yml --expand 2024 2025 --to-duckdb data.duckdb straddles
 ```
 
 ### Querying Files
 
 ```bash
-# Query Parquet file
-uv run python -m specparser.storage --parquet schedules.parquet --query "SELECT DISTINCT asset FROM data ORDER BY asset LIMIT 10"
+# Query Parquet file (table name = file stem)
+uv run python -m specparser.storage --parquet schedules.parquet --query "SELECT DISTINCT asset FROM schedules ORDER BY asset LIMIT 10"
+
+# Describe table structure
+uv run python -m specparser.storage --parquet data/prices.parquet --query "DESCRIBE prices;"
 
 # Query with aggregation
-uv run python -m specparser.storage --parquet schedules.parquet --query "SELECT asset, COUNT(*) as cnt FROM data GROUP BY asset ORDER BY cnt DESC LIMIT 5"
+uv run python -m specparser.storage --parquet schedules.parquet --query "SELECT asset, COUNT(*) as cnt FROM schedules GROUP BY asset ORDER BY cnt DESC LIMIT 5"
 
 # Query DuckDB database
 uv run python -m specparser.storage --db data.duckdb --query "SELECT * FROM schedules WHERE xpry = 2024 AND xprm = 1 LIMIT 10"
@@ -184,13 +184,13 @@ uv run python -m specparser.storage --db data.duckdb --query "SELECT * FROM sche
 | Option | Description |
 |--------|-------------|
 | `--amt PATH` | Path to AMT YAML file |
-| `--expand START END` | Expand schedules for year range |
-| `--pack` | Pack into straddle format (use with `--expand`) |
+| `--expand START END` | Expand schedules for year range (returns straddle strings) |
 | `--to-parquet PATH` | Write output to Parquet file |
 | `--to-duckdb DB TABLE` | Write output to DuckDB table |
 | `--parquet PATH` | Parquet file to query |
 | `--db PATH` | DuckDB file to query |
 | `--query SQL` | SQL query to run |
+| `--load-dir PARQUET_DIR DB_PATH` | Load all Parquet files from directory into DuckDB |
 
 ---
 
@@ -199,31 +199,28 @@ uv run python -m specparser.storage --db data.duckdb --query "SELECT * FROM sche
 ### Create and Query a Database
 
 ```python
-from specparser.amt import expand_schedules_fixed, pack_straddle
+from specparser.amt import expand
 from specparser.storage import table_to_duckdb, table_to_parquet, query_duckdb
 
-# Generate data
-expanded = expand_schedules_fixed("data/amt.yml", 2024, 2025)
-packed = pack_straddle(expanded)
+# Generate straddle data
+straddles = expand("data/amt.yml", 2024, 2025)
 
 # Store in DuckDB
-table_to_duckdb(expanded, "portfolio.duckdb", "schedules")
-table_to_duckdb(packed, "portfolio.duckdb", "straddles")
+table_to_duckdb(straddles, "portfolio.duckdb", "straddles")
 
 # Also save as Parquet for external tools
-table_to_parquet(expanded, "schedules.parquet")
-table_to_parquet(packed, "straddles.parquet")
+table_to_parquet(straddles, "straddles.parquet")
 
-# Query: Monthly schedule counts by asset
+# Query: Count straddles by asset
 result = query_duckdb("portfolio.duckdb", """
-    SELECT asset, xpry, xprm, COUNT(*) as entries
-    FROM schedules
-    WHERE xpry = 2024
-    GROUP BY asset, xpry, xprm
-    ORDER BY asset, xprm
+    SELECT asset, COUNT(*) as cnt
+    FROM straddles
+    GROUP BY asset
+    ORDER BY cnt DESC
+    LIMIT 10
 """)
 
-for row in result['rows'][:10]:
+for row in result['rows']:
     print(row)
 ```
 
@@ -232,15 +229,14 @@ for row in result['rows'][:10]:
 ```python
 from specparser.storage import query_parquet, table_to_parquet
 
-# Filter to specific asset and year
-result = query_parquet("schedules.parquet", """
-    SELECT * FROM data
+# Filter to specific asset
+result = query_parquet("straddles.parquet", """
+    SELECT * FROM straddles
     WHERE asset = 'AAPL US Equity'
-    AND xpry = 2024
 """)
 
 # Export filtered data
-table_to_parquet(result, "aapl_2024.parquet")
+table_to_parquet(result, "aapl_straddles.parquet")
 ```
 
 ### Analyze Straddles
@@ -249,6 +245,7 @@ table_to_parquet(result, "aapl_2024.parquet")
 from specparser.storage import query_parquet
 
 # Parse straddle strings with SQL
+# Straddle format: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
 result = query_parquet("straddles.parquet", """
     SELECT
         asset,
@@ -256,7 +253,7 @@ result = query_parquet("straddles.parquet", """
         SPLIT_PART(straddle, '|', 3) as expiry_date,
         SPLIT_PART(straddle, '|', 4) as entry_code,
         SPLIT_PART(straddle, '|', 8) as weight
-    FROM data
+    FROM straddles
     LIMIT 10
 """)
 

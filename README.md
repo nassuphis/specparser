@@ -44,6 +44,7 @@ expand("[x,y]{1:2}::#{d1}-#{d2}")
 | [Functions](docs/functions.md) | Available functions for init, expand, and render phases |
 | [Modules](docs/modules.md) | Package structure and module API reference |
 | [AMT Reference](docs/amt.md) | AMT YAML processing and schedule expansion |
+| [AMT Format](docs/amt_format.md) | AMT YAML file format specification |
 | [Storage Reference](docs/storage.md) | DuckDB/Parquet storage utilities |
 
 ## Spec Language

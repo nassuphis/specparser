@@ -107,15 +107,15 @@ asset = get_asset("data/amt.yml", "LA Comdty OLD")
 # Returns: {'Underlying': 'LA Comdty', 'WeightCap': 0.05, ...}
 ```
 
-#### `find_by_underlying(path, underlying)`
+#### `find_underlyings(path, pattern)`
 
-Find all assets with a given Underlying value.
+Find all assets with Underlying values matching a regex pattern.
 
 ```python
-from specparser.amt import find_by_underlying
+from specparser.amt import find_underlyings
 
-matches = find_by_underlying("data/amt.yml", "LA Comdty")
-# Returns: [('LA Comdty OLD', {...}), ...]
+matches = find_underlyings("data/amt.yml", "^LA.*")
+# Returns: ['LA Comdty', 'LA2 Comdty', ...]
 ```
 
 #### `list_assets(path)`
@@ -127,17 +127,6 @@ from specparser.amt import list_assets
 
 names = list_assets("data/amt.yml")
 # Returns: ['LA Comdty OLD', 'LP Comdty', ...]
-```
-
-#### `get_schedule(path, name)`
-
-Get the expiry schedule for an asset by its YAML key.
-
-```python
-from specparser.amt import get_schedule
-
-schedule = get_schedule("data/amt.yml", "LA Comdty OLD")
-# Returns: ['N0_OVERRIDE_33.3', 'N5_OVERRIDE_33.3', ...]
 ```
 
 ---
@@ -415,121 +404,111 @@ hedge      BBG:CL F24 Comdty:PX_LAST
 
 ### Schedule Functions
 
+#### `get_schedule(path, underlying)`
+
+Get the expiry schedule for an asset by its Underlying value.
+
+Values like 'a', 'b', 'c', 'd' are automatically fixed to computed day numbers.
+
+```python
+from specparser.amt import get_schedule
+
+schedule = get_schedule("data/amt.yml", "LA Comdty")
+# Returns: ['N1_BD1_33.3', 'N5_BD5_33.3', ...]
+```
+
+#### `find_schedules(path, pattern)`
+
+Find assets matching a regex pattern and return their schedule components.
+
+```python
+from specparser.amt import find_schedules
+
+table = find_schedules("data/amt.yml", "^LA.*")
+# Columns: ['schcnt', 'schid', 'asset', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
+```
+
 #### `live_schedules(path)`
 
-Get all live assets with their schedules expanded into rows.
+Get all live assets (WeightCap > 0) with their schedules expanded into rows.
 
-Each schedule component is parsed into separate columns:
-- Entry code/value (`ntrc`, `ntrv`)
-- Expiry code/value (`xprc`, `xprv`)
-- Weight (`wgt`)
+Each schedule component is parsed into separate columns. Values like
+'a', 'b', 'c', 'd' are automatically fixed to computed day numbers.
 
 ```python
 from specparser.amt import live_schedules
 
 table = live_schedules("data/amt.yml")
-# Columns: ['assid', 'schcnt', 'schid', 'asset', 'wcap', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
+# Columns: ['schcnt', 'schid', 'asset', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
 ```
 
 **Column descriptions:**
 | Column | Description |
 |--------|-------------|
-| `assid` | Asset ID (enumeration index) |
 | `schcnt` | Schedule count (total components in schedule) |
 | `schid` | Schedule ID (1-based component index) |
 | `asset` | Underlying asset name |
-| `wcap` | Weight cap |
 | `ntrc` | Entry code (e.g., 'N' for Near, 'F' for Far) |
-| `ntrv` | Entry value (e.g., '0', '5', or 'a', 'b') |
+| `ntrv` | Entry value (computed day number) |
 | `xprc` | Expiry code (e.g., 'OVERRIDE', 'BD', 'F') |
-| `xprv` | Expiry value (e.g., '', '15', '3') |
+| `xprv` | Expiry value (computed day number) |
 | `wgt` | Weight percentage |
 
-#### `fix_expiry(table)`
+**Value fixing:**
 
-Transform expiry values with lowercase letters [a,b,c,d] to computed values.
-
-The formula is:
+Values 'a', 'b', 'c', 'd' in schedule entries are automatically fixed to computed day numbers using:
 ```
 value = (schedule_id - 1) * day_stride + day_offset
 where:
-    day_offset = asset_id % 5 + 1
+    day_offset = asset_hash % 5 + 1
     day_stride = 20 / (schedule_count + 1)
+    asset_hash = MD5(underlying)[:8] % 1000000
 ```
 
-This spreads entries across the month to avoid clustering.
-
-```python
-from specparser.amt import live_schedules, fix_expiry
-
-raw = live_schedules("data/amt.yml")
-fixed = fix_expiry(raw)
-# 'a', 'b', 'c', 'd' in ntrv/xprv are replaced with computed numbers
-```
+This spreads entries across the month to avoid clustering, with deterministic results based on the asset's underlying name.
 
 ---
 
 ### Schedule Expansion
 
-#### `expand_schedules(path, start_year, end_year)`
+#### `expand(path, start_year, end_year)`
 
-Expand schedules across a year/month range (raw, without fix_expiry).
+Expand all live schedules across a year/month range into straddle strings.
+
+Computes the cartesian product of:
+- years: start_year to end_year (inclusive)
+- months: 1 to 12
+- rows from live_schedules() (already expanded by schedule component)
+
+Each row is packed into a pipe-delimited straddle string.
 
 ```python
-from specparser.amt import expand_schedules
+from specparser.amt import expand
 
-table = expand_schedules("data/amt.yml", 2024, 2025)
-# Columns: ['xpry', 'xprm', 'ntry', 'ntrm', 'assid', 'schcnt', 'schid', 'asset', 'wcap', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
+table = expand("data/amt.yml", 2024, 2025)
+# Columns: ['asset', 'straddle']
 ```
 
-**Additional columns:**
-| Column | Description |
-|--------|-------------|
-| `xpry` | Expiry year |
-| `xprm` | Expiry month (1-12) |
-| `ntry` | Entry year (computed from ntrc) |
-| `ntrm` | Entry month (computed from ntrc) |
+**Straddle format:** `|ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|`
+
+Example: `|2023-12|2024-01|N|0|OVERRIDE||33.3|`
 
 **Entry date calculation:**
 - `ntrc = "N"` (Near): Entry is 1 month before expiry
 - `ntrc = "F"` (Far): Entry is 2 months before expiry
 
-#### `expand_schedules_fixed(path, start_year, end_year)`
+#### `find_expand(path, pattern, start_year, end_year)`
 
-Expand schedules with `fix_expiry()` applied first.
-
-```python
-from specparser.amt import expand_schedules_fixed
-
-table = expand_schedules_fixed("data/amt.yml", 2024, 2025)
-# Same columns as expand_schedules, but ntrv/xprv are transformed
-```
-
----
-
-### Packing Functions
-
-#### `pack_straddle(table)`
-
-Pack expanded schedule rows into straddle strings.
-
-Each row becomes a pipe-delimited string:
-```
-|ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
-```
-
-Example:
-```
-|2023-12|2024-01|N|0|OVERRIDE||33.3|
-```
+Expand schedules matching a regex pattern across a year/month range into straddle strings.
 
 ```python
-from specparser.amt import expand_schedules_fixed, pack_straddle
+from specparser.amt import find_expand
 
-expanded = expand_schedules_fixed("data/amt.yml", 2024, 2024)
-packed = pack_straddle(expanded)
+table = find_expand("data/amt.yml", "^LA.*", 2024, 2025)
 # Columns: ['asset', 'straddle']
 ```
+
+Same straddle format as `expand()`.
 
 ---
 
@@ -568,20 +547,17 @@ uv run python -m specparser.amt data/amt.yml --live-table group_table
 uv run python -m specparser.amt data/amt.yml --live-table limit_overrides
 uv run python -m specparser.amt data/amt.yml --live-table liquidity_table
 
-# List schedules (raw)
-uv run python -m specparser.amt data/amt.yml --schedules-raw
-
-# List schedules (with fix_expiry)
+# List schedules for live assets
 uv run python -m specparser.amt data/amt.yml --schedules
 
-# Expand schedules (raw)
-uv run python -m specparser.amt data/amt.yml --expand-raw 2024 2025
+# Find schedules matching regex pattern
+uv run python -m specparser.amt data/amt.yml --find-schedules "^LA.*"
 
-# Expand schedules (with fix_expiry)
+# Expand live schedules into straddle strings
 uv run python -m specparser.amt data/amt.yml --expand 2024 2025
 
-# Pack into straddle strings
-uv run python -m specparser.amt data/amt.yml --pack 2024 2025
+# Expand schedules matching pattern into straddle strings
+uv run python -m specparser.amt data/amt.yml --find-expand "^CL.*" 2024 2025
 
 # Get value by key path
 uv run python -m specparser.amt data/amt.yml --value backtest.aum
@@ -652,15 +628,15 @@ Where:
 
 ## Examples
 
-### Get all schedules for 2024-2025, packed as straddles
+### Get all schedules for 2024-2025 as straddle strings
 
 ```python
-from specparser.amt import expand_schedules_fixed, pack_straddle
+from specparser.amt import expand
 
-table = expand_schedules_fixed("data/amt.yml", 2024, 2025)
-packed = pack_straddle(table)
+table = expand("data/amt.yml", 2024, 2025)
+# Columns: ['asset', 'straddle']
 
-for row in packed['rows'][:5]:
+for row in table['rows'][:5]:
     asset, straddle = row
     print(f"{asset}: {straddle}")
 ```
@@ -668,32 +644,43 @@ for row in packed['rows'][:5]:
 ### Query specific asset's schedule
 
 ```python
-from specparser.amt import find_by_underlying, get_schedule
+from specparser.amt import get_schedule
 
-matches = find_by_underlying("data/amt.yml", "AAPL US Equity")
-if matches:
-    name, data = matches[0]
-    schedule = get_schedule("data/amt.yml", name)
-    print(f"Schedule for {name}:")
+schedule = get_schedule("data/amt.yml", "AAPL US Equity")
+if schedule:
+    print("Schedule for AAPL US Equity:")
     for entry in schedule:
         print(f"  {entry}")
 ```
 
-### Filter expanded table
+### Expand schedules for specific assets
 
 ```python
-from specparser.amt import expand_schedules_fixed
+from specparser.amt import find_expand
 
-table = expand_schedules_fixed("data/amt.yml", 2024, 2024)
-cols = table['columns']
-asset_idx = cols.index('asset')
-xpry_idx = cols.index('xpry')
-xprm_idx = cols.index('xprm')
+# Expand only commodities matching pattern
+table = find_expand("data/amt.yml", "^CL.*", 2024, 2024)
 
-# Filter for January 2024 only
-jan_rows = [
-    row for row in table['rows']
-    if row[xpry_idx] == 2024 and row[xprm_idx] == 1
-]
-print(f"Found {len(jan_rows)} entries for Jan 2024")
+for row in table['rows'][:5]:
+    asset, straddle = row
+    print(f"{asset}: {straddle}")
+```
+
+### Parse straddle strings
+
+```python
+from specparser.amt import expand
+
+table = expand("data/amt.yml", 2024, 2024)
+
+# Straddle format: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
+for row in table['rows'][:5]:
+    asset, straddle = row
+    parts = straddle.split('|')
+    # parts[0] is empty (leading |)
+    entry_date = parts[1]   # ntry-ntrm
+    expiry_date = parts[2]  # xpry-xprm
+    entry_code = parts[3]   # ntrc (N or F)
+    weight = parts[7]       # wgt
+    print(f"{asset}: entry={entry_date}, expiry={expiry_date}, code={entry_code}, weight={weight}")
 ```

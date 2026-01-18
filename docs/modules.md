@@ -17,7 +17,12 @@ src/specparser/
 ├── dates.py             # Exchange calendar utilities
 ├── slots.py             # Slot management for images
 ├── image2spec.py        # Image metadata (spec embedding)
-├── amt.py               # AMT YAML processing and schedule expansion
+├── amt/                 # AMT YAML processing (subpackage)
+│   ├── __init__.py      # Re-exports all public functions
+│   ├── __main__.py      # CLI entry point
+│   ├── loader.py        # Loading, caching, asset queries
+│   ├── tickers.py       # Ticker extraction and expansion
+│   └── schedules.py     # Schedule expansion and straddle building
 └── storage.py           # DuckDB/Parquet storage utilities
 ```
 
@@ -263,26 +268,34 @@ The `chain` module has its own state (`chain_state.py`) separate from the expand
 
 ## AMT Module
 
-### amt.py
+### amt/
 
 Process AMT (Asset Management Table) YAML files for expiry schedules.
+
+The AMT module is structured as a subpackage:
+- `loader.py` - Loading, caching, and asset queries
+- `tickers.py` - Ticker extraction and expansion
+- `schedules.py` - Schedule expansion and straddle building
 
 **Key exports:**
 ```python
 from specparser.amt import (
-    load_amt, clear_cache,           # Loading and caching
-    get_value, get_aum, get_leverage,# Value extraction
-    get_asset, find_by_underlying,   # Asset queries
-    list_assets, get_schedule,       # Asset and schedule lookups
-    get_table, format_table,         # Table utilities
-    assets, live_assets,             # Asset tables
-    live_class, live_table, live_group,  # Asset class, generic table, and group info
-    asset_tickers, live_tickers,     # Ticker extraction
-    asset_straddle,                  # Straddle info with tickers
-    live_schedules, fix_expiry,      # Schedule processing
-    expand_schedules,                # Schedule expansion (raw)
-    expand_schedules_fixed,          # Schedule expansion (with fix_expiry)
-    pack_straddle,                   # Pack into straddle strings
+    # Loading and caching
+    load_amt, clear_cache,
+    # Value extraction
+    get_value, get_aum, get_leverage,
+    # Asset queries
+    get_asset, find_underlyings, list_assets,
+    # Table utilities
+    get_table, format_table, print_table,
+    # Asset tables
+    assets, live_assets, live_class, live_table, live_group,
+    # Ticker extraction
+    asset_tickers, live_tickers, fut_ticker, asset_straddle, straddle_days,
+    # Schedule processing
+    get_schedule, find_schedules, live_schedules,
+    # Schedule expansion (returns straddle strings)
+    expand, find_expand,
 )
 ```
 
@@ -290,7 +303,8 @@ from specparser.amt import (
 ```bash
 uv run python -m specparser.amt data/amt.yml --get "Asset Name"
 uv run python -m specparser.amt data/amt.yml --expand 2024 2025
-uv run python -m specparser.amt data/amt.yml --pack 2024 2025
+uv run python -m specparser.amt data/amt.yml --find-expand "^CL.*" 2024 2025
+uv run python -m specparser.amt data/amt.yml --schedules
 uv run python -m specparser.amt data/amt.yml --aum
 uv run python -m specparser.amt data/amt.yml --leverage
 uv run python -m specparser.amt data/amt.yml --value backtest.aum
