@@ -818,6 +818,135 @@ def _expand_split_ticker_row(row: dict) -> list[dict]:
     return expanded_rows
 
 
+def asset_straddle(
+    path: str | Path,
+    underlying: str,
+    straddle: str,
+    chain_csv: str | Path | None = None
+) -> dict[str, Any]:
+    """
+    Build a straddle info table with asset metadata and relevant tickers.
+
+    Takes an underlying and a packed straddle string (e.g., |2023-12|2024-01|N|0|OVERRIDE||33.3|)
+    and returns a table with name/value pairs containing:
+    - asset: the underlying
+    - straddle: the packed straddle string
+    - Vol and Hedge tickers formatted as source:ticker:field
+
+    The straddle format is: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
+
+    Tickers are selected based on the expiry year/month from the straddle:
+    - Vol tickers (Near/Far) are included
+    - Hedge tickers matching the expiry month (hedgeX{year}-{month:02d}) are included
+
+    Args:
+        path: Path to the AMT YAML file
+        underlying: The Underlying value to search for
+        straddle: Packed straddle string (e.g., |2023-12|2024-01|N|0|OVERRIDE||33.3|)
+        chain_csv: Optional path to CSV for normalized to actual ticker lookup
+
+    Returns:
+        Dict with keys: 'columns' (list), 'rows' (list of lists)
+        Columns are ['name', 'value']
+
+    Example:
+        >>> table = asset_straddle("data/amt.yml", "C Comdty", "|2023-12|2024-01|N|0|OVERRIDE||33.3|")
+        >>> table['columns']
+        ['name', 'value']
+    """
+    # Parse straddle: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
+    parts = straddle.strip("|").split("|")
+    if len(parts) < 7:
+        raise ValueError(f"Invalid straddle format: {straddle}")
+
+    expiry_part = parts[1]  # "2024-01"
+
+    # Parse expiry year and month
+    try:
+        xpry, xprm = expiry_part.split("-")
+        xpry = int(xpry)
+        xprm = int(xprm)
+    except ValueError as e:
+        raise ValueError(f"Invalid expiry format in straddle: {expiry_part}") from e
+
+    # Get tickers for the asset
+    ticker_table = asset_tickers(path, underlying)
+    if not ticker_table["rows"]:
+        raise ValueError(f"No asset found with Underlying: {underlying}")
+
+    ticker_columns = ticker_table["columns"]
+    rows = []
+
+    # Add asset and straddle info
+    rows.append(["asset", underlying])
+    rows.append(["straddle", straddle])
+
+    # Process tickers: expand BBGfc and split tickers for the expiry month
+    for list_row in ticker_table["rows"]:
+        row = dict(zip(ticker_columns, list_row))
+        ticker_type = row["type"]
+        source = row["source"]
+        param = row["param"]
+
+        if ticker_type == "Vol":
+            # Vol tickers - include as-is with param as name
+            # Format: source:ticker:field
+            value = f"{row['source']}:{row['ticker']}:{row['field']}"
+            rows.append([f"Vol.{param}", value])
+
+        elif ticker_type == "Hedge":
+            if source == "BBGfc":
+                # Expand for the specific expiry month
+                expanded = _expand_bbgfc_row(row, xpry, xpry, chain_csv)
+                # Filter to the specific month
+                target_param = f"hedgeX{xpry}-{xprm:02d}"
+                for exp_row in expanded:
+                    if exp_row["param"] == target_param:
+                        value = f"{exp_row['source']}:{exp_row['ticker']}:{exp_row['field']}"
+                        # Strip date suffix from param (hedgeXYYYY-MM -> hedge)
+                        clean_param = "hedge"
+                        rows.append([f"Hedge.{clean_param}", value])
+            elif source == "BBG":
+                # Check for split tickers and apply date filter
+                expanded = _expand_split_ticker_row(row)
+                for exp_row in expanded:
+                    exp_param = exp_row["param"]
+                    # For split tickers with date constraints, check if valid for expiry
+                    include = True
+                    clean_param = exp_param  # Default to unchanged
+                    if "<" in exp_param:
+                        # param<YYYY-MM means valid before that date
+                        clean_param, date_str = exp_param.split("<", 1)
+                        try:
+                            limit_year, limit_month = map(int, date_str.split("-"))
+                            if (xpry, xprm) >= (limit_year, limit_month):
+                                include = False
+                        except ValueError:
+                            pass  # Keep the ticker if date parsing fails
+                    elif ">" in exp_param:
+                        # param>YYYY-MM means valid after that date
+                        clean_param, date_str = exp_param.split(">", 1)
+                        try:
+                            limit_year, limit_month = map(int, date_str.split("-"))
+                            if (xpry, xprm) <= (limit_year, limit_month):
+                                include = False
+                        except ValueError:
+                            pass  # Keep the ticker if date parsing fails
+
+                    if include:
+                        value = f"{exp_row['source']}:{exp_row['ticker']}:{exp_row['field']}"
+                        rows.append([f"Hedge.{clean_param}", value])
+            else:
+                # Other hedge sources - include as-is
+                value = f"{row['source']}:{row['ticker']}:{row['field']}"
+                rows.append([f"Hedge.{param}", value])
+
+    return {
+        "columns": ["name", "value"],
+        "rows": rows,
+    }
+
+
 def live_tickers(path: str | Path, start_year: int | None = None, end_year: int | None = None, chain_csv: str | Path | None = None) -> dict[str, Any]:
     """
     Get all tickers for all live assets.
@@ -1314,6 +1443,7 @@ def _main() -> int:
     p.add_argument("--aum", action="store_true", help="Get AUM value")
     p.add_argument("--leverage", action="store_true", help="Get leverage value")
     p.add_argument("--fut", nargs=3, metavar=("SPEC", "YEAR", "MONTH"), help="Compute futures ticker from spec string, year, and month")
+    p.add_argument("--straddle", nargs=2, metavar=("UNDERLYING", "STRADDLE"), help="Get straddle info with tickers for an asset")
     args = p.parse_args()
 
     if args.get:
@@ -1445,6 +1575,14 @@ def _main() -> int:
             print(ticker)
         except (ValueError, IndexError) as e:
             print(f"Error computing futures ticker: {e}")
+            return 1
+    elif args.straddle:
+        underlying, straddle_str = args.straddle
+        try:
+            table = asset_straddle(args.path, underlying, straddle_str, chain_csv=args.chain_csv)
+            print_table(table)
+        except ValueError as e:
+            print(f"Error: {e}")
             return 1
     else:
         p.print_help()
