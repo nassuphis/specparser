@@ -277,6 +277,8 @@ from specparser.amt import (
     get_table, format_table,         # Table utilities
     assets, live_assets,             # Asset tables
     live_class, live_table, live_group,  # Asset class, generic table, and group info
+    asset_tickers, live_tickers,     # Ticker extraction
+    asset_straddle,                  # Straddle info with tickers
     live_schedules, fix_expiry,      # Schedule processing
     expand_schedules,                # Schedule expansion (raw)
     expand_schedules_fixed,          # Schedule expansion (with fix_expiry)

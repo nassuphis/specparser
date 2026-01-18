@@ -590,7 +590,7 @@ def asset_tickers(path: str | Path, underlying: str) -> dict[str, Any]:
                 # nonfut has Ticker and Field, source is always "BBG"
                 ticker = hedge.get("Ticker", "")
                 field = hedge.get("Field", "")
-                rows.append([asset_underlying, asset_class, "Hedge", "nonfut", "BBG", ticker, field])
+                rows.append([asset_underlying, asset_class, "Hedge", "hedge", "BBG", ticker, field])
             elif source == "cds":
                 # cds: two rows for hedge and hedge1, each with their ticker value
                 hedge_ticker = hedge.get("hedge", "")
@@ -869,6 +869,10 @@ def asset_straddle(
     except ValueError as e:
         raise ValueError(f"Invalid expiry format in straddle: {expiry_part}") from e
 
+    # Get near/far code - determines which Vol field to use
+    ntrc = parts[2]  # "N" or "F"
+    vol_param = "Near" if ntrc == "N" else "Far"
+
     # Get tickers for the asset
     ticker_table = asset_tickers(path, underlying)
     if not ticker_table["rows"]:
@@ -881,6 +885,15 @@ def asset_straddle(
     rows.append(["asset", underlying])
     rows.append(["straddle", straddle])
 
+    # Add valuation info - comma-delimited name=value pairs
+    matches = find_by_underlying(path, underlying)
+    if matches:
+        _, asset_data = matches[0]
+        valuation = asset_data.get("Valuation", {})
+        if isinstance(valuation, dict) and valuation:
+            val_parts = [f"{k}={v}" for k, v in valuation.items()]
+            rows.append(["valuation", ",".join(val_parts)])
+
     # Process tickers: expand BBGfc and split tickers for the expiry month
     for list_row in ticker_table["rows"]:
         row = dict(zip(ticker_columns, list_row))
@@ -889,10 +902,12 @@ def asset_straddle(
         param = row["param"]
 
         if ticker_type == "Vol":
-            # Vol tickers - include as-is with param as name
+            # Vol tickers - only include the one matching ntrc (Near for N, Far for F)
+            if param != vol_param:
+                continue
             # Format: source:ticker:field
             value = f"{row['source']}:{row['ticker']}:{row['field']}"
-            rows.append([f"Vol.{param}", value])
+            rows.append(["vol", value])
 
         elif ticker_type == "Hedge":
             if source == "BBGfc":
@@ -905,7 +920,7 @@ def asset_straddle(
                         value = f"{exp_row['source']}:{exp_row['ticker']}:{exp_row['field']}"
                         # Strip date suffix from param (hedgeXYYYY-MM -> hedge)
                         clean_param = "hedge"
-                        rows.append([f"Hedge.{clean_param}", value])
+                        rows.append([clean_param, value])
             elif source == "BBG":
                 # Check for split tickers and apply date filter
                 expanded = _expand_split_ticker_row(row)
@@ -935,11 +950,11 @@ def asset_straddle(
 
                     if include:
                         value = f"{exp_row['source']}:{exp_row['ticker']}:{exp_row['field']}"
-                        rows.append([f"Hedge.{clean_param}", value])
+                        rows.append([clean_param, value])
             else:
                 # Other hedge sources - include as-is
                 value = f"{row['source']}:{row['ticker']}:{row['field']}"
-                rows.append([f"Hedge.{param}", value])
+                rows.append([param, value])
 
     return {
         "columns": ["name", "value"],

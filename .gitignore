@@ -1,6 +1,8 @@
 #
 uv.lock
 
+*.parquet
+
 # suff to exclude
 *.pdf 
 *.out 

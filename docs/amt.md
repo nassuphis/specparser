@@ -320,6 +320,99 @@ Each rule specifies:
 
 ---
 
+### Ticker Functions
+
+#### `asset_tickers(path, underlying)`
+
+Get all tickers for an asset by its Underlying value.
+
+```python
+from specparser.amt import asset_tickers
+
+table = asset_tickers("data/amt.yml", "LA Comdty")
+# Columns: ['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field']
+```
+
+**Column descriptions:**
+| Column | Description |
+|--------|-------------|
+| `asset` | Underlying asset name |
+| `cls` | Asset class (e.g., 'Commodity', 'Rate', 'FX') |
+| `type` | Ticker type: 'Market', 'Vol', or 'Hedge' |
+| `param` | Parameter (e.g., 'Near', 'Far', 'hedge', 'calc') |
+| `source` | Data source ('BBG', 'BBGfc', 'calc', etc.) |
+| `ticker` | The ticker symbol or spec string |
+| `field` | Bloomberg field (e.g., 'PX_LAST', 'Near', 'Far') |
+
+#### `live_tickers(path, start_year=None, end_year=None, chain_csv=None)`
+
+Get all tickers for all live assets.
+
+```python
+from specparser.amt import live_tickers
+
+# Basic usage - no expansion
+table = live_tickers("data/amt.yml")
+
+# With BBGfc expansion to monthly tickers
+table = live_tickers("data/amt.yml", 2024, 2025)
+
+# With normalized to actual ticker lookup
+table = live_tickers("data/amt.yml", 2024, 2025, "data/current_bbg_chain_data.csv")
+```
+
+**Parameters:**
+- `path`: Path to the AMT YAML file
+- `start_year`: Optional start year for BBGfc expansion
+- `end_year`: Optional end year for BBGfc expansion
+- `chain_csv`: Optional path to CSV with `normalized_future,actual_future` columns
+
+When `start_year` and `end_year` are provided, BBGfc rows are expanded into monthly tickers. When `chain_csv` is provided, normalized tickers are converted to actual BBG tickers.
+
+#### `asset_straddle(path, underlying, straddle, chain_csv=None)`
+
+Build a straddle info table with asset metadata and relevant tickers.
+
+```python
+from specparser.amt import asset_straddle
+
+table = asset_straddle(
+    "data/amt.yml",
+    "C Comdty",
+    "|2023-12|2024-01|N|0|OVERRIDE||33.3|"
+)
+# Columns: ['name', 'value']
+```
+
+**Output rows:**
+| Name | Description |
+|------|-------------|
+| `asset` | The underlying asset name |
+| `straddle` | The packed straddle string |
+| `valuation` | Comma-delimited name=value pairs from Valuation dict |
+| `vol` | Vol ticker as `source:ticker:field` (Near or Far based on ntrc) |
+| `hedge` | Hedge ticker as `source:ticker:field` |
+| `hedge1` | Additional hedge ticker (if present) |
+| `calc` | Calculated hedge spec (if present) |
+
+**Straddle format:** `|ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|`
+
+The `ntrc` field (position 2) determines which Vol ticker to use:
+- `"N"` (Near): Uses Vol.Near field
+- `"F"` (Far): Uses Vol.Far field
+
+**Example output:**
+```
+name       value
+asset      C Comdty
+straddle   |2023-12|2024-01|N|0|OVERRIDE||33.3|
+valuation  Model=CDS_ES,tenor=5,S=px,X=strike,t=expiry_date - date,v=vol
+vol        BBG:CL1 Comdty:Near
+hedge      BBG:CL F24 Comdty:PX_LAST
+```
+
+---
+
 ### Schedule Functions
 
 #### `live_schedules(path)`
@@ -499,6 +592,24 @@ uv run python -m specparser.amt data/amt.yml --aum
 
 # Get leverage
 uv run python -m specparser.amt data/amt.yml --leverage
+
+# Get tickers for a specific asset
+uv run python -m specparser.amt data/amt.yml --asset-tickers "LA Comdty"
+
+# Get all tickers for live assets
+uv run python -m specparser.amt data/amt.yml --live-tickers
+
+# Get all tickers with BBGfc expansion
+uv run python -m specparser.amt data/amt.yml --live-tickers 2024 2025
+
+# Get all tickers with normalized to actual lookup
+uv run python -m specparser.amt data/amt.yml --live-tickers 2024 2025 --chain-csv data/current_bbg_chain_data.csv
+
+# Compute futures ticker from spec
+uv run python -m specparser.amt data/amt.yml --fut "generic:LA1 Comdty,fut_code:LA,fut_month_map:FGHJKMNQUVXZ,min_year_offset:0,market_code:Comdty" 2024 7
+
+# Get straddle info with tickers
+uv run python -m specparser.amt data/amt.yml --straddle "C Comdty" "|2023-12|2024-01|N|0|OVERRIDE||33.3|"
 ```
 
 ---
