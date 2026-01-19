@@ -29,6 +29,8 @@ from .loader import (
     table_column,
     format_table,
     print_table,
+    bind_rows,
+    table_unique_rows,
     _iter_assets,
     assets,
     asset_class,
@@ -47,7 +49,7 @@ from .tickers import (
     clear_normalized_cache,
     _tschma_dict_expand_bbgfc,
     _tschma_dict_expand_split,
-    asset_straddle,
+    asset_straddle_tickers,
     straddle_days,
     find_tickers,
 )
@@ -60,6 +62,18 @@ from .schedules import (
     expand_ym,
     get_expand,
     get_expand_ym,
+    # straddle parsing
+    ntr,
+    ntry,
+    ntrm,
+    xpr,
+    xpry,
+    xprm,
+    ntrc,
+    ntrv,
+    xprc,
+    xprv,
+    wgt,
 )
 
 __all__ = [
@@ -76,6 +90,8 @@ __all__ = [
     "table_column",
     "format_table",
     "print_table",
+    "bind_rows",
+    "table_unique_rows",
     "_iter_assets",
     "assets",
     "asset_class",
@@ -103,4 +119,16 @@ __all__ = [
     "expand_ym",
     "get_expand",
     "get_expand_ym",
+    # straddle parsing
+    "ntr",
+    "ntry",
+    "ntrm",
+    "xpr",
+    "xpry",
+    "xprm",
+    "ntrc",
+    "ntrv",
+    "xprc",
+    "xprv",
+    "wgt",
 ]

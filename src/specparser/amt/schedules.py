@@ -126,6 +126,78 @@ def find_schedules(path: str | Path, pattern: str,live_only: bool = True) -> dic
     return { "columns": columns, "rows": rows, }
 
 
+# -------------------------------------
+# Straddle string parsing
+# -------------------------------------
+# Straddle format: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
+# Example: |2023-12|2024-01|N|0|OVERRIDE||33.3|
+
+def _parse_straddle(s: str) -> tuple[str, str, str, str, str, str, str]:
+    """Parse a straddle string into its 7 components.
+
+    Returns: (ntr, xpr, ntrc, ntrv, xprc, xprv, wgt)
+    """
+    parts = s.strip("|").split("|")
+    if len(parts) != 7:
+        raise ValueError(f"Invalid straddle format: expected 7 parts, got {len(parts)}")
+    return tuple(parts)
+
+
+def ntr(s: str) -> str:
+    """Extract entry date string (YYYY-MM) from straddle."""
+    return _parse_straddle(s)[0]
+
+
+def ntry(s: str) -> int:
+    """Extract entry year from straddle."""
+    return int(_parse_straddle(s)[0].split("-")[0])
+
+
+def ntrm(s: str) -> int:
+    """Extract entry month from straddle."""
+    return int(_parse_straddle(s)[0].split("-")[1])
+
+
+def xpr(s: str) -> str:
+    """Extract expiry date string (YYYY-MM) from straddle."""
+    return _parse_straddle(s)[1]
+
+
+def xpry(s: str) -> int:
+    """Extract expiry year from straddle."""
+    return int(_parse_straddle(s)[1].split("-")[0])
+
+
+def xprm(s: str) -> int:
+    """Extract expiry month from straddle."""
+    return int(_parse_straddle(s)[1].split("-")[1])
+
+
+def ntrc(s: str) -> str:
+    """Extract entry code from straddle."""
+    return _parse_straddle(s)[2]
+
+
+def ntrv(s: str) -> str:
+    """Extract entry value from straddle."""
+    return _parse_straddle(s)[3]
+
+
+def xprc(s: str) -> str:
+    """Extract expiry code from straddle."""
+    return _parse_straddle(s)[4]
+
+
+def xprv(s: str) -> str:
+    """Extract expiry value from straddle."""
+    return _parse_straddle(s)[5]
+
+
+def wgt(s: str) -> str:
+    """Extract weight from straddle."""
+    return _parse_straddle(s)[6]
+
+
 def _pack_ym(table: dict[str, Any], xpry: int, xprm: int) -> list[list]:
     """pack schedules table for a specific year/month into straddle strings."""
     asset_rows = table["rows"]

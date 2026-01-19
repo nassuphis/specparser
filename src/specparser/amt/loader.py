@@ -288,6 +288,54 @@ def _merge_tables(*tables: dict[str, Any], key_col: int = 0) -> dict[str, Any]:
     return {"columns": columns, "rows": rows}
 
 
+def bind_rows(*tables: dict[str, Any]) -> dict[str, Any]:
+    """
+    Concatenate rows from multiple tables with the same columns.
+
+    Args:
+        *tables: Tables to bind (each has 'columns' and 'rows')
+
+    Returns:
+        New table with all rows concatenated
+
+    Raises:
+        ValueError: If tables have different columns
+    """
+    if not tables:
+        return {"columns": [], "rows": []}
+
+    first = tables[0]
+    columns = first["columns"]
+
+    # Verify all tables have same columns
+    for i, tbl in enumerate(tables[1:], start=2):
+        if tbl["columns"] != columns:
+            raise ValueError(f"Table {i} columns {tbl['columns']} != first table columns {columns}")
+
+    # Concatenate all rows
+    rows = []
+    for tbl in tables:
+        rows.extend(tbl["rows"])
+
+    return {"columns": columns, "rows": rows}
+
+
+def table_unique_rows(table: dict[str, Any]) -> dict[str, Any]:
+    """
+    Remove duplicate rows from a table.
+
+    Uses tuple(row) as key to dedupe, preserving the last occurrence of each row.
+
+    Args:
+        table: Dict with 'columns' and 'rows'
+
+    Returns:
+        New table with only unique rows
+    """
+    seen = {tuple(row): row for row in table["rows"]}
+    return {"columns": table["columns"], "rows": list(seen.values())}
+
+
 def _compile_rules(table: dict[str, Any]) -> list[tuple[str, re.Pattern, str]]:
     """
     Compile rules from a table with columns [field, rgx, value].
