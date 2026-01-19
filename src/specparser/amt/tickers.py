@@ -10,110 +10,78 @@ split ticker handling, and straddle info building.
 import re
 from pathlib import Path
 from typing import Any
+import csv
+import calendar
+import duckdb
 
-from .loader import get_asset, _iter_assets
-
+from . import loader
+from . import schedules
 
 def _split_ticker(ticker: str, param: str) -> list[tuple[str, str]]:
-    """
-    Split a ticker if it's a "split ticker" format: ticker1:YYYY-MM:ticker2
-
-    Returns a list of (ticker, param) tuples.
-    For normal tickers, returns [(ticker, param)].
-    For split tickers, returns [(ticker1, param<YYYY-MM), (ticker2, param>YYYY-MM)].
-
-    The < suffix indicates the ticker is valid before the date.
-    The > suffix indicates the ticker is valid after the date.
-    """
+    """Split a ticker if it's a "split ticker" format: ticker1:YYYY-MM:ticker2"""
     # Match pattern: something:YYYY-MM:something
     # The date part is 4 digits, dash, 2 digits
     match = re.match(r'^(.+):(\d{4}-\d{2}):(.+)$', ticker)
     if match:
-        ticker1 = match.group(1)
-        date = match.group(2)
-        ticker2 = match.group(3)
+        ticker1, date, ticker2 = match.group(1), match.group(2), match.group(3)
         return [(ticker1, f"{param}<{date}"), (ticker2, f"{param}>{date}")]
     return [(ticker, param)]
 
 
-def _format_ticker_spec(row: dict) -> str:
-    """
-    Format a ticker row as source:ticker:field spec string.
-
-    For CV source, the ticker is in the field column and field becomes "none".
-    For other sources, format is source:ticker:field.
-
-    Args:
-        row: Dict with keys 'source', 'ticker', 'field'
-
-    Returns:
-        Formatted spec string like "BBG:CL1 Comdty:PX_LAST"
-    """
-    if row["source"] == "CV":
-        return f"{row['source']}:{row['field']}:none"
-    return f"{row['source']}:{row['ticker']}:{row['field']}"
-
-
-def _parse_ticker_spec(spec: str) -> tuple[str, str, str]:
-    """
-    Parse a source:ticker:field spec string.
-
-    For CV source, field "none" is normalized.
-
-    Args:
-        spec: Spec string like "BBG:CL1 Comdty:PX_LAST"
-
-    Returns:
-        Tuple of (source, ticker, field)
-    """
+def _split_ticker_specstr(spec: str) -> tuple[str, str, str]:
+    """Parse a source:ticker:field spec string."""
     parts = spec.split(":")
-    if len(parts) < 3:
-        return ("", "", "")
-    source = parts[0]
-    ticker = parts[1]
-    field = parts[2]
-    # For CV source, normalize field to "none"
-    if source == "CV":
-        field = "none"
+    if len(parts) < 3: return ("", "", "")
+    source, ticker, field = parts[0], parts[1], parts[2]
+    if source == "CV": field = "none"
     return (source, ticker, field)
 
+def _make_ticker_specstr(spec: dict) -> str:
+    """Format a ticker row as source:ticker:field spec string."""
+    if spec["source"] == "CV": return f"{spec['source']}:{spec['field']}:none"
+    return f"{spec['source']}:{spec['ticker']}:{spec['field']}"
 
-def _parse_date_constraint(param: str) -> tuple[str, tuple[int, int] | None, bool]:
+def _parse_date_constraint(param: str, xpry: int, xprm: int) -> tuple[str, bool]:
+    """Parse a param string with optional date constraint and check if included.
+
+    Returns (clean_param, include) where include is True if the expiry date
+    passes the constraint check.
+
+    Constraints:
+    - paramXYYYY-MM: valid for exactly that date (include if expiry == limit)
+    - param<YYYY-MM: valid before that date (include if expiry < limit)
+    - param>YYYY-MM: valid after that date (include if expiry > limit)
     """
-    Parse a param string with optional date constraint.
-
-    Constraints are encoded as:
-    - param<YYYY-MM: valid before that date
-    - param>YYYY-MM: valid after that date
-
-    Args:
-        param: Param string, possibly with date constraint
-
-    Returns:
-        Tuple of (clean_param, (year, month) or None, is_before)
-        - clean_param: param without the date constraint
-        - date tuple: (year, month) if constraint present, else None
-        - is_before: True if '<' constraint (valid before), False if '>' (valid after)
-    """
-    if "<" in param:
+    # Check for X (equality) first - must come before < and >
+    if "X" in param:
+        clean_param, date_str = param.split("X", 1)
+        try:
+            limit_year, limit_month = map(int, date_str.split("-"))
+            include = (xpry, xprm) == (limit_year, limit_month)
+            return (clean_param, include)
+        except ValueError:
+            return (param, True)
+    elif "<" in param:
         clean_param, date_str = param.split("<", 1)
         try:
-            year, month = map(int, date_str.split("-"))
-            return (clean_param, (year, month), True)
+            limit_year, limit_month = map(int, date_str.split("-"))
+            include = (xpry, xprm) < (limit_year, limit_month)
+            return (clean_param, include)
         except ValueError:
-            return (param, None, True)
+            return (param, True)
     elif ">" in param:
         clean_param, date_str = param.split(">", 1)
         try:
-            year, month = map(int, date_str.split("-"))
-            return (clean_param, (year, month), False)
+            limit_year, limit_month = map(int, date_str.split("-"))
+            include = (xpry, xprm) > (limit_year, limit_month)
+            return (clean_param, include)
         except ValueError:
-            return (param, None, False)
-    return (param, None, True)
+            return (param, True)
+    return (param, True)
 
 
 # -------------------------------------
-# Ticker handler functions
+# Ticker schemas
 # -------------------------------------
 
 
@@ -202,7 +170,7 @@ _HEDGE_HANDLERS = {
 }
 
 
-def asset_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
+def get_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
     """
     Get all tickers for an asset by its Underlying value.
 
@@ -224,7 +192,7 @@ def asset_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
         >>> table['columns']
         ['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field']
     """
-    asset_data = get_asset(path, underlying)
+    asset_data = loader.get_asset(path, underlying)
     if not asset_data:
         return {"columns": ["asset", "cls", "type", "param", "source", "ticker", "field"], "rows": []}
 
@@ -257,6 +225,20 @@ def asset_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
         "rows": rows,
     }
 
+
+def find_tschemas(path: str | Path, pattern: str, live_only: bool = False) -> dict[str, Any]:
+    """Find all tickers for assets matching a regex pattern on Underlying."""
+    columns = ["asset", "cls", "type", "param", "source", "ticker", "field"]
+    rows = []
+    assets_table = loader.find_assets(path, pattern=pattern,live_only=live_only)
+    for underlying in loader.table_column(assets_table, "asset"):
+        table = get_tschemas(path, underlying)
+        rows.extend(table["rows"])
+    return {"columns": columns, "rows": rows}
+
+# -------------------------------------
+# Compute Tickers from Ticker schemas
+# -------------------------------------
 
 def fut_spec2ticker(spec: str, year: int, month: int) -> str:
     """
@@ -340,15 +322,14 @@ def fut_norm2act(csv_path: str | Path, ticker: str) -> str | None:
 
     # Load and cache the CSV if not already cached
     if csv_path not in _NORMALIZED_CACHE:
-        import csv
+
         mapping = {}
         with open(csv_path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 normalized = row.get("normalized_future", "")
                 actual = row.get("actual_future", "")
-                if normalized and actual:
-                    mapping[normalized] = actual
+                if normalized and actual: mapping[normalized] = actual
         _NORMALIZED_CACHE[csv_path] = mapping
 
     return _NORMALIZED_CACHE[csv_path].get(ticker)
@@ -358,93 +339,122 @@ def clear_normalized_cache() -> None:
     """Clear the normalized to actual futures cache."""
     _NORMALIZED_CACHE.clear()
 
+def _tschma_dict_bbgfc_ym(
+    tschema_dict: dict,
+    year: int,
+    month: int,
+    chain_csv: str | Path | None = None
+) -> list[dict]:
+    spec = tschema_dict["ticker"]
 
-def _expand_bbgfc_row(
-    row: dict,
+    ticker = fut_spec2ticker(spec, year, month)
+    new_tschema_dict = tschema_dict.copy()
+    new_tschema_dict["param"] = f"hedgeX{year}-{month:02d}"
+    # Try to look up actual ticker if chain_csv provided
+    if chain_csv is not None:
+        actual = fut_norm2act(chain_csv, ticker)
+        if actual is not None:
+            new_tschema_dict["source"] = "BBG"
+            new_tschema_dict["ticker"] = actual
+        else:
+            new_tschema_dict["source"] = "nBBG"
+            new_tschema_dict["ticker"] = ticker
+    else:
+        new_tschema_dict["source"] = "nBBG"
+        new_tschema_dict["ticker"] = ticker
+
+    return new_tschema_dict
+
+def _tschma_dict_expand_bbgfc(
+    tschema_dict: dict,
     start_year: int,
     end_year: int,
     chain_csv: str | Path | None = None
 ) -> list[dict]:
-    """
-    Expand a BBGfc row into monthly ticker rows.
-
-    Takes a row with source "BBGfc" and expands it into individual monthly ticker rows
-    for each month from January of start_year through December of end_year.
-
-    If chain_csv is provided, normalized tickers are looked up and converted to actual
-    BBG tickers. If lookup succeeds, source becomes "BBG". If lookup fails, source is "nBBG".
-
-    Args:
-        row: A dict with keys [asset, cls, type, param, source, ticker, field] where source is "BBGfc"
-             and ticker is the futures spec string (e.g., "LA{M}{YY} Comdty")
-        start_year: Start year for expansion (inclusive)
-        end_year: End year for expansion (inclusive)
-        chain_csv: Optional path to CSV with normalized_future,actual_future columns
-
-    Returns:
-        List of expanded row dicts, one per month in the date range
-    """
-    expanded_rows = []
-    spec = row["ticker"]
-
+    """Expand a BBGfc row into monthly ticker rows."""
+    expanded_tschema_dict = []
     for year in range(start_year, end_year + 1):
         for month in range(1, 13):
-            ticker = fut_spec2ticker(spec, year, month)
-            new_row = row.copy()
-            new_row["param"] = f"hedgeX{year}-{month:02d}"
-
-            # Try to look up actual ticker if chain_csv provided
-            if chain_csv is not None:
-                actual = fut_norm2act(chain_csv, ticker)
-                if actual is not None:
-                    new_row["source"] = "BBG"
-                    new_row["ticker"] = actual
-                else:
-                    new_row["source"] = "nBBG"
-                    new_row["ticker"] = ticker
-            else:
-                new_row["source"] = "nBBG"
-                new_row["ticker"] = ticker
-
-            expanded_rows.append(new_row)
-
-    return expanded_rows
+            expanded_tschema_dict.append(_tschma_dict_bbgfc_ym(tschema_dict,year,month,chain_csv))
+    return expanded_tschema_dict
 
 
-def _expand_split_ticker_row(row: dict) -> list[dict]:
-    """
-    Expand a BBG row if it contains a split ticker.
-
-    Split ticker format: ticker1:YYYY-MM:ticker2
-    - ticker1 is valid before the date (param gets <YYYY-MM suffix)
-    - ticker2 is valid after the date (param gets >YYYY-MM suffix)
-
-    If the ticker is not a split ticker, returns the row unchanged (as single-item list).
-
-    Args:
-        row: A dict with keys [asset, cls, type, param, source, ticker, field] where source is "BBG"
-
-    Returns:
-        List of row dicts - either one (unchanged) or two (split into before/after)
-    """
-    ticker = row["ticker"]
-    param = row["param"]
-
-    split_result = _split_ticker(ticker, param)
-    if len(split_result) == 1:
-        # Not a split ticker, return unchanged
-        return [row]
-
-    # Split ticker - create two rows
-    expanded_rows = []
+def _tschma_dict_expand_split(ticker_dict: dict) -> list[dict]:
+    """Expand a BBG row if it contains a split ticker."""
+    split_result = _split_ticker(ticker_dict["ticker"], ticker_dict["param"])
+    if len(split_result) == 1: return [ticker_dict]
+    expanded_ticker_dict = []
     for new_ticker, new_param in split_result:
-        new_row = row.copy()
+        new_row = ticker_dict.copy()
         new_row["param"] = new_param
         new_row["ticker"] = new_ticker
-        expanded_rows.append(new_row)
+        expanded_ticker_dict.append(new_row)
+    return expanded_ticker_dict
 
-    return expanded_rows
+def find_tickers_ym(
+    path: str | Path, 
+    pattern: str,
+    live_only: bool,
+    year: int , 
+    month: int , 
+    chain_csv: str | Path | None = None
+) -> dict[str, Any]:
+    """Get all tickers for assets."""
+    rows = []
+    for _, underlying in loader._iter_assets(path, pattern=pattern, live_only=live_only):
+        tschemas_table = get_tschemas(path, underlying)
+        for tschema_row in tschemas_table["rows"]:
+            tschema_dict = dict(zip(tschemas_table["columns"], tschema_row))
+            source = tschema_dict["source"]
+            if source == "BBGfc" and year is not None and month is not None:
+                rows.append(_tschma_dict_bbgfc_ym(tschema_dict, year, month, chain_csv))
+            elif source == "BBG":
+                rows.extend(_tschma_dict_expand_split(tschema_dict))
+            else:
+                rows.append(tschema_dict)
 
+    # Convert dict rows back to list rows
+    ticker_rows = [[row[col] for col in tschemas_table["columns"]] for row in rows]
+
+    return {
+        "columns": tschemas_table["columns"],
+        "rows": ticker_rows,
+    }
+
+def find_tickers(
+    path: str | Path, 
+    pattern: str,
+    live_only: bool = True,
+    start_year: int | None = None, 
+    end_year: int | None = None, 
+    chain_csv: str | Path | None = None
+) -> dict[str, Any]:
+    """Get all tickers for assets."""
+    rows = []
+    for _, underlying in loader._iter_assets(path, pattern=pattern, live_only=live_only):
+        tschemas_table = get_tschemas(path, underlying)
+        for tschema_row in tschemas_table["rows"]:
+            tschema_dict = dict(zip(tschemas_table["columns"], tschema_row))
+            source = tschema_dict["source"]
+            if source == "BBGfc" and start_year is not None and end_year is not None:
+                rows.extend(_tschma_dict_expand_bbgfc(tschema_dict, start_year, end_year, chain_csv))
+            elif source == "BBG":
+                rows.extend(_tschma_dict_expand_split(tschema_dict))
+            else:
+                rows.append(tschema_dict)
+
+    # Convert dict rows back to list rows
+    ticker_rows = [[row[col] for col in tschemas_table["columns"]] for row in rows]
+
+    return {
+        "columns": tschemas_table["columns"],
+        "rows": ticker_rows,
+    }
+
+# -------------------------------------
+# Compute Tickers from Ticker schemas
+# straddle strings are inputs
+# -------------------------------------
 
 def asset_straddle(
     path: str | Path,
@@ -502,7 +512,7 @@ def asset_straddle(
     vol_param = "Near" if ntrc == "N" else "Far"
 
     # Get tickers for the asset
-    ticker_table = asset_tschemas(path, underlying)
+    ticker_table = get_tschemas(path, underlying)
     if not ticker_table["rows"]:
         raise ValueError(f"No asset found with Underlying: {underlying}")
 
@@ -514,7 +524,7 @@ def asset_straddle(
     rows.append(["straddle", straddle])
 
     # Add valuation info - comma-delimited name=value pairs
-    asset_data = get_asset(path, underlying)
+    asset_data = loader.get_asset(path, underlying)
     if asset_data:
         valuation = asset_data.get("Valuation", {})
         if isinstance(valuation, dict) and valuation:
@@ -532,44 +542,34 @@ def asset_straddle(
             # Vol tickers - only include the one matching ntrc (Near for N, Far for F)
             if param != vol_param:
                 continue
-            rows.append(["vol", _format_ticker_spec(row)])
+            rows.append(["vol", _make_ticker_specstr(row)])
 
         elif ticker_type == "Hedge":
             if source == "BBGfc":
                 # Expand for the specific expiry month
-                expanded = _expand_bbgfc_row(row, xpry, xpry, chain_csv)
-                # Filter to the specific month
-                target_param = f"hedgeX{xpry}-{xprm:02d}"
+                expanded = _tschma_dict_expand_bbgfc(row, xpry, xpry, chain_csv)
                 for exp_row in expanded:
-                    if exp_row["param"] == target_param:
-                        rows.append(["hedge", _format_ticker_spec(exp_row)])
+                    clean_param, include = _parse_date_constraint(exp_row["param"], xpry, xprm)
+                    if include: rows.append([clean_param, _make_ticker_specstr(exp_row)])
             elif source == "BBG":
                 # Check for split tickers and apply date filter
-                expanded = _expand_split_ticker_row(row)
+                expanded = _tschma_dict_expand_split(row)
                 for exp_row in expanded:
-                    clean_param, constraint, is_before = _parse_date_constraint(exp_row["param"])
-                    include = True
-                    if constraint is not None:
-                        limit_year, limit_month = constraint
-                        if is_before:
-                            # valid before that date
-                            if (xpry, xprm) >= (limit_year, limit_month):
-                                include = False
-                        else:
-                            # valid after that date
-                            if (xpry, xprm) <= (limit_year, limit_month):
-                                include = False
-                    if include:
-                        rows.append([clean_param, _format_ticker_spec(exp_row)])
+                    clean_param, include = _parse_date_constraint(exp_row["param"], xpry, xprm)
+                    if include: rows.append([clean_param, _make_ticker_specstr(exp_row)])
             else:
                 # Other hedge sources - include as-is
-                rows.append([param, _format_ticker_spec(row)])
+                rows.append([param, _make_ticker_specstr(row)])
 
     return {
         "columns": ["name", "value"],
         "rows": rows,
     }
 
+
+# -------------------------------------
+# Finally, Prices
+# -------------------------------------
 
 def straddle_days(table: dict[str, Any], prices_parquet: str | Path) -> dict[str, Any]:
     """
@@ -596,8 +596,7 @@ def straddle_days(table: dict[str, Any], prices_parquet: str | Path) -> dict[str
         >>> result = straddle_days(straddle, "data/prices.parquet")
         >>> # Date rows have tab-separated values for each ticker
     """
-    import calendar
-    import duckdb
+
 
     # Copy existing rows
     rows = [row[:] for row in table["rows"]]
@@ -637,13 +636,13 @@ def straddle_days(table: dict[str, Any], prices_parquet: str | Path) -> dict[str
 
     # Collect all ticker/field pairs to query
     ticker_field_pairs = []  # List of (ticker, field) tuples
-    _, vol_ticker, vol_field = _parse_ticker_spec(vol_spec)
+    _, vol_ticker, vol_field = _split_ticker_specstr(vol_spec)
     if vol_ticker:
         ticker_field_pairs.append((vol_ticker, vol_field))
 
     hedge_ticker_fields = []  # Keep track of hedge ticker/field for result mapping
     for _, hedge_spec in hedge_specs:
-        _, hedge_ticker, hedge_field = _parse_ticker_spec(hedge_spec)
+        _, hedge_ticker, hedge_field = _split_ticker_specstr(hedge_spec)
         hedge_ticker_fields.append((hedge_ticker, hedge_field))
         if hedge_ticker:
             ticker_field_pairs.append((hedge_ticker, hedge_field))
@@ -722,64 +721,6 @@ def straddle_days(table: dict[str, Any], prices_parquet: str | Path) -> dict[str
     }
 
 
-def live_tickers(path: str | Path, start_year: int | None = None, end_year: int | None = None, chain_csv: str | Path | None = None) -> dict[str, Any]:
-    """
-    Get all tickers for all live assets.
-
-    Returns a table with columns: ['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field']
-
-    Market tickers have source "BBG" and use the Market.Field value.
-    Vol tickers use Vol.Source and have fields "Near" and "Far".
-
-    If start_year and end_year are provided, BBGfc rows are expanded into monthly
-    tickers using the fut_ticker function for each month from Jan start_year to Dec end_year.
-
-    If chain_csv is provided, normalized tickers (nBBG) are looked up and converted
-    to actual BBG tickers. If the lookup succeeds, source becomes "BBG" and the ticker
-    is replaced with the actual ticker. If the lookup fails, source stays "nBBG".
-
-    Args:
-        path: Path to the AMT YAML file
-        start_year: Optional start year for BBGfc expansion
-        end_year: Optional end year for BBGfc expansion
-        chain_csv: Optional path to CSV with normalized_future,actual_future columns
-
-    Returns:
-        Dict with keys: 'columns' (list), 'rows' (list of lists)
-        Columns are ['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field']
-
-    Example:
-        >>> table = live_tickers("data/amt.yml")
-        >>> table['columns']
-        ['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field']
-        >>> table = live_tickers("data/amt.yml", 2024, 2025)  # Expands BBGfc to monthly tickers
-        >>> table = live_tickers("data/amt.yml", 2024, 2025, "data/current_bbg_chain_data.csv")  # With lookup
-    """
-    columns = ["asset", "cls", "type", "param", "source", "ticker", "field"]
-    rows = []
-
-    for _, _, _, underlying, _ in _iter_assets(path, live_only=True):
-        asset_table = asset_tschemas(path, underlying)
-        for list_row in asset_table["rows"]:
-            # Convert list row to dict for easier manipulation
-            row = dict(zip(columns, list_row))
-            source = row["source"]
-
-            if source == "BBGfc" and start_year is not None and end_year is not None:
-                rows.extend(_expand_bbgfc_row(row, start_year, end_year, chain_csv))
-            elif source == "BBG":
-                rows.extend(_expand_split_ticker_row(row))
-            else:
-                rows.append(row)
-
-    # Convert dict rows back to list rows
-    list_rows = [[row[col] for col in columns] for row in rows]
-
-    return {
-        "columns": columns,
-        "rows": list_rows,
-    }
-
 
 # -------------------------------------
 # CLI
@@ -800,52 +741,93 @@ def _main() -> int:
                    help="Prices parquet file (default: data/prices.parquet)")
 
     # Commands
-    p.add_argument("--asset-tickers", metavar="UNDERLYING",
-                   help="Get all tickers for an asset by Underlying value")
-    p.add_argument("--live-tickers", nargs="*", type=int, metavar=("START_YEAR", "END_YEAR"),
-                   help="Get all tickers for live assets (optional: START_YEAR END_YEAR to expand BBGfc)")
-    p.add_argument("--fut", nargs=3, metavar=("SPEC", "YEAR", "MONTH"),
-                   help="Compute futures ticker from spec string, year, and month")
-    p.add_argument("--straddle", nargs=2, metavar=("UNDERLYING", "STRADDLE"),
-                   help="Get straddle info with tickers for an asset")
-    p.add_argument("--straddle-days", nargs=2, metavar=("UNDERLYING", "STRADDLE"),
-                   help="Get straddle info with daily prices for entry month")
+    p.add_argument("--asset-tschemas", metavar="UNDERLYING", type=str,
+                   help="Get all ticker schemas for an asset by Underlying value.")
+    
+    p.add_argument("--find-tschemas", nargs=2, type=str, metavar=("PATTERN", "LIVE"),  
+                   help="Get all ticker schemas for assets matching pattern.")
+    
+    p.add_argument("--find-tickers", nargs=4, type=str, metavar=( "PATTERN", "LIVE", "START_YEAR", "END_YEAR"),
+                   help="Get all tickers for assets in period.")
+    
+    p.add_argument("--find-tickers-ym", nargs=4, type=str, metavar=( "PATTERN", "LIVE", "YEAR", "MONTH"),
+                   help="Get all tickers for assets on specific month.")
 
+    p.add_argument("--expand-ym", nargs=4, type=str, metavar=("PATTERN", "LIVE","YEAR", "MONTH"),
+                   help="Get straddles for assets matching patterns on month.")
+    
+    p.add_argument("--get-expand-ym", nargs=3, type=str, metavar=("ASSET", "YEAR", "MONTH"),
+                   help="Get straddles for asset on month.")
+    
+    p.add_argument("--straddle-days", nargs=2, metavar=("UNDERLYING", "STRADDLE"),
+                   help="Get straddle info with daily prices for entry month.")
+    
+    p.add_argument("--fut", nargs=3, metavar=("SPEC", "YEAR", "MONTH"),
+                   help="Compute futures ticker from spec string, year, and month.")
+    
     args = p.parse_args()
 
-    if args.asset_tickers:
-        table = asset_tschemas(args.path, args.asset_tickers)
+    def str2bool(s: str) -> bool:
+        s = s.strip().lower()
+        if s in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        raise argparse.ArgumentTypeError(f"Expected a boolean, got {s!r}")
+
+    if args.asset_tschemas:
+        table = get_tschemas(args.path, args.asset_tschemas)
         if not table["rows"]:
             print(f"No asset found with Underlying: {args.asset_tickers}")
             return 1
         print_table(table)
 
-    elif args.live_tickers is not None:
-        if len(args.live_tickers) == 2:
-            start_year, end_year = args.live_tickers
-            table = live_tickers(args.path, start_year, end_year, args.chain_csv)
-        elif len(args.live_tickers) == 0:
-            table = live_tickers(args.path)
-        else:
-            print("--live-tickers requires 0 or 2 arguments (START_YEAR END_YEAR)")
-            return 1
-        print_table(table)
+    elif args.find_tschemas is not None:
+        table = find_tschemas(args.path, args.find_tschemas[0], str2bool(args.find_tschemas[1]) )
+        loader.print_table(table)
+
+    elif args.find_tickers is not None:
+        table = find_tickers(
+            args.path, 
+            args.find_tickers[0], 
+            str2bool(args.find_tickers[1]),
+            int(args.find_tickers[2]),
+            int(args.find_tickers[3]),
+            args.chain_csv
+        )
+        loader.print_table(table)
+
+    elif args.find_tickers_ym is not None:
+        table = find_tickers_ym(
+            args.path, 
+            args.find_tickers_ym[0], 
+            str2bool(args.find_tickers_ym[1]),
+            int(args.find_tickers_ym[2]),
+            int(args.find_tickers_ym[3]),
+            args.chain_csv
+        )
+        loader.print_table(table)
 
     elif args.fut:
         spec, year, month = args.fut
         ticker = fut_spec2ticker(spec, int(year), int(month))
         print(ticker)
 
-    elif args.straddle:
-        underlying, straddle_str = args.straddle
-        table = asset_straddle(args.path, underlying, straddle_str, args.chain_csv)
-        print_table(table)
+    elif args.expand_ym:
+        pattern, live, year, month = args.expand_ym
+        table = schedules.expand_ym( args.path, int(year), int(month), pattern, str2bool(live) )
+        loader.print_table(table)
+
+    elif args.get_expand_ym:
+        asset, year, month = args.get_expand_ym
+        table = schedules.get_expand_ym( args.path, asset, int(year), int(month) )
+        loader.print_table(table)
 
     elif args.straddle_days:
         underlying, straddle_str = args.straddle_days
         table = asset_straddle(args.path, underlying, straddle_str, args.chain_csv)
         table = straddle_days(table, args.prices)
-        print_table(table)
+        loader.print_table(table)
 
     else:
         p.print_help()

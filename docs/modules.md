@@ -285,30 +285,37 @@ from specparser.amt import (
     # Value extraction
     get_value, get_aum, get_leverage,
     # Asset queries
-    get_asset, find_underlyings, list_assets,
+    get_asset, find_assets, cached_assets,
     # Table utilities
-    get_table, format_table, print_table,
+    get_table, table_column, format_table, print_table,
     # Asset tables
-    assets, live_assets, live_class, live_table, live_group,
+    assets, asset_class, asset_table, asset_group,
     # Ticker extraction
-    asset_tickers, live_tickers, fut_ticker, asset_straddle, straddle_days,
+    get_tschemas, find_tschemas, live_tickers, fut_spec2ticker, fut_norm2act, asset_straddle, straddle_days,
     # Schedule processing
-    get_schedule, find_schedules, live_schedules,
+    get_schedule, find_schedules,
     # Schedule expansion (returns straddle strings)
-    expand, find_expand,
+    expand, expand_ym, get_expand, get_expand_ym,
 )
 ```
 
-**CLI:**
+**CLI (specparser.amt):**
 ```bash
 uv run python -m specparser.amt data/amt.yml --get "Asset Name"
-uv run python -m specparser.amt data/amt.yml --expand 2024 2025
-uv run python -m specparser.amt data/amt.yml --find-expand "^CL.*" 2024 2025
-uv run python -m specparser.amt data/amt.yml --schedules
 uv run python -m specparser.amt data/amt.yml --aum
 uv run python -m specparser.amt data/amt.yml --leverage
 uv run python -m specparser.amt data/amt.yml --value backtest.aum
 uv run python -m specparser.amt data/amt.yml --group
+uv run python -m specparser.amt data/amt.yml --live-tickers 2024 2025
+```
+
+**CLI (specparser.amt.schedules):**
+```bash
+uv run python -m specparser.amt.schedules data/amt.yml --get "Asset Name"
+uv run python -m specparser.amt.schedules data/amt.yml --live
+uv run python -m specparser.amt.schedules data/amt.yml --expand 2024 2025
+uv run python -m specparser.amt.schedules data/amt.yml --expand-ym 2024 6
+uv run python -m specparser.amt.schedules data/amt.yml --get-expand "Asset Name" 2024 2025
 ```
 
 See [AMT Reference](amt.md) for detailed documentation.

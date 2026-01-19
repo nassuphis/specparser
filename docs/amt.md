@@ -107,26 +107,26 @@ asset = get_asset("data/amt.yml", "LA Comdty OLD")
 # Returns: {'Underlying': 'LA Comdty', 'WeightCap': 0.05, ...}
 ```
 
-#### `find_underlyings(path, pattern)`
+#### `find_assets(path, pattern)`
 
 Find all assets with Underlying values matching a regex pattern.
 
 ```python
-from specparser.amt import find_underlyings
+from specparser.amt import find_assets
 
-matches = find_underlyings("data/amt.yml", "^LA.*")
-# Returns: ['LA Comdty', 'LA2 Comdty', ...]
+table = find_assets("data/amt.yml", "^LA.*")
+# Columns: ['asset']
 ```
 
-#### `list_assets(path)`
+#### `cached_assets(path)`
 
-List all asset names (YAML keys).
+List all asset Underlying values from the cache.
 
 ```python
-from specparser.amt import list_assets
+from specparser.amt import cached_assets
 
-names = list_assets("data/amt.yml")
-# Returns: ['LA Comdty OLD', 'LP Comdty', ...]
+table = cached_assets("data/amt.yml")
+# Columns: ['asset']
 ```
 
 ---
@@ -173,15 +173,15 @@ print_table(table)
 
 ### Asset Tables
 
-#### `assets(path)`
+#### `all_assets(path)`
 
-Get all assets with their Underlying and WeightCap values.
+Get all assets with their Underlying values.
 
 ```python
-from specparser.amt import assets
+from specparser.amt import all_assets
 
-table = assets("data/amt.yml")
-# Columns: ['asset', 'wcap']
+table = all_assets("data/amt.yml")
+# Columns: ['asset']
 ```
 
 #### `live_assets(path)`
@@ -192,7 +192,7 @@ Get all live assets (WeightCap > 0).
 from specparser.amt import live_assets
 
 table = live_assets("data/amt.yml")
-# Columns: ['asset', 'wcap']
+# Columns: ['asset']
 ```
 
 #### `live_class(path)`
@@ -311,14 +311,14 @@ Each rule specifies:
 
 ### Ticker Functions
 
-#### `asset_tickers(path, underlying)`
+#### `get_tschemas(path, underlying)`
 
 Get all tickers for an asset by its Underlying value.
 
 ```python
-from specparser.amt import asset_tickers
+from specparser.amt import get_tschemas
 
-table = asset_tickers("data/amt.yml", "LA Comdty")
+table = get_tschemas("data/amt.yml", "LA Comdty")
 # Columns: ['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field']
 ```
 
@@ -413,8 +413,8 @@ Values like 'a', 'b', 'c', 'd' are automatically fixed to computed day numbers.
 ```python
 from specparser.amt import get_schedule
 
-schedule = get_schedule("data/amt.yml", "LA Comdty")
-# Returns: ['N1_BD1_33.3', 'N5_BD5_33.3', ...]
+table = get_schedule("data/amt.yml", "LA Comdty")
+# Columns: ['schcnt', 'schid', 'asset', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
 ```
 
 #### `find_schedules(path, pattern)`
@@ -425,20 +425,6 @@ Find assets matching a regex pattern and return their schedule components.
 from specparser.amt import find_schedules
 
 table = find_schedules("data/amt.yml", "^LA.*")
-# Columns: ['schcnt', 'schid', 'asset', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
-```
-
-#### `live_schedules(path)`
-
-Get all live assets (WeightCap > 0) with their schedules expanded into rows.
-
-Each schedule component is parsed into separate columns. Values like
-'a', 'b', 'c', 'd' are automatically fixed to computed day numbers.
-
-```python
-from specparser.amt import live_schedules
-
-table = live_schedules("data/amt.yml")
 # Columns: ['schcnt', 'schid', 'asset', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
 ```
 
@@ -478,7 +464,7 @@ Expand all live schedules across a year/month range into straddle strings.
 Computes the cartesian product of:
 - years: start_year to end_year (inclusive)
 - months: 1 to 12
-- rows from live_schedules() (already expanded by schedule component)
+- rows from schedules() (already expanded by schedule component)
 
 Each row is packed into a pipe-delimited straddle string.
 
@@ -497,22 +483,48 @@ Example: `|2023-12|2024-01|N|0|OVERRIDE||33.3|`
 - `ntrc = "N"` (Near): Entry is 1 month before expiry
 - `ntrc = "F"` (Far): Entry is 2 months before expiry
 
-#### `find_expand(path, pattern, start_year, end_year)`
+#### `expand_ym(path, year, month)`
 
-Expand schedules matching a regex pattern across a year/month range into straddle strings.
+Expand all live schedules for a specific year/month into straddle strings.
 
 ```python
-from specparser.amt import find_expand
+from specparser.amt import expand_ym
 
-table = find_expand("data/amt.yml", "^LA.*", 2024, 2025)
+table = expand_ym("data/amt.yml", 2024, 6)
 # Columns: ['asset', 'straddle']
 ```
 
-Same straddle format as `expand()`.
+#### `get_expand(path, underlying, start_year, end_year)`
+
+Expand a single asset's schedule across a year range into straddle strings.
+
+```python
+from specparser.amt import get_expand
+
+table = get_expand("data/amt.yml", "LA Comdty", 2024, 2025)
+# Columns: ['asset', 'straddle']
+```
+
+#### `get_expand_ym(path, underlying, year, month)`
+
+Expand a single asset's schedule for a specific year/month into straddle strings.
+
+```python
+from specparser.amt import get_expand_ym
+
+table = get_expand_ym("data/amt.yml", "LA Comdty", 2024, 6)
+# Columns: ['asset', 'straddle']
+```
 
 ---
 
 ## CLI Usage
+
+The AMT module has two CLIs:
+- `python -m specparser.amt` - Asset and ticker operations
+- `python -m specparser.amt.schedules` - Schedule operations
+
+### Main CLI (specparser.amt)
 
 ```bash
 # Get asset by name
@@ -520,9 +532,6 @@ uv run python -m specparser.amt data/amt.yml --get "LA Comdty OLD"
 
 # Find assets by underlying
 uv run python -m specparser.amt data/amt.yml --find "LA Comdty"
-
-# Get schedule for asset
-uv run python -m specparser.amt data/amt.yml --schedule "LA Comdty"
 
 # Get embedded table
 uv run python -m specparser.amt data/amt.yml --table group_risk_multiplier_table
@@ -546,18 +555,6 @@ uv run python -m specparser.amt data/amt.yml --group
 uv run python -m specparser.amt data/amt.yml --live-table group_table
 uv run python -m specparser.amt data/amt.yml --live-table limit_overrides
 uv run python -m specparser.amt data/amt.yml --live-table liquidity_table
-
-# List schedules for live assets
-uv run python -m specparser.amt data/amt.yml --schedules
-
-# Find schedules matching regex pattern
-uv run python -m specparser.amt data/amt.yml --find-schedules "^LA.*"
-
-# Expand live schedules into straddle strings
-uv run python -m specparser.amt data/amt.yml --expand 2024 2025
-
-# Expand schedules matching pattern into straddle strings
-uv run python -m specparser.amt data/amt.yml --find-expand "^CL.*" 2024 2025
 
 # Get value by key path
 uv run python -m specparser.amt data/amt.yml --value backtest.aum
@@ -586,6 +583,31 @@ uv run python -m specparser.amt data/amt.yml --fut "generic:LA1 Comdty,fut_code:
 
 # Get straddle info with tickers
 uv run python -m specparser.amt data/amt.yml --straddle "C Comdty" "|2023-12|2024-01|N|0|OVERRIDE||33.3|"
+```
+
+### Schedule CLI (specparser.amt.schedules)
+
+```bash
+# Get schedule for a single asset
+uv run python -m specparser.amt.schedules data/amt.yml --get "LA Comdty"
+
+# Find schedules matching regex pattern
+uv run python -m specparser.amt.schedules data/amt.yml --find "^LA.*"
+
+# List schedules for all live assets
+uv run python -m specparser.amt.schedules data/amt.yml --live
+
+# Expand live schedules across year range
+uv run python -m specparser.amt.schedules data/amt.yml --expand 2024 2025
+
+# Expand live schedules for specific year/month
+uv run python -m specparser.amt.schedules data/amt.yml --expand-ym 2024 6
+
+# Expand single asset's schedule across year range
+uv run python -m specparser.amt.schedules data/amt.yml --get-expand "LA Comdty" 2024 2025
+
+# Expand single asset's schedule for specific year/month
+uv run python -m specparser.amt.schedules data/amt.yml --get-expand-ym "LA Comdty" 2024 6
 ```
 
 ---
@@ -646,20 +668,20 @@ for row in table['rows'][:5]:
 ```python
 from specparser.amt import get_schedule
 
-schedule = get_schedule("data/amt.yml", "AAPL US Equity")
-if schedule:
+table = get_schedule("data/amt.yml", "AAPL US Equity")
+if table['rows']:
     print("Schedule for AAPL US Equity:")
-    for entry in schedule:
-        print(f"  {entry}")
+    for row in table['rows']:
+        print(f"  {row}")
 ```
 
 ### Expand schedules for specific assets
 
 ```python
-from specparser.amt import find_expand
+from specparser.amt import expand
 
 # Expand only commodities matching pattern
-table = find_expand("data/amt.yml", "^CL.*", 2024, 2024)
+table = expand("data/amt.yml", 2024, 2024, pattern="^CL.*")
 
 for row in table['rows'][:5]:
     asset, straddle = row
