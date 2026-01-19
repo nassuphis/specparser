@@ -112,7 +112,97 @@ def _parse_date_constraint(param: str) -> tuple[str, tuple[int, int] | None, boo
     return (param, None, True)
 
 
-def asset_tickers(path: str | Path, underlying: str) -> dict[str, Any]:
+# -------------------------------------
+# Ticker handler functions
+# -------------------------------------
+
+
+def _market_tickers(market: dict, underlying: str, cls: str) -> list[list]:
+    """Handle Market tickers - BBG source with Tickers list."""
+    field = market.get("Field", "")
+    tickers = market.get("Tickers", "")
+    if isinstance(tickers, str):
+        ticker_list = [tickers] if tickers else []
+    elif isinstance(tickers, list):
+        ticker_list = tickers
+    else:
+        ticker_list = []
+    return [[underlying, cls, "Market", "-", "BBG", t, field] for t in ticker_list]
+
+
+def _vol_tickers(vol: dict, underlying: str, cls: str) -> list[list]:
+    """Handle Vol tickers - Near and Far fields with deduplication."""
+    source = vol.get("Source", "")
+    ticker = vol.get("Ticker", "")
+    near = vol.get("Near", "")
+    far = vol.get("Far", "")
+
+    rows = []
+    seen = set()
+    for param, field in [("Near", near), ("Far", far)]:
+        if field and field != "NONE":
+            key = (ticker, field)
+            if key not in seen:
+                seen.add(key)
+                rows.append([underlying, cls, "Vol", param, source, ticker, field])
+    return rows
+
+
+def _hedge_nonfut(hedge: dict, underlying: str, cls: str) -> list[list]:
+    """Handle 'nonfut' hedge - simple BBG ticker."""
+    ticker = hedge.get("Ticker", "")
+    field = hedge.get("Field", "")
+    return [[underlying, cls, "Hedge", "hedge", "BBG", ticker, field]]
+
+
+def _hedge_cds(hedge: dict, underlying: str, cls: str) -> list[list]:
+    """Handle 'cds' hedge - two BBG tickers with PX_LAST."""
+    rows = []
+    for param in ["hedge", "hedge1"]:
+        ticker = hedge.get(param, "")
+        if ticker:
+            rows.append([underlying, cls, "Hedge", param, "BBG", ticker, "PX_LAST"])
+    return rows
+
+
+def _hedge_fut(hedge: dict, underlying: str, cls: str) -> list[list]:
+    """Handle 'fut' hedge - BBGfc source with spec string."""
+    spec_parts = [f"{k}:{v}" for k, v in hedge.items() if k != "Source"]
+    spec_str = ",".join(spec_parts)
+    return [[underlying, cls, "Hedge", "fut", "BBGfc", spec_str, "PX_LAST"]]
+
+
+def _hedge_calc(hedge: dict, underlying: str, cls: str) -> list[list]:
+    """Handle 'calc' hedge - 4 calculated tickers."""
+    ccy_list = hedge.get("ccy", [])
+    tenor_list = hedge.get("tenor", [])
+    ccy = ccy_list[0] if isinstance(ccy_list, list) and ccy_list else str(ccy_list)
+    tenor = tenor_list[0] if isinstance(tenor_list, list) and tenor_list else str(tenor_list)
+    return [
+        [underlying, cls, "Hedge", "hedge", "calc", f"{ccy}_fsw0m_{tenor}", ""],
+        [underlying, cls, "Hedge", "hedge1", "calc", f"{ccy}_fsw6m_{tenor}", ""],
+        [underlying, cls, "Hedge", "hedge2", "calc", f"{ccy}_pva0m_{tenor}", ""],
+        [underlying, cls, "Hedge", "hedge3", "calc", f"{ccy}_pva6m_{tenor}", ""],
+    ]
+
+
+def _hedge_default(hedge: dict, underlying: str, cls: str, source: str) -> list[list]:
+    """Handle default hedge - condensed spec string."""
+    spec_parts = [f"{k}:{v}" for k, v in hedge.items() if k != "Source"]
+    spec_str = ",".join(spec_parts)
+    return [[underlying, cls, "Hedge", source, source, "", spec_str]]
+
+
+# Dispatch table for hedge source handlers
+_HEDGE_HANDLERS = {
+    "nonfut": _hedge_nonfut,
+    "cds": _hedge_cds,
+    "fut": _hedge_fut,
+    "calc": _hedge_calc,
+}
+
+
+def asset_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
     """
     Get all tickers for an asset by its Underlying value.
 
@@ -142,88 +232,25 @@ def asset_tickers(path: str | Path, underlying: str) -> dict[str, Any]:
     asset_underlying = asset_data.get("Underlying", "")
     asset_class = asset_data.get("Class", "")
 
-    # Market tickers - source is always "BBG"
+    # Market tickers
     market = asset_data.get("Market", {})
     if isinstance(market, dict):
-        field = market.get("Field", "")
-        tickers = market.get("Tickers", "")
-        # Handle both string and list of tickers
-        if isinstance(tickers, str):
-            ticker_list = [tickers] if tickers else []
-        elif isinstance(tickers, list):
-            ticker_list = tickers
-        else:
-            ticker_list = []
-        for ticker in ticker_list:
-            rows.append([asset_underlying, asset_class, "Market", "-", "BBG", ticker, field])
+        rows.extend(_market_tickers(market, asset_underlying, asset_class))
 
     # Vol tickers
     vol = asset_data.get("Vol", {})
     if isinstance(vol, dict):
-        source = vol.get("Source", "")
-        ticker = vol.get("Ticker", "")
-        near = vol.get("Near", "")
-        far = vol.get("Far", "")
-        # Track (ticker, field) pairs to avoid duplicates
-        vol_seen = set()
-        # Skip "NONE" values
-        if near and near != "NONE":
-            key = (ticker, near)
-            if key not in vol_seen:
-                vol_seen.add(key)
-                rows.append([asset_underlying, asset_class, "Vol", "Near", source, ticker, near])
-        if far and far != "NONE":
-            key = (ticker, far)
-            if key not in vol_seen:
-                vol_seen.add(key)
-                rows.append([asset_underlying, asset_class, "Vol", "Far", source, ticker, far])
+        rows.extend(_vol_tickers(vol, asset_underlying, asset_class))
 
     # Hedge tickers
     hedge = asset_data.get("Hedge", {})
     if isinstance(hedge, dict):
         source = hedge.get("Source", "")
-        if source == "nonfut":
-            # nonfut has Ticker and Field, source is always "BBG"
-            ticker = hedge.get("Ticker", "")
-            field = hedge.get("Field", "")
-            rows.append([asset_underlying, asset_class, "Hedge", "hedge", "BBG", ticker, field])
-        elif source == "cds":
-            # cds: two rows for hedge and hedge1, each with their ticker value
-            hedge_ticker = hedge.get("hedge", "")
-            hedge1_ticker = hedge.get("hedge1", "")
-            if hedge_ticker:
-                rows.append([asset_underlying, asset_class, "Hedge", "hedge", "BBG", hedge_ticker, "PX_LAST"])
-            if hedge1_ticker:
-                rows.append([asset_underlying, asset_class, "Hedge", "hedge1", "BBG", hedge1_ticker, "PX_LAST"])
-        elif source == "fut":
-            # fut: source is BBGfc, spec string goes to ticker, field is PX_LAST
-            spec_parts = []
-            for key, val in hedge.items():
-                if key != "Source":
-                    spec_parts.append(f"{key}:{val}")
-            spec_str = ",".join(spec_parts)
-            rows.append([asset_underlying, asset_class, "Hedge", "fut", "BBGfc", spec_str, "PX_LAST"])
-        elif source == "calc":
-            # calc: generate 4 hedge tickers from ccy and tenor
-            # ccy and tenor are lists, take first element
-            ccy_list = hedge.get("ccy", [])
-            tenor_list = hedge.get("tenor", [])
-            ccy = ccy_list[0] if isinstance(ccy_list, list) and ccy_list else str(ccy_list)
-            tenor = tenor_list[0] if isinstance(tenor_list, list) and tenor_list else str(tenor_list)
-            # Generate 4 tickers: fsw0m, fsw6m, pva0m, pva6m
-            # Field is empty string for calc tickers (as stored in prices parquet)
-            rows.append([asset_underlying, asset_class, "Hedge", "hedge", "calc", f"{ccy}_fsw0m_{tenor}", ""])
-            rows.append([asset_underlying, asset_class, "Hedge", "hedge1", "calc", f"{ccy}_fsw6m_{tenor}", ""])
-            rows.append([asset_underlying, asset_class, "Hedge", "hedge2", "calc", f"{ccy}_pva0m_{tenor}", ""])
-            rows.append([asset_underlying, asset_class, "Hedge", "hedge3", "calc", f"{ccy}_pva6m_{tenor}", ""])
+        handler = _HEDGE_HANDLERS.get(source)
+        if handler:
+            rows.extend(handler(hedge, asset_underlying, asset_class))
         else:
-            # other sources - condense all non-Source fields into a spec string in field column
-            spec_parts = []
-            for key, val in hedge.items():
-                if key != "Source":
-                    spec_parts.append(f"{key}:{val}")
-            spec_str = ",".join(spec_parts)
-            rows.append([asset_underlying, asset_class, "Hedge", source, source, "", spec_str])
+            rows.extend(_hedge_default(hedge, asset_underlying, asset_class, source))
 
     return {
         "columns": ["asset", "cls", "type", "param", "source", "ticker", "field"],
@@ -231,7 +258,7 @@ def asset_tickers(path: str | Path, underlying: str) -> dict[str, Any]:
     }
 
 
-def fut_ticker(spec: str, year: int, month: int) -> str:
+def fut_spec2ticker(spec: str, year: int, month: int) -> str:
     """
     Compute the actual futures ticker from a spec string and year/month.
 
@@ -289,7 +316,7 @@ def fut_ticker(spec: str, year: int, month: int) -> str:
 _NORMALIZED_CACHE: dict[str, dict[str, str]] = {}
 
 
-def normalized2actual(csv_path: str | Path, ticker: str) -> str | None:
+def fut_norm2act(csv_path: str | Path, ticker: str) -> str | None:
     """
     Convert a normalized BBG futures ticker to the actual BBG ticker.
 
@@ -362,13 +389,13 @@ def _expand_bbgfc_row(
 
     for year in range(start_year, end_year + 1):
         for month in range(1, 13):
-            ticker = fut_ticker(spec, year, month)
+            ticker = fut_spec2ticker(spec, year, month)
             new_row = row.copy()
             new_row["param"] = f"hedgeX{year}-{month:02d}"
 
             # Try to look up actual ticker if chain_csv provided
             if chain_csv is not None:
-                actual = normalized2actual(chain_csv, ticker)
+                actual = fut_norm2act(chain_csv, ticker)
                 if actual is not None:
                     new_row["source"] = "BBG"
                     new_row["ticker"] = actual
@@ -475,7 +502,7 @@ def asset_straddle(
     vol_param = "Near" if ntrc == "N" else "Far"
 
     # Get tickers for the asset
-    ticker_table = asset_tickers(path, underlying)
+    ticker_table = asset_tschemas(path, underlying)
     if not ticker_table["rows"]:
         raise ValueError(f"No asset found with Underlying: {underlying}")
 
@@ -732,7 +759,7 @@ def live_tickers(path: str | Path, start_year: int | None = None, end_year: int 
     rows = []
 
     for _, _, _, underlying, _ in _iter_assets(path, live_only=True):
-        asset_table = asset_tickers(path, underlying)
+        asset_table = asset_tschemas(path, underlying)
         for list_row in asset_table["rows"]:
             # Convert list row to dict for easier manipulation
             row = dict(zip(columns, list_row))
@@ -752,3 +779,81 @@ def live_tickers(path: str | Path, start_year: int | None = None, end_year: int 
         "columns": columns,
         "rows": list_rows,
     }
+
+
+# -------------------------------------
+# CLI
+# -------------------------------------
+
+
+def _main() -> int:
+    import argparse
+    from .loader import print_table
+
+    p = argparse.ArgumentParser(
+        description="Ticker extraction and transformation utilities.",
+    )
+    p.add_argument("path", help="Path to AMT YAML file")
+    p.add_argument("--chain-csv", default="data/futs.csv",
+                   help="CSV file with normalized_future,actual_future columns (default: data/futs.csv)")
+    p.add_argument("--prices", default="data/prices.parquet",
+                   help="Prices parquet file (default: data/prices.parquet)")
+
+    # Commands
+    p.add_argument("--asset-tickers", metavar="UNDERLYING",
+                   help="Get all tickers for an asset by Underlying value")
+    p.add_argument("--live-tickers", nargs="*", type=int, metavar=("START_YEAR", "END_YEAR"),
+                   help="Get all tickers for live assets (optional: START_YEAR END_YEAR to expand BBGfc)")
+    p.add_argument("--fut", nargs=3, metavar=("SPEC", "YEAR", "MONTH"),
+                   help="Compute futures ticker from spec string, year, and month")
+    p.add_argument("--straddle", nargs=2, metavar=("UNDERLYING", "STRADDLE"),
+                   help="Get straddle info with tickers for an asset")
+    p.add_argument("--straddle-days", nargs=2, metavar=("UNDERLYING", "STRADDLE"),
+                   help="Get straddle info with daily prices for entry month")
+
+    args = p.parse_args()
+
+    if args.asset_tickers:
+        table = asset_tschemas(args.path, args.asset_tickers)
+        if not table["rows"]:
+            print(f"No asset found with Underlying: {args.asset_tickers}")
+            return 1
+        print_table(table)
+
+    elif args.live_tickers is not None:
+        if len(args.live_tickers) == 2:
+            start_year, end_year = args.live_tickers
+            table = live_tickers(args.path, start_year, end_year, args.chain_csv)
+        elif len(args.live_tickers) == 0:
+            table = live_tickers(args.path)
+        else:
+            print("--live-tickers requires 0 or 2 arguments (START_YEAR END_YEAR)")
+            return 1
+        print_table(table)
+
+    elif args.fut:
+        spec, year, month = args.fut
+        ticker = fut_spec2ticker(spec, int(year), int(month))
+        print(ticker)
+
+    elif args.straddle:
+        underlying, straddle_str = args.straddle
+        table = asset_straddle(args.path, underlying, straddle_str, args.chain_csv)
+        print_table(table)
+
+    elif args.straddle_days:
+        underlying, straddle_str = args.straddle_days
+        table = asset_straddle(args.path, underlying, straddle_str, args.chain_csv)
+        table = straddle_days(table, args.prices)
+        print_table(table)
+
+    else:
+        p.print_help()
+
+    return 0
+
+
+if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    raise SystemExit(_main())

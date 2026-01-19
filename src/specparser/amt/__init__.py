@@ -40,9 +40,9 @@ from .loader import (
 
 from .tickers import (
     _split_ticker,
-    asset_tickers,
-    fut_ticker,
-    normalized2actual,
+    asset_tschemas,
+    fut_spec2ticker,
+    fut_norm2act,
     clear_normalized_cache,
     _expand_bbgfc_row,
     _expand_split_ticker_row,
@@ -57,7 +57,11 @@ from .schedules import (
     _split_code_value,
     live_schedules,
     expand,
+    expand_ym,
     find_expand,
+    find_expand_ym,
+    get_expand,
+    get_expand_ym,
 )
 
 __all__ = [
@@ -83,9 +87,9 @@ __all__ = [
     "live_group",
     # tickers
     "_split_ticker",
-    "asset_tickers",
-    "fut_ticker",
-    "normalized2actual",
+    "asset_tschemas",
+    "fut_spec2ticker",
+    "fut_norm2act",
     "clear_normalized_cache",
     "_expand_bbgfc_row",
     "_expand_split_ticker_row",
@@ -98,5 +102,9 @@ __all__ = [
     "_split_code_value",
     "live_schedules",
     "expand",
+    "expand_ym",
     "find_expand",
+    "find_expand_ym",
+    "get_expand",
+    "get_expand_ym",
 ]

@@ -5,7 +5,9 @@
 CLI entry point for the AMT module.
 
 Usage:
-    python -m specparser.amt data/amt.yml --expand 2024 2025
+    python -m specparser.amt data/amt.yml --get "LA Comdty"
+    python -m specparser.amt data/amt.yml --live
+    python -m specparser.amt data/amt.yml --live-tickers 2024 2025
 """
 import argparse
 
@@ -28,18 +30,11 @@ from .loader import (
     get_leverage,
 )
 from .tickers import (
-    asset_tickers,
+    asset_tschemas,
     live_tickers,
-    fut_ticker,
+    fut_spec2ticker,
     asset_straddle,
     straddle_days,
-)
-from .schedules import (
-    get_schedule,
-    find_schedules,
-    live_schedules,
-    expand,
-    find_expand,
 )
 
 
@@ -50,7 +45,6 @@ def _main() -> int:
     p.add_argument("path", help="Path to AMT YAML file")
     p.add_argument("--get", "-g", metavar="UNDERLYING", help="Get asset by Underlying value")
     p.add_argument("--find", "-f", metavar="PATTERN", help="Find assets by regex pattern on Underlying")
-    p.add_argument("--schedule", "-s", metavar="UNDERLYING", help="Get expiry schedule for asset by Underlying value")
     p.add_argument("--table", "-t", metavar="KEY_PATH", help="Get embedded table by key path (e.g., group_risk_multiplier_table)")
     p.add_argument("--list", "-l", action="store_true", help="List all asset names")
     p.add_argument("--all", "-a", action="store_true", help="List all assets with their weight caps")
@@ -61,10 +55,6 @@ def _main() -> int:
     p.add_argument("--asset-tickers", metavar="UNDERLYING", help="Get all tickers for an asset by Underlying value")
     p.add_argument("--live-tickers", nargs="*", type=int, metavar=("START_YEAR", "END_YEAR"), help="Get all tickers for all live assets (optional: START_YEAR END_YEAR to expand BBGfc)")
     p.add_argument("--chain-csv", metavar="CSV_PATH", help="CSV file with normalized_future,actual_future columns for ticker lookup (use with --live-tickers)")
-    p.add_argument("--schedules", action="store_true", help="List all live assets with their schedules")
-    p.add_argument("--find-schedules", metavar="PATTERN", help="Find schedules by regex pattern on Underlying")
-    p.add_argument("--expand", nargs=2, type=int, metavar=("START_YEAR", "END_YEAR"), help="Expand live schedules into straddle strings")
-    p.add_argument("--find-expand", nargs=3, metavar=("PATTERN", "START_YEAR", "END_YEAR"), help="Expand schedules matching pattern into straddle strings")
     p.add_argument("--value", "-v", metavar="KEY_PATH", help="Get value by dot-separated key path (e.g., backtest.aum)")
     p.add_argument("--aum", action="store_true", help="Get AUM value")
     p.add_argument("--leverage", action="store_true", help="Get leverage value")
@@ -92,19 +82,6 @@ def _main() -> int:
                 rows.append([u, asset.get("Class", ""), asset.get("WeightCap", "")])
         table = {"columns": ["Underlying", "Class", "WeightCap"], "rows": rows}
         print_table(table)
-    elif args.schedule:
-        asset = get_asset(args.path, args.schedule)
-        if not asset:
-            print(f"No asset with Underlying: {args.schedule}")
-            return 1
-        schedule = get_schedule(args.path, args.schedule)
-        if schedule:
-            for entry in schedule:
-                parts = entry.split("_")
-                print("\t".join(parts))
-        else:
-            print(f"No schedule found for: {args.schedule}")
-            return 1
     elif args.table:
         try:
             table = get_table(args.path, args.table)
@@ -135,7 +112,7 @@ def _main() -> int:
             print(f"Error: {e}")
             return 1
     elif args.asset_tickers:
-        table = asset_tickers(args.path, args.asset_tickers)
+        table = asset_tschemas(args.path, args.asset_tickers)
         if table["rows"]:
             print_table(table)
         else:
@@ -151,26 +128,6 @@ def _main() -> int:
             table = live_tickers(args.path, start_year, end_year, chain_csv=args.chain_csv)
         else:
             print("Error: --live-tickers requires either no arguments or exactly 2 (START_YEAR END_YEAR)")
-            return 1
-        print_table(table)
-    elif args.schedules:
-        table = live_schedules(args.path)
-        print_table(table)
-    elif args.find_schedules:
-        table = find_schedules(args.path, args.find_schedules)
-        if not table["rows"]:
-            print(f"No assets found matching: {args.find_schedules}")
-            return 1
-        print_table(table)
-    elif args.expand:
-        start_year, end_year = args.expand
-        table = expand(args.path, start_year, end_year)
-        print_table(table)
-    elif args.find_expand:
-        pattern, start_year, end_year = args.find_expand
-        table = find_expand(args.path, pattern, int(start_year), int(end_year))
-        if not table["rows"]:
-            print(f"No assets found matching: {pattern}")
             return 1
         print_table(table)
     elif args.value:
@@ -199,7 +156,7 @@ def _main() -> int:
         try:
             year = int(year_str)
             month = int(month_str)
-            ticker = fut_ticker(spec, year, month)
+            ticker = fut_spec2ticker(spec, year, month)
             print(ticker)
         except (ValueError, IndexError) as e:
             print(f"Error computing futures ticker: {e}")
