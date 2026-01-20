@@ -202,138 +202,22 @@ def get_table(path: str | Path, key_path: str) -> dict[str, Any]:
     return { "columns": columns, "types": types, "rows": rows, }
 
 
-def table_column(table: dict[str, Any], colname: str) -> list[Any]:
-    """Extract a single column from a table as a list.
+# Re-export table utilities from table.py for backward compatibility
+from .table import (
+    table_column,
+    table_select_columns,
+    table_add_column,
+    table_drop_columns,
+    table_replace_value,
+    table_bind_rows,
+    table_unique_rows,
+    table_join,
+    format_table,
+    print_table,
+)
 
-    Args:
-        table: Dict with 'columns' and 'rows'
-        colname: Name of the column to extract
-
-    Returns:
-        List of values from that column
-
-    Raises:
-        ValueError: If column name not found
-    """
-    try:
-        idx = table["columns"].index(colname)
-    except ValueError:
-        raise ValueError(f"Column '{colname}' not found in table columns: {table['columns']}")
-    return [row[idx] for row in table["rows"]]
-
-
-def format_table(table: dict[str, Any]) -> str:
-    """Format a table dict as a tab-separated string with header."""
-    lines = []
-
-    # Header
-    lines.append("\t".join(str(c) for c in table["columns"]))
-
-    # Rows
-    for row in table["rows"]:
-        lines.append("\t".join(str(v) for v in row))
-
-    return "\n".join(lines)
-
-
-def print_table(table: dict[str, Any]) -> None:
-    """Print a table with header and rows to stdout."""
-    # Header
-    print("\t".join(str(c) for c in table["columns"]))
-
-    # Rows
-    for row in table["rows"]:
-        print("\t".join(str(v) for v in row))
-
-
-def _merge_tables(*tables: dict[str, Any], key_col: int = 0) -> dict[str, Any]:
-    """
-    Merge multiple tables by combining their columns.
-
-    Takes the key column from the first table, then appends all non-key columns
-    from each table. All tables must have the same number of rows.
-
-    Args:
-        *tables: Tables to merge (each has 'columns' and 'rows')
-        key_col: Index of the key column (default 0, typically 'asset')
-
-    Returns:
-        Merged table with combined columns and rows
-    """
-    if not tables:
-        return {"columns": [], "rows": []}
-
-    first = tables[0]
-    n_rows = len(first["rows"])
-
-    # Start with key column from first table
-    columns = [first["columns"][key_col]]
-
-    # Add non-key columns from each table
-    for tbl in tables:
-        for i, col in enumerate(tbl["columns"]):
-            if i != key_col:
-                columns.append(col)
-
-    # Build rows: key value + non-key values from each table
-    rows = []
-    for row_idx in range(n_rows):
-        row = [first["rows"][row_idx][key_col]]
-        for tbl in tables:
-            for i, val in enumerate(tbl["rows"][row_idx]):
-                if i != key_col:
-                    row.append(val)
-        rows.append(row)
-
-    return {"columns": columns, "rows": rows}
-
-
-def bind_rows(*tables: dict[str, Any]) -> dict[str, Any]:
-    """
-    Concatenate rows from multiple tables with the same columns.
-
-    Args:
-        *tables: Tables to bind (each has 'columns' and 'rows')
-
-    Returns:
-        New table with all rows concatenated
-
-    Raises:
-        ValueError: If tables have different columns
-    """
-    if not tables:
-        return {"columns": [], "rows": []}
-
-    first = tables[0]
-    columns = first["columns"]
-
-    # Verify all tables have same columns
-    for i, tbl in enumerate(tables[1:], start=2):
-        if tbl["columns"] != columns:
-            raise ValueError(f"Table {i} columns {tbl['columns']} != first table columns {columns}")
-
-    # Concatenate all rows
-    rows = []
-    for tbl in tables:
-        rows.extend(tbl["rows"])
-
-    return {"columns": columns, "rows": rows}
-
-
-def table_unique_rows(table: dict[str, Any]) -> dict[str, Any]:
-    """
-    Remove duplicate rows from a table.
-
-    Uses tuple(row) as key to dedupe, preserving the last occurrence of each row.
-
-    Args:
-        table: Dict with 'columns' and 'rows'
-
-    Returns:
-        New table with only unique rows
-    """
-    seen = {tuple(row): row for row in table["rows"]}
-    return {"columns": table["columns"], "rows": list(seen.values())}
+# Backward compatibility alias
+bind_rows = table_bind_rows
 
 
 def _compile_rules(table: dict[str, Any]) -> list[tuple[str, re.Pattern, str]]:
@@ -445,7 +329,7 @@ def asset_table(
 #
 def asset_group(path: str | Path, live_only: bool = False, pattern: str = ".") -> dict[str, Any]:
     """live with group, subgroup, liquidity, and limit override."""
-    return _merge_tables(
+    return table_join(
         asset_table(path, "group_table", default="error",live_only=live_only,pattern=pattern),
         asset_table(path, "subgroup_table", default="",live_only=live_only,pattern=pattern),
         asset_table(path, "liquidity_table", default="1",live_only=live_only,pattern=pattern),
@@ -527,7 +411,7 @@ def _main() -> int:
         try:
             table_names = [t.strip() for t in args.merge.split(",")]
             tables = [asset_table(args.path, name, live_only=True) for name in table_names]
-            print_table(_merge_tables(*tables))
+            print_table(table_join(*tables))
         except ValueError as e:
             print(f"Error: {e}")
             return 1
@@ -659,13 +543,13 @@ group_table:
         # TEST1 Comdty -> commodities, TEST3 Rate -> other
         print("  asset_table: OK")
 
-        # Test _merge_tables
+        # Test table_join
         t1 = {"columns": ["key", "a"], "rows": [["k1", 1], ["k2", 2]]}
         t2 = {"columns": ["key", "b"], "rows": [["k1", 10], ["k2", 20]]}
-        merged = _merge_tables(t1, t2)
-        assert merged["columns"] == ["key", "a", "b"], f"_merge_tables: wrong columns {merged['columns']}"
-        assert merged["rows"] == [["k1", 1, 10], ["k2", 2, 20]], f"_merge_tables: wrong rows {merged['rows']}"
-        print("  _merge_tables: OK")
+        merged = table_join(t1, t2)
+        assert merged["columns"] == ["key", "a", "b"], f"table_join: wrong columns {merged['columns']}"
+        assert merged["rows"] == [["k1", 1, 10], ["k2", 2, 20]], f"table_join: wrong rows {merged['rows']}"
+        print("  table_join: OK")
 
         print("All loader self-tests passed!")
         return 0

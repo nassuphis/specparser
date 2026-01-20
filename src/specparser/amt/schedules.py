@@ -137,7 +137,12 @@ def _parse_straddle(s: str) -> tuple[str, str, str, str, str, str, str]:
 
     Returns: (ntr, xpr, ntrc, ntrv, xprc, xprv, wgt)
     """
-    parts = s.strip("|").split("|")
+    # Remove only the leading and trailing pipe, preserving empty internal parts
+    # Using s[1:-1] instead of strip("|") to keep empty fields like ||
+    if s.startswith("|") and s.endswith("|"):
+        parts = s[1:-1].split("|")
+    else:
+        parts = s.split("|")
     if len(parts) != 7:
         raise ValueError(f"Invalid straddle format: expected 7 parts, got {len(parts)}")
     return tuple(parts)

@@ -271,6 +271,8 @@ def fut_spec2ticker(spec: str, year: int, month: int) -> str:
 
 # Cache for normalized to actual futures mapping
 _NORMALIZED_CACHE: dict[str, dict[str, str]] = {}
+# Cache for actual to normalized futures mapping (reverse)
+_ACTUAL_CACHE: dict[str, dict[str, str]] = {}
 
 
 def fut_norm2act(csv_path: str | Path, ticker: str) -> str | None:
@@ -310,9 +312,44 @@ def fut_norm2act(csv_path: str | Path, ticker: str) -> str | None:
     return _NORMALIZED_CACHE[csv_path].get(ticker)
 
 
+def fut_act2norm(csv_path: str | Path, ticker: str) -> str | None:
+    """
+    Convert an actual BBG futures ticker to the normalized ticker.
+
+    This is the inverse of fut_norm2act. Uses the same CSV lookup table
+    to map actual BBG tickers (e.g., "LA F25 Comdty") back to normalized
+    tickers (e.g., "LAF2025 Comdty").
+
+    The CSV is loaded once and cached for subsequent lookups.
+
+    Args:
+        csv_path: Path to the CSV file with normalized_future,actual_future columns
+        ticker: The actual BBG futures ticker to look up
+
+    Returns:
+        The normalized ticker if found, or None if not found
+    """
+    csv_path = str(Path(csv_path).resolve())
+
+    # Load and cache the reverse mapping if not already cached
+    if csv_path not in _ACTUAL_CACHE:
+        mapping = {}
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                normalized = row.get("normalized_future", "")
+                actual = row.get("actual_future", "")
+                if normalized and actual:
+                    mapping[actual] = normalized
+        _ACTUAL_CACHE[csv_path] = mapping
+
+    return _ACTUAL_CACHE[csv_path].get(ticker)
+
+
 def clear_normalized_cache() -> None:
-    """Clear the normalized to actual futures cache."""
+    """Clear both the normalized-to-actual and actual-to-normalized futures caches."""
     _NORMALIZED_CACHE.clear()
+    _ACTUAL_CACHE.clear()
 
 def _tschma_dict_bbgfc_ym(
     tschema_dict: dict,
@@ -438,25 +475,239 @@ def find_tickers(
 # straddle strings are inputs
 # -------------------------------------
 
+def _filter_straddle_tickers(rows: list[list], columns: list[str], ntrc: str) -> list[list]:
+    """Filter ticker rows based on straddle rules.
+
+    Rules:
+    1. Market rows are excluded
+    2. Vol/Near rows kept only if ntrc == "N", param changed to "vol"
+    3. Vol/Far rows kept only if ntrc == "F", param changed to "vol"
+    4. Hedge rows are always kept
+    """
+    type_idx = columns.index("type")
+    param_idx = columns.index("param")
+    source_idx = columns.index("source")
+    ticker_idx = columns.index("ticker")
+    field_idx = columns.index("field")
+
+    filtered = []
+    for row in rows:
+        row_type = row[type_idx]
+        row_param = row[param_idx]
+        row_source = row[source_idx]
+        row_ticker = row[ticker_idx]
+        row_field = row[field_idx]
+
+        if row_type == "Market":
+            continue  # Exclude all Market rows
+        elif row_type == "Vol":
+            
+            new_row = row[:]
+
+            if row_source == "CV":
+                new_row[ticker_idx] = row_field
+                new_row[field_idx] = "NONE"
+
+            if row_param == "Near" and ntrc == "N":
+                new_row[param_idx] = "vol"
+            elif row_param == "Far" and ntrc == "F":
+                new_row[param_idx] = "vol"
+            else:
+                # Other Vol rows are excluded
+                continue
+
+            filtered.append(new_row) # These are kept
+
+        elif row_type == "Hedge":
+            filtered.append(row)  # Keep all Hedge rows
+        else:
+            filtered.append(row)  # Keep other types (calc, etc.)
+
+    return filtered
+
+
 def asset_straddle_tickers(
     path: str | Path,
     underlying: str,
     year: int,
     month: int,
-    chain_csv: str | Path | None = None
+    chain_csv: str | Path | None = None,
+    i: int = 0
 ) -> dict[str, Any]:
-    
-    straddles = loader.table_column(schedules.get_expand_ym(path,underlying,year,month),"straddle")
-    if len(straddles)<1:
-         raise ValueError(f"{underlying} has no straddles in {year}-{month:02d}")
-    straddle = straddles[0]
+    """Get tickers for an asset's straddle with the straddle string included.
+
+    Columns: ['asset', 'param', 'source', 'ticker', 'field', 'straddle']
+
+    Filtering rules:
+    - Market rows are excluded
+    - Vol/Near rows kept only if straddle ntrc == "N", param changed to "vol"
+    - Vol/Far rows kept only if straddle ntrc == "F", param changed to "vol"
+    - Hedge rows are always kept
+
+    Args:
+        path: Path to AMT YAML file
+        underlying: Asset underlying value
+        year: Expiry year
+        month: Expiry month
+        chain_csv: Optional CSV for futures ticker lookup
+        i: Straddle selector index (i % len(straddles))
+
+    Returns:
+        Table with ticker rows plus straddle column
+    """
+    straddles = loader.table_column(schedules.get_expand_ym(path, underlying, year, month), "straddle")
+    if len(straddles) < 1:
+        raise ValueError(f"{underlying} has no straddles in {year}-{month:02d}")
+    straddle = straddles[i % len(straddles)]
     xpry, xprm = schedules.xpry(straddle), schedules.xprm(straddle)
-    ticker_table = get_tickers_ym(path,underlying,xpry,xprm,chain_csv)
-    return ticker_table
+    ntrc = schedules.ntrc(straddle)
+    ticker_table = get_tickers_ym(path, underlying, xpry, xprm, chain_csv)
+    # Filter rows based on straddle rules
+    filtered_rows = _filter_straddle_tickers(ticker_table["rows"], ticker_table["columns"], ntrc)
+    # Build filtered table, then transform using table utilities
+    filtered_table = {"columns": ticker_table["columns"], "rows": filtered_rows}
+    # Drop cls and type columns
+    filtered_table = loader.table_drop_columns(filtered_table, ["cls", "type"])
+    # Add straddle column after asset
+    filtered_table = loader.table_add_column(filtered_table, "straddle", value=straddle, position=1)
+    return filtered_table
 
 # -------------------------------------
 # Finally, Prices
 # -------------------------------------
+
+
+def get_straddle_days(
+    path: str | Path,
+    underlying: str,
+    year: int,
+    month: int,
+    prices_parquet: str | Path,
+    chain_csv: str | Path | None = None,
+    i: int = 0
+) -> dict[str, Any]:
+    """Get daily prices for a straddle from entry to expiry month.
+
+    Columns: ['asset', 'straddle', 'date', <param1>, <param2>, ...]
+    Where params are 'vol', 'hedge', 'hedge1', etc.
+
+    Args:
+        path: Path to AMT YAML file
+        underlying: Asset underlying value
+        year: Expiry year
+        month: Expiry month
+        prices_parquet: Path to prices parquet file
+        chain_csv: Optional CSV for futures ticker lookup
+        i: Straddle selector index (i % len(straddles))
+
+    Returns:
+        Table with one row per day, columns for each param's price
+    """
+    from datetime import date
+
+    # Get ticker table from asset_straddle_tickers
+    table = asset_straddle_tickers(path, underlying, year, month, chain_csv, i)
+
+    if not table["rows"]:
+        return {"columns": ["asset", "straddle", "date"], "rows": []}
+
+    # All rows have same asset and straddle
+    asset = table["rows"][0][0]
+    straddle = table["rows"][0][1]
+
+    # Parse straddle to get date range
+    entry_year, entry_month = schedules.ntry(straddle), schedules.ntrm(straddle)
+    expiry_year, expiry_month = schedules.xpry(straddle), schedules.xprm(straddle)
+
+    # Map param -> (ticker, field) from input rows
+    # Input columns: ["asset", "straddle", "param", "source", "ticker", "field"]
+    param_idx = table["columns"].index("param")
+    ticker_idx = table["columns"].index("ticker")
+    field_idx = table["columns"].index("field")
+
+    ticker_map = {}  # param -> (ticker, field)
+    params_ordered = []  # preserve order for output columns
+    for row in table["rows"]:
+        param = row[param_idx]
+        if param not in ticker_map:
+            params_ordered.append(param)
+            ticker_map[param] = (row[ticker_idx], row[field_idx])
+
+    # Normalize tickers for price lookup (prices DB uses normalized tickers)
+    # Only applies when chain_csv is provided
+    normalized_ticker_map = {}  # param -> (normalized_ticker, field)
+    if chain_csv is not None:
+        for param, (ticker, field) in ticker_map.items():
+            normalized = fut_act2norm(chain_csv, ticker)
+            if normalized is not None:
+                normalized_ticker_map[param] = (normalized, field)
+            else:
+                # Ticker wasn't converted (not a futures ticker), use as-is
+                normalized_ticker_map[param] = (ticker, field)
+    else:
+        normalized_ticker_map = ticker_map
+
+    # Generate all dates from entry month to expiry month (inclusive)
+    dates = []
+    current_year, current_month = entry_year, entry_month
+    while (current_year, current_month) <= (expiry_year, expiry_month):
+        _, num_days = calendar.monthrange(current_year, current_month)
+        for day in range(1, num_days + 1):
+            dates.append(date(current_year, current_month, day))
+        # Advance to next month
+        if current_month == 12:
+            current_year += 1
+            current_month = 1
+        else:
+            current_month += 1
+
+    # Build list of (ticker, field) pairs to query using normalized tickers
+    ticker_field_pairs = list(normalized_ticker_map.values())
+
+    start_date = dates[0].isoformat()
+    end_date = dates[-1].isoformat()
+
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW prices AS SELECT * FROM '{prices_parquet}'")
+
+    # Query all prices in one go
+    # Parquet schema: ticker, date, field, value
+    conditions = " OR ".join(
+        f"(ticker = '{t}' AND field = '{f}')" for t, f in ticker_field_pairs
+    )
+    query = f"""
+        SELECT ticker, field, date, value
+        FROM prices
+        WHERE ({conditions})
+        AND date >= '{start_date}'
+        AND date <= '{end_date}'
+    """
+    result = con.execute(query).fetchall()
+    con.close()
+
+    # Organize: (ticker, field) -> {date_str -> value}
+    prices = {}
+    for ticker, field, dt, value in result:
+        key = (ticker, field)
+        if key not in prices:
+            prices[key] = {}
+        prices[key][str(dt)] = str(value)
+
+    # Output columns: asset, straddle, date, <params...>
+    out_columns = ["asset", "straddle", "date"] + params_ordered
+
+    out_rows = []
+    for dt in dates:
+        date_str = dt.isoformat()
+        row = [asset, straddle, date_str]
+        for param in params_ordered:
+            ticker, field = normalized_ticker_map[param]  # Use normalized for lookup
+            value = prices.get((ticker, field), {}).get(date_str, "none")
+            row.append(value)
+        out_rows.append(row)
+
+    return {"columns": out_columns, "rows": out_rows}
+
 
 def straddle_days(table: dict[str, Any], prices_parquet: str | Path) -> dict[str, Any]:
     """
@@ -652,9 +903,12 @@ def _main() -> int:
     p.add_argument("--get-expand-ym", nargs=3, type=str, metavar=("ASSET", "YEAR", "MONTH"),
                    help="Get straddles for asset on month.")
     
-    p.add_argument("--straddle-days", nargs=2, metavar=("UNDERLYING", "STRADDLE"),
+    p.add_argument("--asset-tickers", nargs=4, type=str, metavar=("UNDERLYING", "YEAR", "MONTH","NDX"),
                    help="Get straddle info with daily prices for entry month.")
-    
+
+    p.add_argument("--asset-days", nargs=4, type=str, metavar=("UNDERLYING", "YEAR", "MONTH", "NDX"),
+                   help="Get daily prices for a straddle from entry to expiry month.")
+
     p.add_argument("--fut", nargs=3, metavar=("SPEC", "YEAR", "MONTH"),
                    help="Compute futures ticker from spec string, year, and month.")
     
@@ -727,10 +981,14 @@ def _main() -> int:
         table = schedules.get_expand_ym( args.path, asset, int(year), int(month) )
         loader.print_table(table)
 
-    elif args.straddle_days:
-        underlying, straddle_str = args.straddle_days
-        table = asset_straddle_tickers(args.path, underlying, straddle_str, args.chain_csv)
-        table = straddle_days(table, args.prices)
+    elif args.asset_tickers:
+        underlying, year, month, i = args.asset_tickers
+        table = asset_straddle_tickers(args.path, underlying, int(year), int(month), args.chain_csv, int(i))
+        loader.print_table(table)
+
+    elif args.asset_days:
+        underlying, year, month, i = args.asset_days
+        table = get_straddle_days(args.path, underlying, int(year), int(month), args.prices, args.chain_csv, int(i))
         loader.print_table(table)
 
     else:
