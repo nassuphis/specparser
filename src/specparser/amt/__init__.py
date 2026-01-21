@@ -43,6 +43,8 @@ __all__ = [
     "table_bind_rows",
     "table_unique_rows",
     "table_join",
+    "table_unchop",
+    "table_chop",
     "format_table",
     "print_table",
     # backward compatibility alias
@@ -69,6 +71,9 @@ __all__ = [
     "expand_ym",
     "get_expand",
     "get_expand_ym",
+    "get_days_ym",
+    "clear_days_cache",
+    "year_month_days",
     # straddle parsing
     "ntr",
     "ntry",
@@ -111,6 +116,8 @@ _LAZY_IMPORTS = {
     "table_bind_rows": (".table", "table_bind_rows"),
     "table_unique_rows": (".table", "table_unique_rows"),
     "table_join": (".table", "table_join"),
+    "table_unchop": (".table", "table_unchop"),
+    "table_chop": (".table", "table_chop"),
     "format_table": (".table", "format_table"),
     "print_table": (".table", "print_table"),
     # backward compatibility alias
@@ -137,6 +144,9 @@ _LAZY_IMPORTS = {
     "expand_ym": (".schedules", "expand_ym"),
     "get_expand": (".schedules", "get_expand"),
     "get_expand_ym": (".schedules", "get_expand_ym"),
+    "year_month_days": (".schedules", "year_month_days"),
+    "get_days_ym": (".schedules", "get_days_ym"),
+    "clear_days_cache": (".schedules", "clear_days_cache"),
     # straddle parsing
     "ntr": (".schedules", "ntr"),
     "ntry": (".schedules", "ntry"),

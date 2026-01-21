@@ -129,12 +129,15 @@ def get_asset(path: str | Path, underlying: str) -> dict[str, Any] | None:
         load_amt(path)
     return _ASSET_BY_UNDERLYING.get(path_str, {}).get(underlying)
 
-
 def find_assets(path: str | Path, pattern: str, live_only: bool = False) -> dict[str, Any]:
     """Find all Underlying values matching a regex pattern."""
     rows = [[underlying] for _, underlying in _iter_assets(path, live_only=live_only, pattern=pattern)]
     return {"columns": ["asset"], "rows": rows}
 
+def assets(path: str | Path, live_only: bool = False, pattern: str = ".") -> dict[str, Any]:
+    """Get assets with their Underlying values."""
+    rows = [[underlying] for _, underlying in _iter_assets(path, live_only=live_only, pattern=pattern)]
+    return {"columns": ["asset"], "rows": rows}
 
 def cached_assets(path: str | Path) -> dict[str, Any]:
     """List all asset Underlying values from the cache."""
@@ -144,12 +147,6 @@ def cached_assets(path: str | Path) -> dict[str, Any]:
     assets = _ASSET_BY_UNDERLYING.get(path_str, {})
     rows = [[u] for u in assets.keys()]
     return { "columns": ["asset"], "rows": rows }
-
-def assets(path: str | Path, live_only: bool = False, pattern: str = ".") -> dict[str, Any]:
-    """Get assets with their Underlying values."""
-    rows = [[underlying] for _, underlying in _iter_assets(path, live_only=live_only, pattern=pattern)]
-    return {"columns": ["asset"], "rows": rows}
-
 
 def asset_class(path: str | Path, live_only: bool = False, pattern: str = ".") -> dict[str, Any]:
     """Get all live assets (WeightCap > 0) with their class and source information."""

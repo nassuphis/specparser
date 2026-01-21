@@ -191,6 +191,41 @@ def table_unique_rows(table: dict[str, Any]) -> dict[str, Any]:
     return {"columns": table["columns"], "rows": list(seen.values())}
 
 
+def table_head(table: dict[str, Any], n: int = 10) -> dict[str, Any]:
+    """
+    Return the first n rows of a table.
+
+    Args:
+        table: Dict with 'columns' and 'rows'
+        n: Number of rows to return (default 10)
+
+    Returns:
+        New table with only the first n rows
+    """
+    return {"columns": table["columns"], "rows": table["rows"][:n]}
+
+
+def table_sample(table: dict[str, Any], n: int = 10) -> dict[str, Any]:
+    """
+    Return a random sample of n rows from a table (without replacement).
+
+    If the table has fewer than n rows, returns all rows.
+
+    Args:
+        table: Dict with 'columns' and 'rows'
+        n: Number of rows to sample (default 10)
+
+    Returns:
+        New table with sampled rows
+    """
+    import random
+    rows = table["rows"]
+    if len(rows) <= n:
+        return {"columns": table["columns"], "rows": rows[:]}
+    sampled = random.sample(rows, n)
+    return {"columns": table["columns"], "rows": sampled}
+
+
 def table_join(*tables: dict[str, Any], key_col: int = 0) -> dict[str, Any]:
     """
     Join multiple tables by combining their columns.
@@ -233,6 +268,28 @@ def table_join(*tables: dict[str, Any], key_col: int = 0) -> dict[str, Any]:
     return {"columns": columns, "rows": rows}
 
 
+def _format_value(v: Any) -> str:
+    """Format a value for table output.
+
+    Numbers (float or numeric strings) are formatted to 3 significant figures.
+    Other values are converted to strings as-is.
+    """
+    if isinstance(v, float):
+        if v == 0:
+            return "0"
+        return f"{v:.3g}"
+    if isinstance(v, str):
+        # Try to parse as float and format if numeric
+        try:
+            f = float(v)
+            if f == 0:
+                return "0"
+            return f"{f:.3g}"
+        except ValueError:
+            pass
+    return str(v)
+
+
 def format_table(table: dict[str, Any]) -> str:
     """Format a table dict as a tab-separated string with header."""
     lines = []
@@ -242,7 +299,7 @@ def format_table(table: dict[str, Any]) -> str:
 
     # Rows
     for row in table["rows"]:
-        lines.append("\t".join(str(v) for v in row))
+        lines.append("\t".join(_format_value(v) for v in row))
 
     return "\n".join(lines)
 
@@ -254,4 +311,103 @@ def print_table(table: dict[str, Any]) -> None:
 
     # Rows
     for row in table["rows"]:
-        print("\t".join(str(v) for v in row))
+        print("\t".join(_format_value(v) for v in row))
+
+
+def _resolve_column_index(table: dict[str, Any], column: str | int) -> int:
+    """Convert column name or index to index, with validation.
+
+    Args:
+        table: Dict with 'columns' and 'rows'
+        column: Column name (str) or index (int)
+
+    Returns:
+        Column index
+
+    Raises:
+        ValueError: If column not found or index out of range
+    """
+    if isinstance(column, int):
+        if column < 0 or column >= len(table["columns"]):
+            raise ValueError(f"Column index {column} out of range")
+        return column
+    try:
+        return table["columns"].index(column)
+    except ValueError:
+        raise ValueError(f"Column '{column}' not found in table columns: {table['columns']}")
+
+
+def table_unchop(table: dict[str, Any], column: str | int) -> dict[str, Any]:
+    """Expand rows by unrolling a list-valued column into multiple rows.
+
+    Args:
+        table: Dict with 'columns' and 'rows'
+        column: Column name (str) or index (int) containing list values
+
+    Returns:
+        New table with expanded rows (one row per list element)
+
+    Notes:
+        - If a cell contains an empty list, that row is omitted from output
+        - If a cell is not a list, it's treated as a single-element list
+    """
+    col_idx = _resolve_column_index(table, column)
+
+    rows = []
+    for row in table["rows"]:
+        cell = row[col_idx]
+        # Handle non-list as single element
+        if not isinstance(cell, list):
+            rows.append(row[:])
+        elif len(cell) == 0:
+            # Empty list → skip row
+            continue
+        else:
+            # Expand: one output row per list element
+            for val in cell:
+                new_row = row[:col_idx] + [val] + row[col_idx + 1:]
+                rows.append(new_row)
+
+    return {"columns": table["columns"][:], "rows": rows}
+
+
+def table_chop(table: dict[str, Any], column: str | int) -> dict[str, Any]:
+    """Collapse rows by grouping on non-target columns and collecting target into lists.
+
+    Args:
+        table: Dict with 'columns' and 'rows'
+        column: Column name (str) or index (int) to collect into lists
+
+    Returns:
+        New table with grouped rows (target column values collected into lists)
+
+    Notes:
+        - Groups by all columns EXCEPT the target column
+        - Preserves order of first occurrence of each group
+        - Values are collected in the order they appear
+    """
+    col_idx = _resolve_column_index(table, column)
+
+    # Group by all columns except target
+    groups = {}  # key tuple -> [list of target values]
+    group_first_row = {}  # key tuple -> first row (for non-target values)
+
+    for row in table["rows"]:
+        # Build key from all columns except target
+        key = tuple(row[:col_idx] + row[col_idx + 1:])
+        target_val = row[col_idx]
+
+        if key not in groups:
+            groups[key] = []
+            group_first_row[key] = row
+        groups[key].append(target_val)
+
+    # Build output rows preserving order
+    rows = []
+    for key in groups:
+        first_row = group_first_row[key]
+        collected = groups[key]
+        new_row = first_row[:col_idx] + [collected] + first_row[col_idx + 1:]
+        rows.append(new_row)
+
+    return {"columns": table["columns"][:], "rows": rows}

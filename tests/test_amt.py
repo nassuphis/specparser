@@ -62,6 +62,7 @@ from specparser.amt import (
     find_tschemas,
     fut_spec2ticker,
     fut_norm2act,
+    fut_act2norm,
     clear_normalized_cache,
     _tschma_dict_expand_bbgfc,
     _tschma_dict_expand_split,
@@ -69,7 +70,28 @@ from specparser.amt import (
     find_tickers_ym,
     asset_straddle_tickers,
 )
-from specparser.amt.tickers import _parse_date_constraint, get_tickers_ym, _filter_straddle_tickers
+from specparser.amt.tickers import (
+    _parse_date_constraint,
+    get_tickers_ym,
+    _filter_straddle_tickers,
+    _compute_actions,
+    _anchor_day,
+    _nth_good_day_after,
+    _add_calendar_days,
+    _last_good_day_in_month,
+    _norm_cdf,
+    model_ES,
+    model_NS,
+    model_BS,
+    model_default,
+    MODEL_DISPATCH,
+    _get_rollforward_fields,
+    get_straddle_valuation,
+    _load_overrides,
+    _override_expiry,
+    _OVERRIDE_CACHE,
+)
+import specparser.amt.tickers as tickers_module
 
 
 # -------------------------------------
@@ -1067,6 +1089,55 @@ class TestTickers:
         result = fut_norm2act(chain_csv_file, "CLG2024 Comdty")
         assert result == "CL G24 Comdty"
 
+    def test_fut_act2norm(self, chain_csv_file):
+        """Test actual to normalized ticker lookup."""
+        clear_normalized_cache()
+        result = fut_act2norm(chain_csv_file, "CL F24 Comdty")
+        assert result == "CLF2024 Comdty"
+
+        # Non-existent
+        result = fut_act2norm(chain_csv_file, "NONEXISTENT")
+        assert result is None
+
+    def test_fut_act2norm_caching(self, chain_csv_file):
+        """Test that reverse CSV is cached."""
+        clear_normalized_cache()
+        # First call loads CSV
+        fut_act2norm(chain_csv_file, "CL F24 Comdty")
+        # Second call should use cache
+        result = fut_act2norm(chain_csv_file, "CL G24 Comdty")
+        assert result == "CLG2024 Comdty"
+
+    def test_fut_act2norm_and_norm2act_inverse(self, chain_csv_file):
+        """Test that fut_act2norm and fut_norm2act are inverses."""
+        clear_normalized_cache()
+        # Normalized -> Actual -> Normalized
+        normalized = "CLM2024 Comdty"
+        actual = fut_norm2act(chain_csv_file, normalized)
+        assert actual == "CL M24 Comdty"
+        back_to_normalized = fut_act2norm(chain_csv_file, actual)
+        assert back_to_normalized == normalized
+
+        # Actual -> Normalized -> Actual
+        actual2 = "CL Z24 Comdty"
+        normalized2 = fut_act2norm(chain_csv_file, actual2)
+        assert normalized2 == "CLZ2024 Comdty"
+        back_to_actual = fut_norm2act(chain_csv_file, normalized2)
+        assert back_to_actual == actual2
+
+    def test_clear_normalized_cache_clears_both(self, chain_csv_file):
+        """Test that clear_normalized_cache clears both forward and reverse caches."""
+        clear_normalized_cache()
+        # Populate both caches
+        fut_norm2act(chain_csv_file, "CLF2024 Comdty")
+        fut_act2norm(chain_csv_file, "CL F24 Comdty")
+        # Clear caches
+        clear_normalized_cache()
+        # Access internal caches to verify they're cleared
+        from specparser.amt.tickers import _NORMALIZED_CACHE, _ACTUAL_CACHE
+        assert chain_csv_file not in _NORMALIZED_CACHE or str(chain_csv_file) not in _NORMALIZED_CACHE
+        assert chain_csv_file not in _ACTUAL_CACHE or str(chain_csv_file) not in _ACTUAL_CACHE
+
     def test_tschma_dict_expand_bbgfc(self):
         """Test expanding BBGfc row."""
         row = {
@@ -1228,7 +1299,7 @@ class TestTickerExpansion:
         """Test asset_straddle_tickers returns correct format."""
         clear_cache()
         clear_normalized_cache()
-        table = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 0)
+        table = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         # Output columns (cls and type removed, straddle after asset)
         assert table["columns"] == ["asset", "straddle", "param", "source", "ticker", "field"]
         assert len(table["rows"]) > 0
@@ -1243,8 +1314,8 @@ class TestTickerExpansion:
         clear_normalized_cache()
         # CL Comdty has 2 schedule components (monthly_std)
         # Index 0 and 2 should give same result
-        table0 = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 0)
-        table2 = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 2)
+        table0 = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        table2 = asset_straddle_tickers("CL Comdty", 2024, 6, 2, test_amt_file, chain_csv_file)
         # Should be same straddle (0 % 2 == 2 % 2), straddle is at index 1
         assert table0["rows"][0][1] == table2["rows"][0][1]
 
@@ -1252,8 +1323,8 @@ class TestTickerExpansion:
         """Test asset_straddle_tickers with different index gives different straddle."""
         clear_cache()
         clear_normalized_cache()
-        table0 = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 0)
-        table1 = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 1)
+        table0 = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        table1 = asset_straddle_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
         # Should be different straddles, straddle is at index 1
         assert table0["rows"][0][1] != table1["rows"][0][1]
 
@@ -1278,7 +1349,7 @@ amt:
             clear_cache()
             clear_normalized_cache()
             # Asset has no Options field - returns placeholder straddle with empty values
-            table = asset_straddle_tickers(path, "NO_SCHED Test", 2024, 6, None, 0)
+            table = asset_straddle_tickers("NO_SCHED Test", 2024, 6, 0, path, None)
             assert len(table["rows"]) > 0
             # Straddle has empty ntrc, ntrv, xprc, xprv, wgt (straddle is at index 1)
             straddle = table["rows"][0][1]
@@ -1293,7 +1364,7 @@ amt:
         """Test that straddle string in result is valid."""
         clear_cache()
         clear_normalized_cache()
-        table = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 0)
+        table = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         straddle = table["rows"][0][1]  # straddle is at index 1
         # Verify straddle format by parsing it (use s[1:-1] to preserve empty parts)
         parts = straddle[1:-1].split("|")
@@ -1458,7 +1529,7 @@ class TestStraddleTickerFiltering:
         clear_cache()
         clear_normalized_cache()
         # Index 0 should be an N straddle (first schedule entry is N1_OVERRIDE15)
-        table = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 0)
+        table = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         # Check straddle has ntrc=N (straddle is at index 1)
         straddle = table["rows"][0][1]
         parts = straddle[1:-1].split("|")
@@ -1473,7 +1544,7 @@ class TestStraddleTickerFiltering:
         clear_cache()
         clear_normalized_cache()
         # Index 1 should be an F straddle (second schedule entry is Fa_OVERRIDEb_0.5)
-        table = asset_straddle_tickers(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file, 1)
+        table = asset_straddle_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
         # Check straddle has ntrc=F (straddle is at index 1)
         straddle = table["rows"][0][1]
         parts = straddle[1:-1].split("|")
@@ -1482,6 +1553,783 @@ class TestStraddleTickerFiltering:
         # Check Vol row has param "vol" (param is at index 2)
         vol_rows = [r for r in table["rows"] if r[2] == "vol"]
         assert len(vol_rows) == 1
+
+
+# -------------------------------------
+# Action Column Tests
+# -------------------------------------
+
+class TestComputeActions:
+    """Tests for _compute_actions function."""
+
+    def test_default_action_unknown_xprc(self):
+        """Test that unknown xprc returns all default actions."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],
+            ["A", "s", "2024-01-02", "11", "101"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "5", "UNKNOWN", "15")
+        assert all(a == "-" for a in actions)
+
+    def test_override_without_underlying_returns_no_actions(self):
+        """Test that OVERRIDE without underlying parameter returns all default actions."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],
+            ["A", "s", "2024-01-02", "11", "101"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # OVERRIDE without underlying should fail lookup and return no actions
+        actions = _compute_actions(rows, columns, "N", "5", "OVERRIDE", "15", ntry=2024, ntrm=1)
+        assert all(a == "-" for a in actions)
+
+    def test_bd_trigger_at_exact_threshold(self):
+        """Test BD trigger fires at exact threshold."""
+        # xprc = "BD", ntrv = "2", xprv = "3" → threshold = 5
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],
+            ["A", "s", "2024-01-02", "11", "101"],
+            ["A", "s", "2024-01-03", "12", "102"],
+            ["A", "s", "2024-01-04", "13", "103"],
+            ["A", "s", "2024-01-05", "14", "104"],  # 5th valid day
+            ["A", "s", "2024-01-06", "15", "105"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "2", "BD", "3", ntry=2024, ntrm=1)
+        assert actions == ["-", "-", "-", "-", "ntry", "-"]
+
+    def test_bd_missing_data_finds_next_good_day(self):
+        """Test that when target date has missing data, next good day is used."""
+        # January 2024: 1st BD=Jan 1, 2nd BD=Jan 2
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],   # 1st BD
+            ["A", "s", "2024-01-02", "11", "101"],   # 2nd BD = anchor
+            ["A", "s", "2024-01-03", "none", "102"], # target (anchor+1) - BAD
+            ["A", "s", "2024-01-04", "13", "103"],   # first good at/after target - ntry!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # BD/2: anchor = 2024-01-02, ntrv=1: target = 2024-01-03, first good = 2024-01-04
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "2", ntry=2024, ntrm=1)
+        assert actions == ["-", "-", "-", "ntry"]
+
+    def test_bd_threshold_never_reached(self):
+        """Test that no action when threshold never reached."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],
+            ["A", "s", "2024-01-02", "11", "101"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "5", "BD", "5")  # threshold = 10
+        assert actions == ["-", "-"]
+
+    def test_invalid_ntrv_xprv_values(self):
+        """Test that non-numeric ntrv/xprv returns default actions."""
+        rows = [["A", "s", "2024-01-01", "10", "100"]]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "abc", "BD", "5")
+        assert actions == ["-"]
+
+    def test_empty_ntrv(self):
+        """Test that empty ntrv returns default actions."""
+        rows = [["A", "s", "2024-01-01", "10", "100"]]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "", "BD", "5")
+        assert actions == ["-"]
+
+    def test_empty_xprv(self):
+        """Test that empty xprv returns default actions."""
+        rows = [["A", "s", "2024-01-01", "10", "100"]]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "5", "BD", "")
+        assert actions == ["-"]
+
+    def test_missing_vol_column(self):
+        """Test that missing vol column returns default actions."""
+        rows = [["A", "s", "2024-01-01", "100"]]
+        columns = ["asset", "straddle", "date", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "1")
+        assert actions == ["-"]
+
+    def test_missing_hedge_column(self):
+        """Test that missing hedge column returns default actions."""
+        rows = [["A", "s", "2024-01-01", "10"]]
+        columns = ["asset", "straddle", "date", "vol"]
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "1")
+        assert actions == ["-"]
+
+    def test_multiple_hedges_all_must_be_valid(self):
+        """Test that ALL hedge columns must be valid for a good day."""
+        # January 2024: 1st BD=Jan 1, 2nd BD=Jan 2
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100", "200"],   # 1st BD
+            ["A", "s", "2024-01-02", "11", "101", "201"],   # 2nd BD = anchor
+            ["A", "s", "2024-01-03", "12", "102", "none"],  # target - BAD (hedge1 missing)
+            ["A", "s", "2024-01-04", "13", "none", "203"],  # BAD (hedge missing)
+            ["A", "s", "2024-01-05", "14", "104", "204"],   # first good at/after target - ntry!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge", "hedge1"]
+        # BD/2: anchor = 2024-01-02, ntrv=1: target = 2024-01-03
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "2", ntry=2024, ntrm=1)
+        assert actions == ["-", "-", "-", "-", "ntry"]
+
+    def test_multiple_hedges_with_hedge2(self):
+        """Test with hedge, hedge1, hedge2 - all three must be valid."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100", "200", "300"],   # valid (1)
+            ["A", "s", "2024-01-02", "11", "101", "201", "none"],  # invalid - hedge2 missing
+            ["A", "s", "2024-01-03", "12", "102", "202", "302"],   # valid (2) - trigger!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge", "hedge1", "hedge2"]
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "1", ntry=2024, ntrm=1)  # threshold = 2
+        assert actions == ["-", "-", "ntry"]
+
+    def test_empty_rows(self):
+        """Test with empty rows list."""
+        rows = []
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "1")
+        assert actions == []
+
+    def test_threshold_of_one(self):
+        """Test threshold of 1 triggers on first valid day."""
+        rows = [
+            ["A", "s", "2024-01-01", "none", "100"],  # invalid - vol missing
+            ["A", "s", "2024-01-02", "11", "101"],    # valid (1) - trigger!
+            ["A", "s", "2024-01-03", "12", "102"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "0", "BD", "1", ntry=2024, ntrm=1)  # threshold = 1
+        assert actions == ["-", "ntry", "-"]
+
+    # --- Rule 2: xpry action tests ---
+
+    def test_xpry_trigger_at_expiry_month(self):
+        """Test xpry trigger at anchor (Nth BD) of expiry month."""
+        # Entry month: 2024-01, Expiry month: 2024-02
+        # BD/3: 3rd BD of January 2024 is 2024-01-03 (1=Jan 1, 2=Jan 2, 3=Jan 3)
+        # BD/3: 3rd BD of February 2024 is 2024-02-05 (1=Feb 1, 2=Feb 2, 3=Feb 5)
+        rows = [
+            ["A", "s", "2024-01-02", "10", "100"],  # 2nd BD Jan
+            ["A", "s", "2024-01-03", "11", "101"],  # 3rd BD Jan = anchor, target = anchor + 0 - ntry!
+            ["A", "s", "2024-02-01", "12", "102"],  # 1st BD Feb
+            ["A", "s", "2024-02-02", "13", "103"],  # 2nd BD Feb
+            ["A", "s", "2024-02-05", "14", "104"],  # 3rd BD Feb = expiry anchor - xpry!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # BD/3: entry anchor = 3rd BD Jan = 2024-01-03, ntrv=0: target = anchor
+        # xpry anchor = 3rd BD Feb = 2024-02-05
+        actions = _compute_actions(rows, columns, "N", "0", "BD", "3", xpry=2024, xprm=2, ntry=2024, ntrm=1)
+        assert actions == ["-", "ntry", "-", "-", "xpry"]
+
+    def test_xpry_with_missing_data(self):
+        """Test xpry trigger skips invalid days in expiry month."""
+        rows = [
+            ["A", "s", "2024-02-01", "11", "101"],   # expiry: valid (1)
+            ["A", "s", "2024-02-02", "none", "102"], # expiry: invalid (vol missing)
+            ["A", "s", "2024-02-03", "13", "none"],  # expiry: invalid (hedge missing)
+            ["A", "s", "2024-02-04", "14", "104"],   # expiry: valid (2) - xpry trigger!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # ntry threshold = 10+2 = 12 (never reached)
+        # xpry threshold = 2 (fires on 2024-02-04)
+        actions = _compute_actions(rows, columns, "N", "10", "BD", "2", xpry=2024, xprm=2)
+        assert actions == ["-", "-", "-", "xpry"]
+
+    def test_xpry_threshold_never_reached(self):
+        """Test no xpry when threshold never reached."""
+        rows = [
+            ["A", "s", "2024-02-01", "10", "100"],
+            ["A", "s", "2024-02-02", "11", "101"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # xpry threshold = 10 (never reached)
+        actions = _compute_actions(rows, columns, "N", "5", "BD", "10", xpry=2024, xprm=2)
+        assert actions == ["-", "-"]
+
+    def test_xpry_without_xpry_xprm_params(self):
+        """Test that xpry rule is skipped when xpry/xprm not provided."""
+        rows = [
+            ["A", "s", "2024-02-01", "10", "100"],
+            ["A", "s", "2024-02-02", "11", "101"],
+            ["A", "s", "2024-02-03", "12", "102"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # Without xpry/xprm, only ntry rule applies
+        # ntry threshold = 1+2 = 3 (fires on 2024-02-03)
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "2", ntry=2024, ntrm=2)
+        assert actions == ["-", "-", "ntry"]
+
+    def test_xpry_both_ntry_and_xpry_trigger(self):
+        """Test both ntry and xpry can trigger in same data set."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],  # valid (1)
+            ["A", "s", "2024-01-02", "11", "101"],  # valid (2)
+            ["A", "s", "2024-01-03", "12", "102"],  # valid (3) - ntry trigger!
+            ["A", "s", "2024-02-01", "13", "103"],  # expiry: valid (1)
+            ["A", "s", "2024-02-02", "14", "104"],  # expiry: valid (2) - xpry trigger!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # ntry threshold = 1+2 = 3 (fires on 2024-01-03)
+        # xpry threshold = 2 (fires on 2024-02-02)
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "2", xpry=2024, xprm=2, ntry=2024, ntrm=1)
+        assert actions == ["-", "-", "ntry", "-", "xpry"]
+
+    def test_xpry_multiple_hedges(self):
+        """Test xpry trigger with multiple hedge columns."""
+        rows = [
+            ["A", "s", "2024-02-01", "10", "100", "200"],   # valid (1)
+            ["A", "s", "2024-02-02", "11", "101", "none"],  # invalid - hedge1 missing
+            ["A", "s", "2024-02-03", "12", "102", "202"],   # valid (2) - xpry trigger!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge", "hedge1"]
+        # xpry threshold = 2
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "2", xpry=2024, xprm=2)
+        assert actions == ["-", "-", "xpry"]
+
+    def test_xpry_expiry_month_not_in_data(self):
+        """Test xpry when expiry month dates not in data (all dates before)."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],
+            ["A", "s", "2024-01-02", "11", "101"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # Expiry month is 2024-02 but data only has January
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "1", xpry=2024, xprm=2, ntry=2024, ntrm=1)
+        # ntry threshold = 2, fires on 2024-01-02
+        # xpry never starts counting (no dates >= 2024-02-01)
+        assert actions == ["-", "ntry"]
+
+    def test_xpry_threshold_of_one(self):
+        """Test xpry threshold of 1 triggers on first valid day of expiry month."""
+        rows = [
+            ["A", "s", "2024-01-31", "10", "100"],
+            ["A", "s", "2024-02-01", "none", "101"],  # invalid - vol missing
+            ["A", "s", "2024-02-02", "12", "102"],    # valid (1) - xpry trigger!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # xpry threshold = 1
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "1", xpry=2024, xprm=2)
+        # ntry threshold = 2, but only 1 valid before expiry month
+        assert actions == ["-", "-", "xpry"]
+
+    # --- Rule 3 & 4: F/R/W weekday action tests ---
+
+    def test_friday_expiry_trigger_on_anchor(self):
+        """Test Rule 3: F (Friday) expiry trigger when anchor is a good day."""
+        # 3rd Friday of June 2024 is 2024-06-21
+        rows = [
+            ["A", "s", "2024-06-19", "10", "100"],  # Wednesday
+            ["A", "s", "2024-06-20", "11", "101"],  # Thursday
+            ["A", "s", "2024-06-21", "12", "102"],  # Friday (3rd) - anchor, good day - xpry!
+            ["A", "s", "2024-06-24", "13", "103"],  # Monday
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "0", "F", "3", xpry=2024, xprm=6, ntry=2024, ntrm=6)
+        # Rule 3: anchor (2024-06-21) is good, so xpry on anchor
+        # Rule 4: anchor (2024-06-21) is good, ntrv=0 means act on anchor, so ntry on anchor too
+        # Both rules point to same day, xpry wins since processed second (overwrites ntry)
+        assert actions[2] == "xpry"
+
+    def test_friday_expiry_trigger_next_good_day(self):
+        """Test Rule 3: F (Friday) expiry trigger when anchor is not a good day."""
+        # 3rd Friday of June 2024 is 2024-06-21
+        rows = [
+            ["A", "s", "2024-06-19", "10", "100"],  # Wednesday
+            ["A", "s", "2024-06-20", "11", "101"],  # Thursday
+            ["A", "s", "2024-06-21", "none", "102"],  # Friday (3rd) - anchor, BAD (vol missing)
+            ["A", "s", "2024-06-24", "13", "103"],  # Monday - next good day - xpry!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "0", "F", "3", xpry=2024, xprm=6, ntry=2024, ntrm=6)
+        # Rule 3: anchor (2024-06-21) is bad, next good day is 2024-06-24, xpry there
+        # Rule 4: anchor (2024-06-21) is bad, next good day is 2024-06-24, ntrv=0 means Day 0
+        # Both rules point to same day, xpry wins since processed second (overwrites ntry)
+        assert actions[3] == "xpry"
+
+    def test_thursday_entry_trigger_with_offset(self):
+        """Test R (Thursday) entry trigger with ntrv calendar day offset."""
+        # 2nd Thursday of May 2024 is 2024-05-09
+        rows = [
+            ["A", "s", "2024-05-08", "10", "100"],  # Wednesday
+            ["A", "s", "2024-05-09", "11", "101"],  # Thursday (2nd) - anchor
+            ["A", "s", "2024-05-10", "12", "102"],  # Friday
+            ["A", "s", "2024-05-11", "none", "none"],  # Saturday - target (anchor + 2) - no data
+            ["A", "s", "2024-05-13", "14", "104"],  # Monday - first good day at/after target - ntry!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # ntrv = "2" means anchor + 2 calendar days = 2024-05-11 (Sat, no data), first good = Monday
+        actions = _compute_actions(rows, columns, "N", "2", "R", "2", xpry=2024, xprm=6, ntry=2024, ntrm=5)
+        # anchor = 2024-05-09, target = 2024-05-11, first good at/after = 2024-05-13
+        assert actions == ["-", "-", "-", "-", "ntry"]
+
+    def test_wednesday_expiry_5th_weekday_not_exist(self):
+        """Test Rule 3: W (Wednesday) when 5th Wednesday doesn't exist - no action."""
+        # June 2024 has only 4 Wednesdays (5th, 12th, 19th, 26th)
+        rows = [
+            ["A", "s", "2024-06-19", "10", "100"],
+            ["A", "s", "2024-06-26", "11", "101"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # xprv = "5" → 5th Wednesday doesn't exist
+        actions = _compute_actions(rows, columns, "N", "0", "W", "5", xpry=2024, xprm=6, ntry=2024, ntrm=6)
+        # No anchor found → no action
+        assert actions == ["-", "-"]
+
+    def test_friday_entry_and_expiry_different_months(self):
+        """Test F entry and expiry with calendar day offset in different months."""
+        # 3rd Friday of May 2024 is 2024-05-17
+        # 3rd Friday of June 2024 is 2024-06-21
+        rows = [
+            ["A", "s", "2024-05-15", "10", "100"],  # Wed
+            ["A", "s", "2024-05-16", "11", "101"],  # Thu
+            ["A", "s", "2024-05-17", "12", "102"],  # Fri (3rd) - entry anchor
+            ["A", "s", "2024-05-18", "13", "103"],  # Sat - target (anchor + 1 day) - ntry! (good day)
+            ["A", "s", "2024-06-19", "14", "104"],  # Wed
+            ["A", "s", "2024-06-20", "15", "105"],  # Thu
+            ["A", "s", "2024-06-21", "16", "106"],  # Fri (3rd) - expiry anchor - xpry!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # ntrv = "1" → anchor + 1 calendar day = 2024-05-18, first good at/after
+        actions = _compute_actions(rows, columns, "N", "1", "F", "3", xpry=2024, xprm=6, ntry=2024, ntrm=5)
+        assert actions[3] == "ntry"  # 2024-05-18
+        assert actions[6] == "xpry"  # 2024-06-21
+
+    def test_friday_anchor_with_calendar_offset(self):
+        """Test F anchor with calendar day offset."""
+        # 2nd Friday of May 2024 is 2024-05-10
+        rows = [
+            ["A", "s", "2024-05-09", "10", "100"],  # Thu
+            ["A", "s", "2024-05-10", "11", "101"],  # Fri (2nd) - anchor
+            ["A", "s", "2024-05-11", "12", "102"],  # Sat - target (anchor + 1 day) - ntry! (good day)
+            ["A", "s", "2024-05-13", "13", "103"],  # Mon
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # ntrv = "1" → anchor + 1 calendar day = 2024-05-11, first good at/after
+        actions = _compute_actions(rows, columns, "N", "1", "F", "2", xpry=2024, xprm=6, ntry=2024, ntrm=5)
+        # anchor = 2024-05-10, target = 2024-05-11, first good at/after = 2024-05-11
+        assert actions == ["-", "-", "ntry", "-"]
+
+    def test_bd_entry_with_calendar_offset(self):
+        """Test BD rule entry with calendar day offset."""
+        # January 2024: 1st BD=Jan 1, 2nd BD=Jan 2
+        # February 2024: 1st BD=Feb 1, 2nd BD=Feb 2
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],  # 1st BD
+            ["A", "s", "2024-01-02", "11", "101"],  # 2nd BD = anchor
+            ["A", "s", "2024-01-03", "12", "102"],  # anchor + 1 day - ntry!
+            ["A", "s", "2024-02-02", "13", "103"],  # expiry month: 2nd BD - xpry!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        # BD/2: anchor = 2nd business day of January = 2024-01-02
+        # ntrv = "1": target = anchor + 1 = 2024-01-03
+        actions = _compute_actions(rows, columns, "N", "1", "BD", "2", xpry=2024, xprm=2, ntry=2024, ntrm=1)
+        assert actions == ["-", "-", "ntry", "xpry"]
+
+    def test_frw_with_month_limit_expiry(self):
+        """Test F/R/W rule with expiry month limit - no good day in expiry month."""
+        # 3rd Friday of June 2024 is 2024-06-21
+        rows = [
+            ["A", "s", "2024-06-21", "none", "100"],  # Fri (3rd) - anchor BAD
+            ["A", "s", "2024-06-24", "none", "101"],  # Mon - BAD
+            ["A", "s", "2024-06-28", "none", "102"],  # Fri - BAD (last weekday of June)
+            ["A", "s", "2024-07-01", "13", "103"],  # July - outside expiry month!
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+        actions = _compute_actions(rows, columns, "N", "0", "F", "3", xpry=2024, xprm=6, ntry=2024, ntrm=5)
+        # No good day in expiry month after anchor, so no xpry
+        # ntry would use May anchor (not in data), so no ntry either
+        assert actions == ["-", "-", "-", "-"]
+
+
+class TestAnchorDay:
+    """Tests for _anchor_day helper function."""
+
+    def test_friday_3rd_june_2024(self):
+        """Test 3rd Friday of June 2024."""
+        result = _anchor_day("F", "3", 2024, 6)
+        assert result == "2024-06-21"
+
+    def test_thursday_2nd_may_2024(self):
+        """Test 2nd Thursday of May 2024."""
+        result = _anchor_day("R", "2", 2024, 5)
+        assert result == "2024-05-09"
+
+    def test_wednesday_1st_jan_2024(self):
+        """Test 1st Wednesday of January 2024."""
+        result = _anchor_day("W", "1", 2024, 1)
+        assert result == "2024-01-03"
+
+    def test_friday_5th_not_exist(self):
+        """Test 5th Friday doesn't exist in June 2024."""
+        result = _anchor_day("F", "5", 2024, 6)
+        assert result is None
+
+    def test_invalid_xprc(self):
+        """Test invalid xprc returns None."""
+        assert _anchor_day("X", "3", 2024, 6) is None
+        assert _anchor_day("", "3", 2024, 6) is None
+
+    def test_bd_anchor_day(self):
+        """Test BD code returns Nth business day."""
+        # June 2024: 1=Sat, 3=Mon(1st BD), 4=Tue(2nd BD), 5=Wed(3rd BD)
+        assert _anchor_day("BD", "1", 2024, 6) == "2024-06-03"  # 1st BD = Mon June 3
+        assert _anchor_day("BD", "3", 2024, 6) == "2024-06-05"  # 3rd BD = Wed June 5
+        assert _anchor_day("BD", "10", 2024, 6) == "2024-06-14"  # 10th BD
+
+    def test_invalid_xprv(self):
+        """Test invalid xprv returns None."""
+        assert _anchor_day("F", "0", 2024, 6) is None
+        assert _anchor_day("F", "-1", 2024, 6) is None
+        assert _anchor_day("F", "abc", 2024, 6) is None
+        assert _anchor_day("F", "", 2024, 6) is None
+
+    def test_friday_4th_in_month_with_5_fridays(self):
+        """Test 4th Friday in month with 5 Fridays (August 2024)."""
+        # August 2024: Fridays on 2, 9, 16, 23, 30
+        result = _anchor_day("F", "4", 2024, 8)
+        assert result == "2024-08-23"
+        result = _anchor_day("F", "5", 2024, 8)
+        assert result == "2024-08-30"
+
+
+class TestAddCalendarDays:
+    """Tests for _add_calendar_days helper function."""
+
+    def test_add_zero_days(self):
+        """Test adding 0 days returns same date."""
+        result = _add_calendar_days("2024-01-19", 0)
+        assert result == "2024-01-19"
+
+    def test_add_ten_days(self):
+        """Test adding 10 days."""
+        result = _add_calendar_days("2024-01-19", 10)
+        assert result == "2024-01-29"
+
+    def test_add_days_across_month(self):
+        """Test adding days that cross month boundary."""
+        result = _add_calendar_days("2024-01-25", 10)
+        assert result == "2024-02-04"
+
+    def test_add_days_across_year(self):
+        """Test adding days that cross year boundary."""
+        result = _add_calendar_days("2024-12-25", 10)
+        assert result == "2025-01-04"
+
+
+class TestLastGoodDayInMonth:
+    """Tests for _last_good_day_in_month helper function."""
+
+    def test_last_good_day_basic(self):
+        """Test finding last good day in month."""
+        rows = [
+            ["A", "s", "2024-01-29", "10", "100"],  # good (idx 0)
+            ["A", "s", "2024-01-30", "11", "101"],  # good (idx 1)
+            ["A", "s", "2024-01-31", "12", "102"],  # good (idx 2) - last
+        ]
+        # vol_idx=3, hedge_indices=[4], date_idx=2
+        result = _last_good_day_in_month(rows, 3, [4], 2, 2024, 1)
+        assert result == 2
+
+    def test_last_good_day_skips_invalid(self):
+        """Test that invalid days at end are skipped."""
+        rows = [
+            ["A", "s", "2024-01-29", "10", "100"],     # good (idx 0)
+            ["A", "s", "2024-01-30", "11", "101"],     # good (idx 1) - last good
+            ["A", "s", "2024-01-31", "none", "102"],   # invalid
+        ]
+        result = _last_good_day_in_month(rows, 3, [4], 2, 2024, 1)
+        assert result == 1
+
+    def test_last_good_day_no_good_days(self):
+        """Test when no good days exist in month."""
+        rows = [
+            ["A", "s", "2024-01-29", "none", "100"],
+            ["A", "s", "2024-01-30", "none", "101"],
+            ["A", "s", "2024-01-31", "none", "102"],
+        ]
+        result = _last_good_day_in_month(rows, 3, [4], 2, 2024, 1)
+        assert result is None
+
+    def test_last_good_day_respects_month_boundary(self):
+        """Test that only days in specified month are considered."""
+        rows = [
+            ["A", "s", "2024-01-31", "10", "100"],  # good - January
+            ["A", "s", "2024-02-01", "11", "101"],  # good - February (different month)
+        ]
+        result = _last_good_day_in_month(rows, 3, [4], 2, 2024, 1)
+        assert result == 0  # Only January day
+
+
+class TestNthGoodDayAfter:
+    """Tests for _nth_good_day_after helper function."""
+
+    def test_n_zero_anchor_is_good(self):
+        """Test n=0 returns anchor when anchor is good."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],  # anchor - good
+            ["A", "s", "2024-01-02", "11", "101"],
+        ]
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-01", 0)
+        assert result == 0
+
+    def test_n_zero_anchor_is_bad(self):
+        """Test n=0 returns first good day after anchor when anchor is bad."""
+        rows = [
+            ["A", "s", "2024-01-01", "none", "100"],  # anchor - bad
+            ["A", "s", "2024-01-02", "11", "101"],    # first good day (Day 0)
+        ]
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-01", 0)
+        assert result == 1
+
+    def test_n_one_after_good_anchor(self):
+        """Test n=1 returns 1st good day after Day 0."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],  # anchor - good (Day 0)
+            ["A", "s", "2024-01-02", "11", "101"],  # Day 1
+        ]
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-01", 1)
+        assert result == 1
+
+    def test_n_one_after_bad_anchor(self):
+        """Test n=1 returns 1st good day after Day 0 when anchor is bad."""
+        rows = [
+            ["A", "s", "2024-01-01", "none", "100"],  # anchor - bad
+            ["A", "s", "2024-01-02", "11", "101"],    # Day 0 (first good after anchor)
+            ["A", "s", "2024-01-03", "12", "102"],    # Day 1
+        ]
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-01", 1)
+        assert result == 2
+
+    def test_n_two_skips_invalid(self):
+        """Test n=2 correctly skips invalid days."""
+        rows = [
+            ["A", "s", "2024-01-01", "10", "100"],   # anchor - good (Day 0)
+            ["A", "s", "2024-01-02", "none", "101"], # invalid
+            ["A", "s", "2024-01-03", "12", "102"],   # Day 1
+            ["A", "s", "2024-01-04", "13", "103"],   # Day 2
+        ]
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-01", 2)
+        assert result == 3
+
+    def test_respects_month_limit(self):
+        """Test that searching stops at month_limit."""
+        rows = [
+            ["A", "s", "2024-01-30", "10", "100"],  # anchor - good (Day 0)
+            ["A", "s", "2024-01-31", "11", "101"],  # Day 1
+            ["A", "s", "2024-02-01", "12", "102"],  # outside limit
+        ]
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-30", 2, "2024-01-31")
+        assert result is None  # Not enough days within limit
+
+    def test_anchor_not_in_data(self):
+        """Test when anchor date is not in data (all dates after)."""
+        rows = [
+            ["A", "s", "2024-01-05", "10", "100"],  # first date in data
+            ["A", "s", "2024-01-06", "11", "101"],
+        ]
+        # anchor is 2024-01-01, not in data, first date >= anchor is 2024-01-05
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-01", 0)
+        assert result == 0  # First good day at/after anchor
+
+    def test_negative_n(self):
+        """Test negative n returns None."""
+        rows = [["A", "s", "2024-01-01", "10", "100"]]
+        result = _nth_good_day_after(rows, 3, [4], 2, "2024-01-01", -1)
+        assert result is None
+
+
+# -------------------------------------
+# Strike Columns
+# -------------------------------------
+
+class TestStrikeColumns:
+    """Tests for strike columns (strike_vol, strike, strike1, ...) in get_straddle_days output."""
+
+    def _make_mock_output(self, actions):
+        """Create mock get_straddle_days output (before strike columns are added).
+
+        Returns rows with: asset, straddle, date, vol, hedge, hedge1, action, model
+        """
+        columns = ["asset", "straddle", "date", "vol", "hedge", "hedge1", "action", "model"]
+        rows = [
+            ["A", "s", "2024-01-01", "10.0", "100.0", "1.0", actions[0], "BS"],
+            ["A", "s", "2024-01-02", "11.0", "101.0", "1.1", actions[1], "BS"],
+            ["A", "s", "2024-01-03", "12.0", "102.0", "1.2", actions[2], "BS"],
+            ["A", "s", "2024-01-04", "13.0", "103.0", "1.3", actions[3], "BS"],
+            ["A", "s", "2024-01-05", "14.0", "104.0", "1.4", actions[4], "BS"],
+        ]
+        return {"columns": columns, "rows": rows}
+
+    def _add_strike_columns(self, table):
+        """Add strike columns to a table (simulates the logic in get_straddle_days)."""
+        out_columns = table["columns"][:]
+        out_rows = [row[:] for row in table["rows"]]
+
+        # Find action column to get ntry/xpry indices
+        action_idx = out_columns.index("action")
+        ntry_idx = None
+        xpry_idx = None
+        for i, row in enumerate(out_rows):
+            if row[action_idx] == "ntry":
+                ntry_idx = i
+            elif row[action_idx] == "xpry":
+                xpry_idx = i
+
+        # Find vol and hedge column indices
+        vol_col_idx = out_columns.index("vol") if "vol" in out_columns else None
+        hedge_col_indices = []
+        for i, col in enumerate(out_columns):
+            if col == "hedge" or (col.startswith("hedge") and col[5:].isdigit()):
+                hedge_col_indices.append(i)
+
+        # Get strike values from ntry row
+        if ntry_idx is not None and vol_col_idx is not None:
+            strike_vol_value = out_rows[ntry_idx][vol_col_idx]
+            strike_values = [out_rows[ntry_idx][idx] for idx in hedge_col_indices]
+        else:
+            strike_vol_value = "-"
+            strike_values = ["-"] * len(hedge_col_indices)
+
+        # Add strike_vol column
+        for i, row in enumerate(out_rows):
+            in_range = (ntry_idx is not None and i >= ntry_idx and
+                        (xpry_idx is None or i <= xpry_idx))
+            row.append(strike_vol_value if in_range else "-")
+        out_columns.append("strike_vol")
+
+        # Add strike columns
+        for j in range(len(hedge_col_indices)):
+            strike_col_name = "strike" if j == 0 else f"strike{j}"
+            for i, row in enumerate(out_rows):
+                in_range = (ntry_idx is not None and i >= ntry_idx and
+                            (xpry_idx is None or i <= xpry_idx))
+                row.append(strike_values[j] if in_range else "-")
+            out_columns.append(strike_col_name)
+
+        return {"columns": out_columns, "rows": out_rows}
+
+    def test_strike_columns_basic(self):
+        """Verify strike_vol and strike columns are added with correct values from ntry row."""
+        # ntry at row 1, xpry at row 3
+        table = self._make_mock_output(["-", "ntry", "-", "xpry", "-"])
+        result = self._add_strike_columns(table)
+
+        assert "strike_vol" in result["columns"]
+        assert "strike" in result["columns"]
+        assert "strike1" in result["columns"]
+
+        # Strike values should come from ntry row (row 1)
+        strike_vol_idx = result["columns"].index("strike_vol")
+        strike_idx = result["columns"].index("strike")
+        strike1_idx = result["columns"].index("strike1")
+
+        # Row 1 (ntry): vol=11.0, hedge=101.0, hedge1=1.1
+        assert result["rows"][1][strike_vol_idx] == "11.0"
+        assert result["rows"][1][strike_idx] == "101.0"
+        assert result["rows"][1][strike1_idx] == "1.1"
+
+    def test_strike_columns_before_ntry(self):
+        """Verify all strike columns show '-' before ntry."""
+        # ntry at row 2, xpry at row 4
+        table = self._make_mock_output(["-", "-", "ntry", "-", "xpry"])
+        result = self._add_strike_columns(table)
+
+        strike_vol_idx = result["columns"].index("strike_vol")
+        strike_idx = result["columns"].index("strike")
+        strike1_idx = result["columns"].index("strike1")
+
+        # Rows 0, 1 are before ntry - should be "-"
+        assert result["rows"][0][strike_vol_idx] == "-"
+        assert result["rows"][0][strike_idx] == "-"
+        assert result["rows"][0][strike1_idx] == "-"
+        assert result["rows"][1][strike_vol_idx] == "-"
+        assert result["rows"][1][strike_idx] == "-"
+        assert result["rows"][1][strike1_idx] == "-"
+
+    def test_strike_columns_after_xpry(self):
+        """Verify all strike columns show '-' after xpry."""
+        # ntry at row 1, xpry at row 3
+        table = self._make_mock_output(["-", "ntry", "-", "xpry", "-"])
+        result = self._add_strike_columns(table)
+
+        strike_vol_idx = result["columns"].index("strike_vol")
+        strike_idx = result["columns"].index("strike")
+        strike1_idx = result["columns"].index("strike1")
+
+        # Row 4 is after xpry - should be "-"
+        assert result["rows"][4][strike_vol_idx] == "-"
+        assert result["rows"][4][strike_idx] == "-"
+        assert result["rows"][4][strike1_idx] == "-"
+
+    def test_strike_columns_in_range(self):
+        """Verify strike columns show values from ntry to xpry (inclusive)."""
+        # ntry at row 1, xpry at row 3
+        table = self._make_mock_output(["-", "ntry", "-", "xpry", "-"])
+        result = self._add_strike_columns(table)
+
+        strike_vol_idx = result["columns"].index("strike_vol")
+        strike_idx = result["columns"].index("strike")
+
+        # Rows 1, 2, 3 are in range (ntry to xpry inclusive)
+        for i in [1, 2, 3]:
+            assert result["rows"][i][strike_vol_idx] == "11.0"  # vol at ntry
+            assert result["rows"][i][strike_idx] == "101.0"     # hedge at ntry
+
+    def test_strike_columns_no_ntry(self):
+        """When no ntry action exists, all strike columns are '-' for all rows."""
+        # No ntry, xpry at row 3
+        table = self._make_mock_output(["-", "-", "-", "xpry", "-"])
+        result = self._add_strike_columns(table)
+
+        strike_vol_idx = result["columns"].index("strike_vol")
+        strike_idx = result["columns"].index("strike")
+
+        # All rows should be "-"
+        for row in result["rows"]:
+            assert row[strike_vol_idx] == "-"
+            assert row[strike_idx] == "-"
+
+    def test_strike_columns_no_xpry(self):
+        """When no xpry action exists, strike values continue to end of data."""
+        # ntry at row 1, no xpry
+        table = self._make_mock_output(["-", "ntry", "-", "-", "-"])
+        result = self._add_strike_columns(table)
+
+        strike_vol_idx = result["columns"].index("strike_vol")
+        strike_idx = result["columns"].index("strike")
+
+        # Row 0 is before ntry - should be "-"
+        assert result["rows"][0][strike_vol_idx] == "-"
+
+        # Rows 1-4 are from ntry onward - should have values
+        for i in [1, 2, 3, 4]:
+            assert result["rows"][i][strike_vol_idx] == "11.0"
+            assert result["rows"][i][strike_idx] == "101.0"
+
+    def test_strike_columns_multiple_hedges(self):
+        """Verify correct number of strike columns (one per hedge)."""
+        table = self._make_mock_output(["-", "ntry", "-", "xpry", "-"])
+        result = self._add_strike_columns(table)
+
+        # Should have strike_vol, strike, strike1 (2 hedges)
+        assert "strike_vol" in result["columns"]
+        assert "strike" in result["columns"]
+        assert "strike1" in result["columns"]
+        # strike2 should not exist (only 2 hedges)
+        assert "strike2" not in result["columns"]
+
+    def test_vol_column_unchanged(self):
+        """Verify vol column is NOT modified (still shows market data)."""
+        table = self._make_mock_output(["-", "ntry", "-", "xpry", "-"])
+        original_vols = [row[3] for row in table["rows"]]  # vol is at index 3
+
+        result = self._add_strike_columns(table)
+
+        vol_idx = result["columns"].index("vol")
+        result_vols = [row[vol_idx] for row in result["rows"]]
+
+        # Vol column should be unchanged
+        assert result_vols == original_vols
 
 
 # -------------------------------------
@@ -1672,3 +2520,816 @@ class TestIntegration:
         assert "Market" in types
         assert "Vol" in types
         assert "Hedge" in types
+
+
+# -------------------------------------
+# Valuation Model Tests
+# -------------------------------------
+
+
+class TestNormCdf:
+    """Tests for _norm_cdf helper function."""
+
+    def test_norm_cdf_zero(self):
+        """N(0) = 0.5."""
+        assert abs(_norm_cdf(0) - 0.5) < 1e-10
+
+    def test_norm_cdf_positive(self):
+        """N(1) ≈ 0.8413."""
+        assert abs(_norm_cdf(1) - 0.8413447460685429) < 1e-6
+
+    def test_norm_cdf_negative(self):
+        """N(-1) ≈ 0.1587."""
+        assert abs(_norm_cdf(-1) - 0.15865525393145707) < 1e-6
+
+    def test_norm_cdf_large_positive(self):
+        """N(3) ≈ 0.9987."""
+        assert abs(_norm_cdf(3) - 0.9986501019683699) < 1e-6
+
+    def test_norm_cdf_large_negative(self):
+        """N(-3) ≈ 0.0013."""
+        assert abs(_norm_cdf(-3) - 0.0013498980316300946) < 1e-6
+
+    def test_norm_cdf_symmetry(self):
+        """N(x) + N(-x) = 1."""
+        for x in [0.5, 1.0, 2.0]:
+            assert abs(_norm_cdf(x) + _norm_cdf(-x) - 1.0) < 1e-10
+
+
+class TestModelES:
+    """Tests for model_ES European Straddle pricing function."""
+
+    def test_model_es_basic(self):
+        """Test basic ES model calculation."""
+        row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] != "-"
+        assert result["delta"] != "-"
+        mv = float(result["mv"])
+        assert mv > 0  # ATM straddle has positive value
+
+    def test_model_es_atm_value(self):
+        """ATM straddle value / strike should be roughly 10-15% for 25% vol, 90 days."""
+        row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "25",
+            "date": "2025-01-01",
+            "expiry": "2025-04-01",  # 90 days
+        }
+        result = model_ES(row)
+        mv = float(result["mv"])
+        # ATM straddle with 25% vol, 90 days: mv/X should be roughly 0.08-0.20
+        assert 0.08 < mv < 0.20
+
+    def test_model_es_itm_higher_value(self):
+        """ITM straddle (S > X) should have higher value than ATM."""
+        atm_row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        itm_row = {
+            "hedge": "110",  # S > X
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        atm_mv = float(model_ES(atm_row)["mv"])
+        itm_mv = float(model_ES(itm_row)["mv"])
+        assert itm_mv > atm_mv
+
+    def test_model_es_higher_vol_higher_value(self):
+        """Higher vol should give higher straddle value."""
+        low_vol_row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "10",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        high_vol_row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "30",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        low_mv = float(model_ES(low_vol_row)["mv"])
+        high_mv = float(model_ES(high_vol_row)["mv"])
+        assert high_mv > low_mv
+
+    def test_model_es_longer_time_higher_value(self):
+        """Longer time to expiry should give higher straddle value."""
+        short_row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-01-15",  # 14 days
+        }
+        long_row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-04-01",  # 90 days
+        }
+        short_mv = float(model_ES(short_row)["mv"])
+        long_mv = float(model_ES(long_row)["mv"])
+        assert long_mv > short_mv
+
+    def test_model_es_at_expiry_returns_intrinsic(self):
+        """t=0 (at expiry) returns intrinsic value abs(S-X)/X."""
+        row = {
+            "hedge": "110",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-02-01",
+            "expiry": "2025-02-01",  # Same day
+        }
+        result = model_ES(row)
+        assert result["mv"] != "-"
+        assert float(result["mv"]) == 0.1  # abs(110 - 100) / 100
+        assert float(result["delta"]) == 1.0  # S >= X
+
+    def test_model_es_at_expiry_itm_put(self):
+        """t=0 with S < X returns intrinsic value / strike."""
+        row = {
+            "hedge": "90",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-02-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert float(result["mv"]) == 0.1  # abs(90 - 100) / 100
+        assert float(result["delta"]) == -1.0  # S < X
+
+    def test_model_es_at_expiry_atm(self):
+        """t=0 with S == X returns 0."""
+        row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-02-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert float(result["mv"]) == 0.0  # abs(100 - 100) / 100
+        assert float(result["delta"]) == 1.0  # S >= X (equal case)
+
+    def test_model_es_past_expiry_returns_dash(self):
+        """t<0 (past expiry) returns '-'."""
+        row = {
+            "hedge": "110",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-02-15",
+            "expiry": "2025-02-01",  # Past
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_zero_vol_returns_dash(self):
+        """Zero volatility returns '-'."""
+        row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "0",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_negative_vol_returns_dash(self):
+        """Negative volatility returns '-'."""
+        row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "-20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_zero_hedge_returns_dash(self):
+        """Zero hedge price returns '-'."""
+        row = {
+            "hedge": "0",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_zero_strike_returns_dash(self):
+        """Zero strike returns '-'."""
+        row = {
+            "hedge": "100",
+            "strike": "0",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_missing_key_returns_dash(self):
+        """Missing required key returns '-'."""
+        row = {
+            "hedge": "100",
+            # "strike" missing
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_invalid_date_returns_dash(self):
+        """Invalid date format returns '-'."""
+        row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "20",
+            "date": "invalid",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_non_numeric_hedge_returns_dash(self):
+        """Non-numeric hedge returns '-'."""
+        row = {
+            "hedge": "none",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        assert result["mv"] == "-"
+        assert result["delta"] == "-"
+
+    def test_model_es_delta_atm(self):
+        """ATM straddle delta should be near 0."""
+        row = {
+            "hedge": "100",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        delta = float(result["delta"])
+        # ATM straddle delta should be close to 0 (N_d1 ≈ 1 for ATM, so delta = N_d1 - 1 ≈ 0)
+        assert -0.1 < delta < 0.1
+
+    def test_model_es_delta_itm_call(self):
+        """ITM straddle (S > X) should have positive delta."""
+        row = {
+            "hedge": "120",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        delta = float(result["delta"])
+        # ITM call-side means N_d1 > 1, so delta = N_d1 - 1 > 0
+        assert delta > 0
+
+    def test_model_es_delta_itm_put(self):
+        """ITM straddle (S < X) should have negative delta."""
+        row = {
+            "hedge": "80",
+            "strike": "100",
+            "vol": "20",
+            "date": "2025-01-01",
+            "expiry": "2025-02-01",
+        }
+        result = model_ES(row)
+        delta = float(result["delta"])
+        # ITM put-side means N_d1 < 1, so delta = N_d1 - 1 < 0
+        assert delta < 0
+
+
+class TestOtherModels:
+    """Tests for placeholder model functions."""
+
+    def test_model_ns_returns_dash(self):
+        """model_NS always returns '-' for mv and delta."""
+        assert model_NS({}) == {"mv": "-", "delta": "-"}
+        assert model_NS({"hedge": "100"}) == {"mv": "-", "delta": "-"}
+
+    def test_model_bs_returns_dash(self):
+        """model_BS always returns '-' for mv and delta."""
+        assert model_BS({}) == {"mv": "-", "delta": "-"}
+        assert model_BS({"hedge": "100"}) == {"mv": "-", "delta": "-"}
+
+    def test_model_default_returns_dash(self):
+        """model_default always returns '-' for mv and delta."""
+        assert model_default({}) == {"mv": "-", "delta": "-"}
+        assert model_default({"hedge": "100"}) == {"mv": "-", "delta": "-"}
+
+    def test_model_dispatch_es(self):
+        """MODEL_DISPATCH maps 'ES' to model_ES."""
+        assert MODEL_DISPATCH["ES"] == model_ES
+
+    def test_model_dispatch_cds_es(self):
+        """MODEL_DISPATCH maps 'CDS_ES' to model_ES."""
+        assert MODEL_DISPATCH["CDS_ES"] == model_ES
+
+    def test_model_dispatch_unknown(self):
+        """Unknown model name not in dispatch."""
+        assert "UNKNOWN" not in MODEL_DISPATCH
+
+
+class TestGetRollforwardFields:
+    """Tests for _get_rollforward_fields helper."""
+
+    def test_rollforward_vol_and_hedge(self):
+        """Should include vol and hedge."""
+        columns = ["asset", "date", "vol", "hedge", "action"]
+        fields = _get_rollforward_fields(columns)
+        assert "vol" in fields
+        assert "hedge" in fields
+
+    def test_rollforward_multiple_hedges(self):
+        """Should include hedge1, hedge2, etc."""
+        columns = ["asset", "vol", "hedge", "hedge1", "hedge2", "action"]
+        fields = _get_rollforward_fields(columns)
+        assert "hedge" in fields
+        assert "hedge1" in fields
+        assert "hedge2" in fields
+
+    def test_rollforward_excludes_non_market_data(self):
+        """Should not include non-market columns."""
+        columns = ["asset", "straddle", "date", "vol", "hedge", "action", "model", "strike", "expiry"]
+        fields = _get_rollforward_fields(columns)
+        assert "asset" not in fields
+        assert "straddle" not in fields
+        assert "date" not in fields
+        assert "action" not in fields
+        assert "model" not in fields
+        assert "strike" not in fields
+        assert "expiry" not in fields
+
+    def test_rollforward_empty_columns(self):
+        """Empty columns list returns empty set."""
+        assert _get_rollforward_fields([]) == set()
+
+    def test_rollforward_no_vol_or_hedge(self):
+        """Columns without vol/hedge returns empty set."""
+        columns = ["asset", "date", "action"]
+        assert _get_rollforward_fields(columns) == set()
+
+
+class TestValuationRollforward:
+    """Tests for get_straddle_valuation with roll-forward logic."""
+
+    def _make_mock_valuation_table(self, rows_data):
+        """Create a mock table for valuation testing.
+
+        rows_data: list of dicts with keys: date, vol, hedge, action
+        """
+        columns = ["asset", "straddle", "date", "vol", "hedge", "action", "model", "strike_vol", "strike", "expiry"]
+        rows = []
+        for d in rows_data:
+            rows.append([
+                "TEST",
+                "|2025-01|2025-02|N|0|F|3|100|",
+                d["date"],
+                d["vol"],
+                d["hedge"],
+                d["action"],
+                "ES",
+                d.get("strike_vol", "25"),
+                d.get("strike", "100"),
+                d.get("expiry", "2025-02-21"),
+            ])
+        return {"columns": columns, "rows": rows}
+
+    def test_rollforward_basic(self):
+        """Basic roll-forward: weekend uses previous day's data."""
+        # Simulate: Friday good, Saturday/Sunday missing, Monday good
+        table = self._make_mock_valuation_table([
+            {"date": "2025-02-14", "vol": "25", "hedge": "100", "action": "ntry"},  # Friday
+            {"date": "2025-02-15", "vol": "25", "hedge": "none", "action": "-"},    # Saturday
+            {"date": "2025-02-16", "vol": "25", "hedge": "none", "action": "-"},    # Sunday
+            {"date": "2025-02-17", "vol": "26", "hedge": "102", "action": "-"},     # Monday
+            {"date": "2025-02-21", "vol": "27", "hedge": "105", "action": "xpry"},  # Expiry
+        ])
+
+        # Manually apply the valuation logic (simulating get_straddle_valuation internals)
+        columns = table["columns"]
+        rows = table["rows"]
+        action_idx = columns.index("action")
+
+        ntry_idx = None
+        xpry_idx = None
+        for idx, row in enumerate(rows):
+            if row[action_idx] == "ntry":
+                ntry_idx = idx
+            elif row[action_idx] == "xpry":
+                xpry_idx = idx
+
+        rollforward_fields = _get_rollforward_fields(columns)
+        rolled_data = {}
+        ntry_row_dict = dict(zip(columns, rows[ntry_idx]))
+        for key in rollforward_fields:
+            if key in ntry_row_dict:
+                rolled_data[key] = ntry_row_dict[key]
+
+        mv_results = []
+        for idx, row in enumerate(rows):
+            if idx < ntry_idx or idx > xpry_idx:
+                mv_results.append("-")
+            else:
+                row_dict = dict(zip(columns, row))
+                for key in rollforward_fields:
+                    if key in row_dict and row_dict[key] != "none":
+                        rolled_data[key] = row_dict[key]
+                model_input = row_dict.copy()
+                model_input.update(rolled_data)
+                result = model_ES(model_input)
+                mv_results.append(result)
+
+        # All rows from ntry to xpry should have values (including xpry which returns intrinsic)
+        assert mv_results[0]["mv"] != "-"  # ntry
+        assert mv_results[1]["mv"] != "-"  # Saturday - rolled forward
+        assert mv_results[2]["mv"] != "-"  # Sunday - rolled forward
+        assert mv_results[3]["mv"] != "-"  # Monday - new data
+        assert mv_results[4]["mv"] != "-"  # xpry (t=0, returns intrinsic value)
+
+    def test_rollforward_partial_data(self):
+        """When only hedge is missing, vol from current row is used."""
+        table = self._make_mock_valuation_table([
+            {"date": "2025-02-14", "vol": "25", "hedge": "100", "action": "ntry"},
+            {"date": "2025-02-15", "vol": "30", "hedge": "none", "action": "-"},  # Vol exists, hedge missing
+            {"date": "2025-02-21", "vol": "27", "hedge": "105", "action": "xpry"},
+        ])
+
+        columns = table["columns"]
+        rows = table["rows"]
+        rollforward_fields = _get_rollforward_fields(columns)
+
+        # After processing row 1 (2025-02-15), rolled_data should have:
+        # - vol = "30" (from current row, not "none")
+        # - hedge = "100" (rolled forward from ntry)
+
+        rolled_data = {}
+        ntry_row_dict = dict(zip(columns, rows[0]))
+        for key in rollforward_fields:
+            if key in ntry_row_dict:
+                rolled_data[key] = ntry_row_dict[key]
+
+        # Process row 1
+        row_dict = dict(zip(columns, rows[1]))
+        for key in rollforward_fields:
+            if key in row_dict and row_dict[key] != "none":
+                rolled_data[key] = row_dict[key]
+
+        assert rolled_data["vol"] == "30"    # Updated from current row
+        assert rolled_data["hedge"] == "100"  # Rolled forward
+
+    def test_rollforward_updates_when_data_returns(self):
+        """When new data arrives, it replaces rolled-forward values."""
+        columns = ["vol", "hedge"]
+        rolled_data = {"vol": "25", "hedge": "100"}
+
+        # Simulate new data arriving
+        new_row = {"vol": "28", "hedge": "110"}
+        rollforward_fields = {"vol", "hedge"}
+        for key in rollforward_fields:
+            if key in new_row and new_row[key] != "none":
+                rolled_data[key] = new_row[key]
+
+        assert rolled_data["vol"] == "28"
+        assert rolled_data["hedge"] == "110"
+
+    def test_rollforward_consecutive_missing(self):
+        """Multiple consecutive missing days all get values."""
+        # 5 days of missing data should all compute mv using rolled-forward data
+        table = self._make_mock_valuation_table([
+            {"date": "2025-02-10", "vol": "25", "hedge": "100", "action": "ntry"},
+            {"date": "2025-02-11", "vol": "none", "hedge": "none", "action": "-"},
+            {"date": "2025-02-12", "vol": "none", "hedge": "none", "action": "-"},
+            {"date": "2025-02-13", "vol": "none", "hedge": "none", "action": "-"},
+            {"date": "2025-02-14", "vol": "none", "hedge": "none", "action": "-"},
+            {"date": "2025-02-15", "vol": "none", "hedge": "none", "action": "-"},
+            {"date": "2025-02-21", "vol": "27", "hedge": "105", "action": "xpry"},
+        ])
+
+        columns = table["columns"]
+        rows = table["rows"]
+        rollforward_fields = _get_rollforward_fields(columns)
+
+        rolled_data = {}
+        ntry_row_dict = dict(zip(columns, rows[0]))
+        for key in rollforward_fields:
+            if key in ntry_row_dict:
+                rolled_data[key] = ntry_row_dict[key]
+
+        mv_results = []
+        for idx, row in enumerate(rows):
+            if idx == 0 or idx == len(rows) - 1:
+                # Skip ntry and xpry for this test
+                continue
+            row_dict = dict(zip(columns, row))
+            for key in rollforward_fields:
+                if key in row_dict and row_dict[key] != "none":
+                    rolled_data[key] = row_dict[key]
+            model_input = row_dict.copy()
+            model_input.update(rolled_data)
+            mv = model_ES(model_input)
+            mv_results.append(mv)
+
+        # All 5 missing days should have computed values (not "-")
+        for mv in mv_results:
+            assert mv != "-"
+
+
+# -------------------------------------
+# Override Expiry Tests
+# -------------------------------------
+
+
+class TestOverrideExpiry:
+    """Tests for OVERRIDE expiry rule functionality."""
+
+    @pytest.fixture(autouse=True)
+    def reset_override_cache(self):
+        """Reset the override cache before and after each test."""
+        tickers_module._OVERRIDE_CACHE = None
+        yield
+        tickers_module._OVERRIDE_CACHE = None
+
+    def test_load_overrides_creates_cache(self, tmp_path):
+        """Test that _load_overrides creates a cache from CSV."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST Asset,2024-03-15\nTEST Asset,2024-04-19\n")
+
+        cache = _load_overrides(csv_file)
+
+        assert ("TEST Asset", "2024-03") in cache
+        assert cache[("TEST Asset", "2024-03")] == "2024-03-15"
+        assert ("TEST Asset", "2024-04") in cache
+        assert cache[("TEST Asset", "2024-04")] == "2024-04-19"
+
+    def test_load_overrides_caches_result(self, tmp_path):
+        """Test that _load_overrides returns cached result on second call."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST,2024-03-15\n")
+
+        cache1 = _load_overrides(csv_file)
+        # Modify the cache to verify it's returned
+        cache1[("MODIFIED", "2024-01")] = "2024-01-01"
+        cache2 = _load_overrides(csv_file)
+
+        assert cache1 is cache2
+        assert ("MODIFIED", "2024-01") in cache2
+
+    def test_load_overrides_handles_missing_file(self, tmp_path):
+        """Test that _load_overrides returns empty cache for missing file."""
+        cache = _load_overrides(tmp_path / "nonexistent.csv")
+        assert cache == {}
+
+    def test_override_expiry_found(self, tmp_path):
+        """Test _override_expiry returns correct date when found."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST Asset,2024-03-15\n")
+
+        result = _override_expiry("TEST Asset", 2024, 3, csv_file)
+        assert result == "2024-03-15"
+
+    def test_override_expiry_not_found(self, tmp_path):
+        """Test _override_expiry returns None when not found."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST Asset,2024-03-15\n")
+
+        result = _override_expiry("OTHER Asset", 2024, 3, csv_file)
+        assert result is None
+
+        result = _override_expiry("TEST Asset", 2024, 4, csv_file)
+        assert result is None
+
+    def test_anchor_day_override_returns_lookup(self, tmp_path):
+        """Test _anchor_day with OVERRIDE returns override lookup result."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST Asset,2024-03-21\n")
+
+        result = _anchor_day("OVERRIDE", "0", 2024, 3, "TEST Asset", csv_file)
+        assert result == "2024-03-21"
+
+    def test_anchor_day_override_without_underlying(self):
+        """Test _anchor_day with OVERRIDE but no underlying returns None."""
+        result = _anchor_day("OVERRIDE", "0", 2024, 3)
+        assert result is None
+
+    def test_anchor_day_override_not_found(self, tmp_path):
+        """Test _anchor_day with OVERRIDE returns None when lookup fails."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST Asset,2024-03-21\n")
+
+        result = _anchor_day("OVERRIDE", "0", 2024, 4, "TEST Asset", csv_file)
+        assert result is None
+
+    def test_compute_actions_override_entry(self, tmp_path):
+        """Test _compute_actions with OVERRIDE sets ntry correctly."""
+        csv_file = tmp_path / "overrides.csv"
+        # Override for entry month 2024-01 = 2024-01-15
+        csv_file.write_text("ticker,expiry\nTEST,2024-01-15\nTEST,2024-02-20\n")
+
+        rows = [
+            ["A", "s", "2024-01-14", "10", "100"],
+            ["A", "s", "2024-01-15", "11", "101"],  # anchor, should be ntry
+            ["A", "s", "2024-01-16", "12", "102"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+
+        # OVERRIDE with ntrv=0: anchor is 2024-01-15, target is 2024-01-15
+        actions = _compute_actions(
+            rows, columns, "N", "0", "OVERRIDE", "0",
+            ntry=2024, ntrm=1, underlying="TEST", overrides_path=csv_file
+        )
+        assert actions == ["-", "ntry", "-"]
+
+    def test_compute_actions_override_entry_with_offset(self, tmp_path):
+        """Test _compute_actions with OVERRIDE and ntrv calendar day offset."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST,2024-01-15\n")
+
+        rows = [
+            ["A", "s", "2024-01-15", "10", "100"],  # anchor
+            ["A", "s", "2024-01-16", "11", "101"],
+            ["A", "s", "2024-01-17", "12", "102"],  # anchor + 2 days, should be ntry
+            ["A", "s", "2024-01-18", "13", "103"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+
+        # OVERRIDE with ntrv=2: anchor is 2024-01-15, target is 2024-01-17
+        actions = _compute_actions(
+            rows, columns, "N", "2", "OVERRIDE", "0",
+            ntry=2024, ntrm=1, underlying="TEST", overrides_path=csv_file
+        )
+        assert actions == ["-", "-", "ntry", "-"]
+
+    def test_compute_actions_override_expiry(self, tmp_path):
+        """Test _compute_actions with OVERRIDE sets xpry correctly."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST,2024-01-10\nTEST,2024-02-15\n")
+
+        rows = [
+            ["A", "s", "2024-02-14", "10", "100"],
+            ["A", "s", "2024-02-15", "11", "101"],  # expiry anchor, should be xpry
+            ["A", "s", "2024-02-16", "12", "102"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+
+        actions = _compute_actions(
+            rows, columns, "N", "0", "OVERRIDE", "0",
+            xpry=2024, xprm=2, underlying="TEST", overrides_path=csv_file
+        )
+        assert actions == ["-", "xpry", "-"]
+
+    def test_compute_actions_override_both_entry_and_expiry(self, tmp_path):
+        """Test _compute_actions with OVERRIDE sets both ntry and xpry."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST,2024-01-10\nTEST,2024-02-15\n")
+
+        rows = [
+            ["A", "s", "2024-01-09", "10", "100"],
+            ["A", "s", "2024-01-10", "11", "101"],  # entry anchor, should be ntry
+            ["A", "s", "2024-01-11", "12", "102"],
+            ["A", "s", "2024-02-14", "13", "103"],
+            ["A", "s", "2024-02-15", "14", "104"],  # expiry anchor, should be xpry
+            ["A", "s", "2024-02-16", "15", "105"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+
+        actions = _compute_actions(
+            rows, columns, "N", "0", "OVERRIDE", "0",
+            ntry=2024, ntrm=1, xpry=2024, xprm=2,
+            underlying="TEST", overrides_path=csv_file
+        )
+        assert actions == ["-", "ntry", "-", "-", "xpry", "-"]
+
+    def test_compute_actions_override_no_match(self, tmp_path):
+        """Test _compute_actions with OVERRIDE returns no actions when lookup fails."""
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nOTHER,2024-01-15\n")
+
+        rows = [
+            ["A", "s", "2024-01-14", "10", "100"],
+            ["A", "s", "2024-01-15", "11", "101"],
+        ]
+        columns = ["asset", "straddle", "date", "vol", "hedge"]
+
+        actions = _compute_actions(
+            rows, columns, "N", "0", "OVERRIDE", "0",
+            ntry=2024, ntrm=1, underlying="TEST", overrides_path=csv_file
+        )
+        assert actions == ["-", "-"]
+
+
+# -------------------------------------
+# year_month_days Tests
+# -------------------------------------
+
+from specparser.amt import year_month_days
+import datetime
+
+
+class TestYearMonthDays:
+    """Tests for year_month_days function."""
+
+    def test_single_month(self):
+        """Test generating days for a single month."""
+        days = year_month_days(2024, 1, 2024, 1)
+        assert len(days) == 31  # January has 31 days
+        assert days[0] == datetime.date(2024, 1, 1)
+        assert days[-1] == datetime.date(2024, 1, 31)
+
+    def test_february_leap_year(self):
+        """Test February in a leap year."""
+        days = year_month_days(2024, 2, 2024, 2)
+        assert len(days) == 29  # 2024 is a leap year
+        assert days[-1] == datetime.date(2024, 2, 29)
+
+    def test_february_non_leap_year(self):
+        """Test February in a non-leap year."""
+        days = year_month_days(2023, 2, 2023, 2)
+        assert len(days) == 28
+        assert days[-1] == datetime.date(2023, 2, 28)
+
+    def test_multiple_months(self):
+        """Test spanning multiple months."""
+        days = year_month_days(2024, 1, 2024, 3)
+        # Jan=31, Feb=29, Mar=31 = 91 days
+        assert len(days) == 91
+        assert days[0] == datetime.date(2024, 1, 1)
+        assert days[-1] == datetime.date(2024, 3, 31)
+
+    def test_cross_year_boundary(self):
+        """Test spanning across year boundary."""
+        days = year_month_days(2023, 12, 2024, 1)
+        # Dec=31, Jan=31 = 62 days
+        assert len(days) == 62
+        assert days[0] == datetime.date(2023, 12, 1)
+        assert days[-1] == datetime.date(2024, 1, 31)
+
+    def test_full_year(self):
+        """Test generating all days in a year."""
+        days = year_month_days(2024, 1, 2024, 12)
+        assert len(days) == 366  # 2024 is a leap year
+        assert days[0] == datetime.date(2024, 1, 1)
+        assert days[-1] == datetime.date(2024, 12, 31)
+
+    def test_invalid_month_start(self):
+        """Test invalid start month raises ValueError."""
+        with pytest.raises(ValueError, match="month must be in 1..12"):
+            year_month_days(2024, 0, 2024, 1)
+
+    def test_invalid_month_end(self):
+        """Test invalid end month raises ValueError."""
+        with pytest.raises(ValueError, match="month must be in 1..12"):
+            year_month_days(2024, 1, 2024, 13)
+
+    def test_start_after_end(self):
+        """Test start > end raises ValueError."""
+        with pytest.raises(ValueError, match="start must be <= end"):
+            year_month_days(2024, 3, 2024, 1)
+
+    def test_consecutive_days(self):
+        """Test that returned days are consecutive."""
+        days = year_month_days(2024, 1, 2024, 3)
+        for i in range(1, len(days)):
+            delta = days[i] - days[i-1]
+            assert delta.days == 1, f"Gap between {days[i-1]} and {days[i]}"
+
+    def test_returns_date_objects(self):
+        """Test that function returns datetime.date objects."""
+        days = year_month_days(2024, 1, 2024, 1)
+        assert all(isinstance(d, datetime.date) for d in days)

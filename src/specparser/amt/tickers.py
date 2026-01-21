@@ -28,14 +28,6 @@ def _split_ticker(ticker: str, param: str) -> list[tuple[str, str]]:
     return [(ticker, param)]
 
 
-def _split_ticker_specstr(spec: str) -> tuple[str, str, str]:
-    """Parse a source:ticker:field spec string."""
-    parts = spec.split(":")
-    if len(parts) < 3: return ("", "", "")
-    source, ticker, field = parts[0], parts[1], parts[2]
-    if source == "CV": field = "none"
-    return (source, ticker, field)
-
 def _make_ticker_specstr(spec: dict) -> str:
     """Format a ticker row as source:ticker:field spec string."""
     if spec["source"] == "CV": return f"{spec['source']}:{spec['field']}:none"
@@ -170,6 +162,26 @@ _HEDGE_HANDLERS = {
 }
 
 
+# -------------------------------------
+# Tschemas cache
+# -------------------------------------
+
+_TSCHEMAS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_MEMOIZE_ENABLED: bool = True
+
+
+def set_memoize_enabled(enabled: bool) -> None:
+    """Enable or disable memoization for ticker functions."""
+    global _MEMOIZE_ENABLED
+    _MEMOIZE_ENABLED = enabled
+
+
+def clear_ticker_caches() -> None:
+    """Clear all ticker-related caches."""
+    _TSCHEMAS_CACHE.clear()
+    _TICKERS_YM_CACHE.clear()
+
+
 def get_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
     """
     Get all tickers for an asset by its Underlying value.
@@ -192,9 +204,17 @@ def get_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
         >>> table['columns']
         ['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field']
     """
+    path_str = str(Path(path).resolve())
+    cache_key = (path_str, underlying)
+    if _MEMOIZE_ENABLED and cache_key in _TSCHEMAS_CACHE:
+        return _TSCHEMAS_CACHE[cache_key]
+
     asset_data = loader.get_asset(path, underlying)
     if not asset_data:
-        return {"columns": ["asset", "cls", "type", "param", "source", "ticker", "field"], "rows": []}
+        result = {"columns": ["asset", "cls", "type", "param", "source", "ticker", "field"], "rows": []}
+        if _MEMOIZE_ENABLED:
+            _TSCHEMAS_CACHE[cache_key] = result
+        return result
 
     rows = []
     asset_underlying = asset_data.get("Underlying", "")
@@ -220,10 +240,13 @@ def get_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
         else:
             rows.extend(_hedge_default(hedge, asset_underlying, asset_class, source))
 
-    return {
+    result = {
         "columns": ["asset", "cls", "type", "param", "source", "ticker", "field"],
         "rows": rows,
     }
+    if _MEMOIZE_ENABLED:
+        _TSCHEMAS_CACHE[cache_key] = result
+    return result
 
 
 def find_tschemas(path: str | Path, pattern: str, live_only: bool = False) -> dict[str, Any]:
@@ -403,13 +426,26 @@ def _tschma_dict_expand_split(ticker_dict: dict) -> list[dict]:
         expanded_ticker_dict.append(new_row)
     return expanded_ticker_dict
 
+# -------------------------------------
+# Tickers YM cache
+# -------------------------------------
+
+_TICKERS_YM_CACHE: dict[tuple[str, str, int, int, str | None], dict[str, Any]] = {}
+
+
 def get_tickers_ym(
-    path: str | Path, 
+    path: str | Path,
     asset: str,
-    year: int , 
-    month: int , 
-    chain_csv: str | Path | None = None 
+    year: int ,
+    month: int ,
+    chain_csv: str | Path | None = None
 ) -> dict[str, Any]:
+    path_str = str(Path(path).resolve())
+    chain_str = str(Path(chain_csv).resolve()) if chain_csv else None
+    cache_key = (path_str, asset, year, month, chain_str)
+    if _MEMOIZE_ENABLED and cache_key in _TICKERS_YM_CACHE:
+        return _TICKERS_YM_CACHE[cache_key]
+
     tschemas_table = get_tschemas(path, asset)
     ticker_dicts = []
     for tschema_row in tschemas_table["rows"]:
@@ -422,14 +458,17 @@ def get_tickers_ym(
                 expanded_tschema_dict = _tschma_dict_expand_split(tschema_dict)
             for expanded_row in expanded_tschema_dict:
                     clean_param, include = _parse_date_constraint(expanded_row["param"], year, month)
-                    if include: 
+                    if include:
                         new_row = expanded_row.copy()
                         new_row["param"]=clean_param
                         ticker_dicts.append(new_row)
         else:
             ticker_dicts.append(tschema_dict)
     ticker_rows = [[row[col] for col in tschemas_table["columns"]] for row in ticker_dicts]
-    return { "columns": tschemas_table["columns"], "rows": ticker_rows }
+    result = { "columns": tschemas_table["columns"], "rows": ticker_rows }
+    if _MEMOIZE_ENABLED:
+        _TICKERS_YM_CACHE[cache_key] = result
+    return result
 
 def find_tickers_ym(
     path: str | Path,
@@ -506,7 +545,10 @@ def _filter_straddle_tickers(rows: list[list], columns: list[str], ntrc: str) ->
 
             if row_source == "CV":
                 new_row[ticker_idx] = row_field
-                new_row[field_idx] = "NONE"
+                new_row[field_idx] = "none"
+
+            if row_source == "calc":
+                new_row[field_idx] = ""
 
             if row_param == "Near" and ntrc == "N":
                 new_row[param_idx] = "vol"
@@ -527,12 +569,12 @@ def _filter_straddle_tickers(rows: list[list], columns: list[str], ntrc: str) ->
 
 
 def asset_straddle_tickers(
-    path: str | Path,
-    underlying: str,
+    asset: str,
     year: int,
     month: int,
-    chain_csv: str | Path | None = None,
-    i: int = 0
+    i: int,
+    amt_path: str | Path,
+    chain_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Get tickers for an asset's straddle with the straddle string included.
 
@@ -545,23 +587,27 @@ def asset_straddle_tickers(
     - Hedge rows are always kept
 
     Args:
-        path: Path to AMT YAML file
-        underlying: Asset underlying value
+        asset: Asset underlying value
         year: Expiry year
         month: Expiry month
-        chain_csv: Optional CSV for futures ticker lookup
         i: Straddle selector index (i % len(straddles))
+        amt_path: Path to AMT YAML file
+        chain_path: Optional CSV for futures ticker lookup
 
     Returns:
         Table with ticker rows plus straddle column
     """
-    straddles = loader.table_column(schedules.get_expand_ym(path, underlying, year, month), "straddle")
+    # Check if underlying exists first
+    if loader.get_asset(amt_path, asset) is None:
+        raise ValueError(f"Asset '{asset}' not found")
+
+    straddles = loader.table_column(schedules.get_expand_ym(amt_path, asset, year, month), "straddle")
     if len(straddles) < 1:
-        raise ValueError(f"{underlying} has no straddles in {year}-{month:02d}")
+        raise ValueError(f"'{asset}' has no straddles in {year}-{month:02d}")
     straddle = straddles[i % len(straddles)]
     xpry, xprm = schedules.xpry(straddle), schedules.xprm(straddle)
     ntrc = schedules.ntrc(straddle)
-    ticker_table = get_tickers_ym(path, underlying, xpry, xprm, chain_csv)
+    ticker_table = get_tickers_ym(amt_path, asset, xpry, xprm, chain_path)
     # Filter rows based on straddle rules
     filtered_rows = _filter_straddle_tickers(ticker_table["rows"], ticker_table["columns"], ntrc)
     # Build filtered table, then transform using table utilities
@@ -577,36 +623,667 @@ def asset_straddle_tickers(
 # -------------------------------------
 
 
-def get_straddle_days(
-    path: str | Path,
+import math
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal cumulative distribution function."""
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+# -------------------------------------
+# Valuation Models
+# -------------------------------------
+
+
+def model_ES(row: dict[str, Any]) -> dict[str, str]:
+    """European Straddle pricing model.
+
+    Formula: mv = S * 2*N(d1) - X * 2*N(d2) + X - S
+             delta = N_d1 - 1
+
+    Inputs from row:
+        - hedge: current underlying price (S)
+        - strike: strike price captured at entry (X)
+        - vol: current implied vol in percent
+        - date: current date
+        - expiry: expiry date
+
+    Returns dict with "mv" and "delta" keys. Values are "-" for any inadequate
+    inputs (missing, non-numeric, invalid dates, t < 0, zero/negative prices or vol, etc.)
+    """
+    try:
+        from datetime import date as date_type
+
+        S = float(row["hedge"])
+        X = float(row["strike"])
+        v = float(row["vol"])
+
+        # Validate positive values
+        if S <= 0 or X <= 0 or v <= 0:
+            return {"mv": "-", "delta": "-"}
+
+        # Calculate days to expiry
+        current_date = date_type.fromisoformat(row["date"])
+        expiry_date = date_type.fromisoformat(row["expiry"])
+        t = (expiry_date - current_date).days
+
+        if t < 0:
+            return {"mv": "-", "delta": "-"}  # Past expiry - inadequate input
+
+        if t == 0:
+            # At expiry - intrinsic value, delta is +1 or -1 depending on S vs X
+            mv = abs(S - X) / X
+            delta = 1.0 if S >= X else -1.0
+            return {"mv": str(mv), "delta": str(delta)}
+
+        # Total volatility
+        tv = (v / 100) * math.sqrt(t / 365)
+
+        d1 = math.log(S / X) / tv + 0.5 * tv
+        d2 = d1 - tv
+
+        N_d1 = 2 * _norm_cdf(d1)
+        N_d2 = 2 * _norm_cdf(d2)
+
+        mv = S * N_d1 - X * N_d2 + X - S
+        delta = N_d1 - 1
+
+        # Return option value divided by strike, and delta
+        return {"mv": str(mv / X), "delta": str(delta)}
+    except (ValueError, KeyError, TypeError, ZeroDivisionError):
+        return {"mv": "-", "delta": "-"}
+
+
+def model_NS(row: dict[str, Any]) -> dict[str, str]:
+    """Normal Straddle model - placeholder."""
+    return {"mv": "-", "delta": "-"}
+
+
+def model_BS(row: dict[str, Any]) -> dict[str, str]:
+    """Black-Scholes model - placeholder."""
+    return {"mv": "-", "delta": "-"}
+
+
+def model_default(row: dict[str, Any]) -> dict[str, str]:
+    """Default model for unknown model names."""
+    return {"mv": "-", "delta": "-"}
+
+
+MODEL_DISPATCH = {
+    "ES": model_ES,
+    "NS": model_NS,
+    "BS": model_BS,
+    "CDS_ES": model_ES,  # CDS_ES uses ES model
+}
+
+
+def prices_last(prices_parquet: str | Path, pattern: str) -> dict[str, Any]:
+    """Get last date for each ticker/field matching regex pattern.
+
+    Args:
+        prices_parquet: Path to prices parquet file
+        pattern: Regex pattern to match tickers
+
+    Returns:
+        Table with columns: [ticker, field, last_date]
+    """
+    con = duckdb.connect()
+    table_name = Path(prices_parquet).stem
+    con.execute(f"CREATE VIEW {table_name} AS SELECT * FROM '{prices_parquet}'")
+
+    query = f"""
+        SELECT ticker, field, MAX(date) AS last_date
+        FROM {table_name}
+        WHERE regexp_matches(ticker, '{pattern}')
+        GROUP BY ticker, field
+        ORDER BY ticker, field
+    """
+    result = con.execute(query).fetchall()
+    con.close()
+
+    rows = [[str(ticker), str(field), str(last_date)] for ticker, field, last_date in result]
+    return {"columns": ["ticker", "field", "last_date"], "rows": rows}
+
+
+def prices_query(prices_parquet: str | Path, sql: str) -> dict[str, Any]:
+    """Run arbitrary SQL query against prices parquet.
+
+    The parquet file is exposed as table 'prices'.
+
+    Args:
+        prices_parquet: Path to prices parquet file
+        sql: SQL query to execute
+
+    Returns:
+        Table with query results
+    """
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW prices AS SELECT * FROM '{prices_parquet}'")
+
+    result = con.execute(sql)
+    columns = [desc[0] for desc in result.description]
+    rows = [[str(v) for v in row] for row in result.fetchall()]
+    con.close()
+
+    return {"columns": columns, "rows": rows}
+
+
+def _add_calendar_days(date_str: str, days: int) -> str:
+    """Add calendar days to a date string.
+
+    Args:
+        date_str: ISO date string like "2024-01-19"
+        days: Number of calendar days to add (can be 0)
+
+    Returns:
+        New date string
+    """
+    from datetime import date, timedelta
+    d = date.fromisoformat(date_str)
+    return (d + timedelta(days=days)).isoformat()
+
+
+def _last_good_day_in_month(
+    rows: list[list],
+    vol_idx: int,
+    hedge_indices: list[int],
+    date_idx: int,
+    year: int,
+    month: int
+) -> int | None:
+    """Find the last good day in a given month.
+
+    A "good day" is one where vol and all hedge columns are not "none".
+
+    Args:
+        rows: Data rows from get_straddle_days output
+        vol_idx: Index of vol column
+        hedge_indices: List of hedge column indices
+        date_idx: Index of date column
+        year: Year
+        month: Month (1-12)
+
+    Returns:
+        Row index of last good day, or None if no good days exist.
+    """
+    month_start = f"{year}-{month:02d}-01"
+    _, num_days = calendar.monthrange(year, month)
+    month_end = f"{year}-{month:02d}-{num_days:02d}"
+
+    def is_good_day(row: list) -> bool:
+        if row[vol_idx] == "none":
+            return False
+        return all(row[idx] != "none" for idx in hedge_indices)
+
+    last_good_idx = None
+    for i, row in enumerate(rows):
+        row_date = row[date_idx]
+        if row_date < month_start:
+            continue
+        if row_date > month_end:
+            break
+        if is_good_day(row):
+            last_good_idx = i
+
+    return last_good_idx
+
+
+# -------------------------------------
+# Preloaded prices dict (for backtest)
+# -------------------------------------
+
+_PRICES_DICT: dict[str, str] | None = None
+
+
+def load_all_prices(
+    prices_parquet: str | Path,
+    start_date: str | None = None,
+    end_date: str | None = None
+) -> dict[str, str]:
+    """Load all prices into a flat dict with composite key.
+
+    Args:
+        prices_parquet: Path to parquet file
+        start_date: Optional start date filter (YYYY-MM-DD)
+        end_date: Optional end date filter (YYYY-MM-DD)
+
+    Returns:
+        Dict mapping "ticker|field|date" -> value
+    """
+    global _PRICES_DICT
+    if _PRICES_DICT is not None:
+        return _PRICES_DICT
+
+    con = duckdb.connect()
+
+    # Build query with optional date filters
+    query = f"SELECT ticker, field, date, value FROM '{prices_parquet}'"
+    conditions = []
+    if start_date:
+        conditions.append(f"date >= '{start_date}'")
+    if end_date:
+        conditions.append(f"date <= '{end_date}'")
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    result = con.execute(query).fetchall()
+    con.close()
+
+    # Build flat dict with composite string key
+    _PRICES_DICT = {}
+    for ticker, field, dt, value in result:
+        key = f"{ticker}|{field}|{dt}"
+        _PRICES_DICT[key] = str(value)
+
+    return _PRICES_DICT
+
+
+def set_prices_dict(prices_dict: dict[str, str] | None) -> None:
+    """Set the global prices dict (used by workers)."""
+    global _PRICES_DICT
+    _PRICES_DICT = prices_dict
+
+
+def get_price(prices_dict: dict[str, str], ticker: str, field: str, date_str: str) -> str:
+    """Look up a price from the preloaded dict.
+
+    Returns "none" if not found.
+    """
+    key = f"{ticker}|{field}|{date_str}"
+    return prices_dict.get(key, "none")
+
+
+def clear_prices_dict() -> None:
+    """Clear the global prices dict."""
+    global _PRICES_DICT
+    _PRICES_DICT = None
+
+
+# -------------------------------------
+# DuckDB connection cache
+# -------------------------------------
+
+_DUCKDB_CACHE: dict[str, "duckdb.DuckDBPyConnection"] = {}
+
+
+def _get_prices_connection(prices_parquet: str | Path) -> "duckdb.DuckDBPyConnection":
+    """Get or create a cached DuckDB connection for the given parquet file.
+
+    The connection is cached by the resolved path string. The parquet file
+    is exposed as the 'prices' view.
+
+    Args:
+        prices_parquet: Path to prices parquet file
+
+    Returns:
+        DuckDB connection with 'prices' view created
+    """
+    path_str = str(Path(prices_parquet).resolve())
+    if path_str not in _DUCKDB_CACHE:
+        con = duckdb.connect()
+        con.execute(f"CREATE VIEW prices AS SELECT * FROM '{prices_parquet}'")
+        _DUCKDB_CACHE[path_str] = con
+    return _DUCKDB_CACHE[path_str]
+
+
+def _clear_prices_cache():
+    """Clear the DuckDB connection cache."""
+    for con in _DUCKDB_CACHE.values():
+        try:
+            con.close()
+        except Exception:
+            pass
+    _DUCKDB_CACHE.clear()
+
+
+# -------------------------------------
+# Override expiry lookup
+# -------------------------------------
+
+_OVERRIDE_CACHE: dict[tuple[str, str], str] | None = None
+
+
+def _load_overrides(path: str | Path = "data/overrides.csv") -> dict[tuple[str, str], str]:
+    """Load and cache override expiry dates.
+
+    Args:
+        path: Path to overrides CSV file
+
+    Returns:
+        Dict mapping (ticker, "YYYY-MM") -> "YYYY-MM-DD"
+    """
+    global _OVERRIDE_CACHE
+    if _OVERRIDE_CACHE is not None:
+        return _OVERRIDE_CACHE
+
+    _OVERRIDE_CACHE = {}
+    try:
+        with open(path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ticker = row["ticker"]
+                expiry = row["expiry"]  # "YYYY-MM-DD"
+                year_month = expiry[:7]  # "YYYY-MM"
+                key = (ticker, year_month)
+                _OVERRIDE_CACHE[key] = expiry
+    except (FileNotFoundError, KeyError):
+        pass  # Return empty cache if file not found or malformed
+
+    return _OVERRIDE_CACHE
+
+
+def _override_expiry(
     underlying: str,
     year: int,
     month: int,
-    prices_parquet: str | Path,
+    overrides_path: str | Path = "data/overrides.csv"
+) -> str | None:
+    """Look up override expiry date for an asset/month.
+
+    Args:
+        underlying: Asset identifier (e.g., "0R Comdty")
+        year: Expiry year
+        month: Expiry month (1-12)
+        overrides_path: Path to overrides CSV
+
+    Returns:
+        Expiry date string "YYYY-MM-DD" or None if not found
+    """
+    overrides = _load_overrides(overrides_path)
+    key = (underlying, f"{year}-{month:02d}")
+    return overrides.get(key)
+
+
+def _anchor_day(
+    xprc: str,
+    xprv: str,
+    year: int,
+    month: int,
+    underlying: str | None = None,
+    overrides_path: str | Path | None = None
+) -> str | None:
+    """
+    Calculate the anchor day for a given month.
+
+    Args:
+        xprc: Code ("F", "R", "W", "BD", or "OVERRIDE")
+        xprv: Value (string, the Nth occurrence; ignored for OVERRIDE)
+        year: Year (int)
+        month: Month (int, 1-12)
+        underlying: Asset name (required for OVERRIDE)
+        overrides_path: Path to overrides CSV (for OVERRIDE)
+
+    Returns:
+        Date string in ISO format (e.g., "2024-06-21"), or None if:
+        - xprc is not in ["F", "R", "W", "BD", "OVERRIDE"]
+        - xprv is not a valid positive integer (for non-OVERRIDE)
+        - The Nth weekday/business day doesn't exist in the month
+        - OVERRIDE lookup fails (no entry for asset/month)
+    """
+    # Handle OVERRIDE first - no xprv validation needed
+    if xprc == "OVERRIDE":
+        if underlying is None:
+            return None
+        return _override_expiry(underlying, year, month,
+                                overrides_path or "data/overrides.csv")
+
+    WEEKDAY_MAP = {"F": 4, "R": 3, "W": 2}  # Friday, Thursday, Wednesday
+
+    try:
+        n = int(xprv)
+        if n < 1:
+            return None
+    except (ValueError, TypeError):
+        return None
+
+    _, num_days = calendar.monthrange(year, month)
+
+    if xprc == "BD":
+        # Find Nth business day (Mon-Fri) in the month
+        from datetime import date
+        bd_count = 0
+        for day in range(1, num_days + 1):
+            d = date(year, month, day)
+            if d.weekday() < 5:  # Mon=0, Fri=4
+                bd_count += 1
+                if bd_count == n:
+                    return d.isoformat()
+        return None  # Not enough business days
+
+    elif xprc in WEEKDAY_MAP:
+        target_weekday = WEEKDAY_MAP[xprc]
+
+        # Find all occurrences of target weekday in the month
+        from datetime import date
+        weekday_dates = []
+        for day in range(1, num_days + 1):
+            d = date(year, month, day)
+            if d.weekday() == target_weekday:
+                weekday_dates.append(d)
+
+        # Return Nth occurrence (1-indexed)
+        if n > len(weekday_dates):
+            return None  # e.g., 5th Friday doesn't exist
+
+        return weekday_dates[n - 1].isoformat()
+
+    return None
+
+
+def _nth_good_day_after(
+    rows: list[list],
+    vol_idx: int,
+    hedge_indices: list[int],
+    date_idx: int,
+    anchor_date: str,
+    n: int,
+    month_limit: str | None = None
+) -> int | None:
+    """
+    Find the Nth good day after (or at) an anchor date.
+
+    A "good day" is one where vol and all hedge columns are not "none".
+
+    Semantics for n:
+    - n = 0: Return anchor row if anchor is good, else first good day after anchor
+    - n > 0: Return Nth good day after Day 0
+
+    Args:
+        rows: Data rows from get_straddle_days output
+        vol_idx: Index of vol column
+        hedge_indices: List of hedge column indices
+        date_idx: Index of date column
+        anchor_date: Date string like "2024-05-17" (the anchor)
+        n: Offset from anchor (0 = anchor or first good after, 1 = first good after Day 0, etc.)
+        month_limit: Optional date string like "2024-06-30" - stop searching after this date
+
+    Returns:
+        Row index of the target good day, or None if not found
+    """
+    if n < 0:
+        return None
+
+    def is_good_day(row: list) -> bool:
+        if row[vol_idx] == "none":
+            return False
+        return all(row[idx] != "none" for idx in hedge_indices)
+
+    # First, find Day 0 (anchor if good, else first good day after anchor)
+    day_0_idx = None
+    for i, row in enumerate(rows):
+        row_date = row[date_idx]
+
+        # Skip rows before anchor
+        if row_date < anchor_date:
+            continue
+
+        # Stop if past month_limit
+        if month_limit is not None and row_date > month_limit:
+            break
+
+        if is_good_day(row):
+            day_0_idx = i
+            break
+
+    if day_0_idx is None:
+        return None  # No good day found at or after anchor
+
+    if n == 0:
+        return day_0_idx
+
+    # For n > 0, count n good days after Day 0
+    count = 0
+    for i in range(day_0_idx + 1, len(rows)):
+        row = rows[i]
+        row_date = row[date_idx]
+
+        # Stop if past month_limit
+        if month_limit is not None and row_date > month_limit:
+            break
+
+        if is_good_day(row):
+            count += 1
+            if count == n:
+                return i
+
+    return None  # Not enough good days after Day 0
+
+
+def _compute_actions(
+    rows: list[list],
+    columns: list[str],
+    ntrc: str,
+    ntrv: str,
+    xprc: str,
+    xprv: str,
+    xpry: int | None = None,
+    xprm: int | None = None,
+    ntry: int | None = None,
+    ntrm: int | None = None,
+    underlying: str | None = None,
+    overrides_path: str | Path | None = None
+) -> list[str]:
+    """
+    Compute action values for each row in get_straddle_days output.
+
+    Args:
+        rows: Output rows from get_straddle_days (before action column added)
+        columns: Column names (to find vol/hedge indices)
+        ntrc: Entry code from straddle
+        ntrv: Entry value from straddle
+        xprc: Expiry code from straddle
+        xprv: Expiry value from straddle
+        xpry: Expiry year from straddle
+        xprm: Expiry month from straddle
+        ntry: Entry year from straddle
+        ntrm: Entry month from straddle
+        underlying: Asset name (required for OVERRIDE code)
+        overrides_path: Path to overrides CSV (for OVERRIDE code)
+
+    Returns:
+        List of action strings, one per row ("-" for no action, "ntry" for entry trigger, "xpry" for expiry trigger)
+    """
+    actions = ["-"] * len(rows)
+
+    # Find vol index
+    vol_idx = columns.index("vol") if "vol" in columns else None
+    if vol_idx is None:
+        return actions  # Missing vol column
+
+    # Find all hedge column indices (hedge, hedge1, hedge2, ...)
+    hedge_indices = []
+    for i, col in enumerate(columns):
+        if col == "hedge" or (col.startswith("hedge") and col[5:].isdigit()):
+            hedge_indices.append(i)
+
+    if not hedge_indices:
+        return actions  # No hedge columns
+
+    # Find date column index
+    date_idx = columns.index("date") if "date" in columns else None
+    if date_idx is None:
+        return actions  # Missing date column
+
+    # Unified rules for F/R/W/BD/OVERRIDE codes
+    # Entry: anchor + ntrv calendar days -> first good day at or after -> fallback to last good day
+    # Expiry: anchor -> first good day at or after
+    if xprc in ["F", "R", "W", "BD", "OVERRIDE"]:
+        # Entry trigger ("ntry")
+        if ntry is not None and ntrm is not None:
+            entry_anchor = _anchor_day(xprc, xprv, ntry, ntrm, underlying, overrides_path)
+            if entry_anchor is not None:
+                try:
+                    ntrv_int = int(ntrv) if ntrv else 0
+                    _, entry_num_days = calendar.monthrange(ntry, ntrm)
+                    entry_month_end = f"{ntry}-{ntrm:02d}-{entry_num_days:02d}"
+
+                    # Add calendar days to anchor
+                    target_date = _add_calendar_days(entry_anchor, ntrv_int)
+
+                    # If target is past entry month, use last good day of month
+                    if target_date > entry_month_end:
+                        idx = _last_good_day_in_month(rows, vol_idx, hedge_indices, date_idx, ntry, ntrm)
+                    else:
+                        # Find first good day at or after target
+                        idx = _nth_good_day_after(rows, vol_idx, hedge_indices, date_idx,
+                                                  target_date, 0, entry_month_end)
+                        # If no good day found at or after target, use last good day of month
+                        if idx is None:
+                            idx = _last_good_day_in_month(rows, vol_idx, hedge_indices, date_idx, ntry, ntrm)
+
+                    if idx is not None:
+                        actions[idx] = "ntry"
+                except (ValueError, TypeError):
+                    pass
+
+        # Expiry trigger ("xpry")
+        # Anchor -> first good day at or after
+        if xpry is not None and xprm is not None:
+            expiry_anchor = _anchor_day(xprc, xprv, xpry, xprm, underlying, overrides_path)
+            if expiry_anchor is not None:
+                _, expiry_num_days = calendar.monthrange(xpry, xprm)
+                expiry_month_end = f"{xpry}-{xprm:02d}-{expiry_num_days:02d}"
+
+                idx = _nth_good_day_after(rows, vol_idx, hedge_indices, date_idx,
+                                          expiry_anchor, 0, expiry_month_end)
+                if idx is not None:
+                    actions[idx] = "xpry"
+
+    return actions
+
+
+def get_straddle_days(
+    underlying: str,
+    year: int,
+    month: int,
+    i: int,
+    path: str | Path,
     chain_csv: str | Path | None = None,
-    i: int = 0
+    prices_parquet: str | Path | None = None,
 ) -> dict[str, Any]:
     """Get daily prices for a straddle from entry to expiry month.
 
     Columns: ['asset', 'straddle', 'date', <param1>, <param2>, ...]
     Where params are 'vol', 'hedge', 'hedge1', etc.
 
+    Uses the module-level _PRICES_DICT if set (via set_prices_dict or load_all_prices),
+    otherwise falls back to DuckDB queries on prices_parquet.
+
     Args:
-        path: Path to AMT YAML file
         underlying: Asset underlying value
         year: Expiry year
         month: Expiry month
-        prices_parquet: Path to prices parquet file
-        chain_csv: Optional CSV for futures ticker lookup
         i: Straddle selector index (i % len(straddles))
+        path: Path to AMT YAML file
+        chain_csv: Optional CSV for futures ticker lookup
+        prices_parquet: Path to prices parquet file (for DuckDB fallback)
 
     Returns:
         Table with one row per day, columns for each param's price
     """
-    from datetime import date
-
     # Get ticker table from asset_straddle_tickers
-    table = asset_straddle_tickers(path, underlying, year, month, chain_csv, i)
+    table = asset_straddle_tickers(underlying, year, month, i, path, chain_csv)
 
     if not table["rows"]:
         return {"columns": ["asset", "straddle", "date"], "rows": []}
@@ -614,6 +1291,14 @@ def get_straddle_days(
     # All rows have same asset and straddle
     asset = table["rows"][0][0]
     straddle = table["rows"][0][1]
+
+    # Get model from Valuation.Model
+    asset_data = loader.get_asset(path, underlying)
+    if asset_data is not None:
+        valuation = asset_data.get("Valuation", {})
+        model = valuation.get("Model", "") if isinstance(valuation, dict) else ""
+    else:
+        model = ""
 
     # Parse straddle to get date range
     entry_year, entry_month = schedules.ntry(straddle), schedules.ntrm(straddle)
@@ -651,9 +1336,7 @@ def get_straddle_days(
     dates = []
     current_year, current_month = entry_year, entry_month
     while (current_year, current_month) <= (expiry_year, expiry_month):
-        _, num_days = calendar.monthrange(current_year, current_month)
-        for day in range(1, num_days + 1):
-            dates.append(date(current_year, current_month, day))
+        dates.extend(schedules.get_days_ym(current_year, current_month))
         # Advance to next month
         if current_month == 12:
             current_year += 1
@@ -664,34 +1347,46 @@ def get_straddle_days(
     # Build list of (ticker, field) pairs to query using normalized tickers
     ticker_field_pairs = list(normalized_ticker_map.values())
 
-    start_date = dates[0].isoformat()
-    end_date = dates[-1].isoformat()
-
-    con = duckdb.connect()
-    con.execute(f"CREATE VIEW prices AS SELECT * FROM '{prices_parquet}'")
-
-    # Query all prices in one go
-    # Parquet schema: ticker, date, field, value
-    conditions = " OR ".join(
-        f"(ticker = '{t}' AND field = '{f}')" for t, f in ticker_field_pairs
-    )
-    query = f"""
-        SELECT ticker, field, date, value
-        FROM prices
-        WHERE ({conditions})
-        AND date >= '{start_date}'
-        AND date <= '{end_date}'
-    """
-    result = con.execute(query).fetchall()
-    con.close()
-
     # Organize: (ticker, field) -> {date_str -> value}
     prices = {}
-    for ticker, field, dt, value in result:
-        key = (ticker, field)
-        if key not in prices:
-            prices[key] = {}
-        prices[key][str(dt)] = str(value)
+
+    if _PRICES_DICT is not None:
+        # Use preloaded dict - O(1) lookups
+        for ticker, field in ticker_field_pairs:
+            prices[(ticker, field)] = {}
+            for dt in dates:
+                date_str = dt.isoformat()
+                value = get_price(_PRICES_DICT, ticker, field, date_str)
+                if value != "none":
+                    prices[(ticker, field)][date_str] = value
+    elif prices_parquet is not None:
+        # Fallback to DuckDB query
+        start_date = dates[0].isoformat()
+        end_date = dates[-1].isoformat()
+
+        con = _get_prices_connection(prices_parquet)
+
+        # Query all prices in one go
+        # Parquet schema: ticker, date, field, value
+        conditions = " OR ".join(
+            f"(ticker = '{t}' AND field = '{f}')" for t, f in ticker_field_pairs
+        )
+        query = f"""
+            SELECT ticker, field, date, value
+            FROM prices
+            WHERE ({conditions})
+            AND date >= '{start_date}'
+            AND date <= '{end_date}'
+        """
+        result = con.execute(query).fetchall()
+
+        for ticker, field, dt, value in result:
+            key = (ticker, field)
+            if key not in prices:
+                prices[key] = {}
+            prices[key][str(dt)] = str(value)
+    else:
+        raise ValueError("No prices available: call load_all_prices() or set_prices_dict() first, or provide prices_parquet")
 
     # Output columns: asset, straddle, date, <params...>
     out_columns = ["asset", "straddle", "date"] + params_ordered
@@ -706,158 +1401,265 @@ def get_straddle_days(
             row.append(value)
         out_rows.append(row)
 
+    # Compute action column
+    ntrc_val = schedules.ntrc(straddle)
+    ntrv_val = schedules.ntrv(straddle)
+    xprc_val = schedules.xprc(straddle)
+    xprv_val = schedules.xprv(straddle)
+
+    actions = _compute_actions(out_rows, out_columns, ntrc_val, ntrv_val, xprc_val, xprv_val, expiry_year, expiry_month, entry_year, entry_month, underlying)
+
+    # Add action to each row
+    for i, action in enumerate(actions):
+        out_rows[i].append(action)
+    out_columns.append("action")
+
+    # Add model column (same value for all rows)
+    for row in out_rows:
+        row.append(model)
+    out_columns.append("model")
+
+    # Add strike columns (strike_vol, strike, strike1, ...)
+    # Find ntry and xpry row indices
+    ntry_idx = None
+    xpry_idx = None
+    for i, action in enumerate(actions):
+        if action == "ntry":
+            ntry_idx = i
+        elif action == "xpry":
+            xpry_idx = i
+
+    # Find vol column index in out_columns
+    vol_col_idx = out_columns.index("vol") if "vol" in out_columns else None
+
+    # Find hedge column indices
+    hedge_col_indices = []
+    for i, col in enumerate(out_columns):
+        if col == "hedge" or (col.startswith("hedge") and col[5:].isdigit()):
+            hedge_col_indices.append(i)
+
+    # Get strike values from ntry row
+    if ntry_idx is not None and vol_col_idx is not None:
+        strike_vol_value = out_rows[ntry_idx][vol_col_idx]
+        strike_values = [out_rows[ntry_idx][idx] for idx in hedge_col_indices]
+    else:
+        strike_vol_value = "-"
+        strike_values = ["-"] * len(hedge_col_indices)
+
+    # Add strike_vol column
+    for i, row in enumerate(out_rows):
+        # Show value only from ntry to xpry (inclusive)
+        in_range = (ntry_idx is not None and i >= ntry_idx and
+                    (xpry_idx is None or i <= xpry_idx))
+        row.append(strike_vol_value if in_range else "-")
+    out_columns.append("strike_vol")
+
+    # Add strike columns (one per hedge)
+    for j in range(len(hedge_col_indices)):
+        strike_col_name = "strike" if j == 0 else f"strike{j}"
+        for i, row in enumerate(out_rows):
+            in_range = (ntry_idx is not None and i >= ntry_idx and
+                        (xpry_idx is None or i <= xpry_idx))
+            row.append(strike_values[j] if in_range else "-")
+        out_columns.append(strike_col_name)
+
+    # Add expiry column (date at xpry, "-" before ntry and after xpry)
+    date_col_idx = out_columns.index("date") if "date" in out_columns else None
+    if xpry_idx is not None and date_col_idx is not None:
+        expiry_value = out_rows[xpry_idx][date_col_idx]
+    else:
+        expiry_value = "-"
+
+    for i, row in enumerate(out_rows):
+        in_range = (ntry_idx is not None and i >= ntry_idx and
+                    (xpry_idx is None or i <= xpry_idx))
+        row.append(expiry_value if in_range else "-")
+    out_columns.append("expiry")
+
     return {"columns": out_columns, "rows": out_rows}
 
 
-def straddle_days(table: dict[str, Any], prices_parquet: str | Path) -> dict[str, Any]:
-    """
-    Add daily price values to a straddle table for the entry month.
+def _get_rollforward_fields(columns: list[str]) -> set[str]:
+    """Get fields that should be rolled forward (vol and hedge columns)."""
+    fields = set()
+    for col in columns:
+        if col == "vol":
+            fields.add(col)
+        elif col == "hedge" or (col.startswith("hedge") and col[5:].isdigit()):
+            fields.add(col)
+    return fields
 
-    Takes the output from asset_straddle() and adds rows for each calendar day
-    in the entry month. Each date row has tab-separated values for vol and each
-    hedge ticker.
 
-    The vol ticker is parsed from the "vol" row (format: source:ticker:field).
-    Hedge tickers are parsed from "hedge", "hedge1", etc. rows.
-    For CV source, field "none" is used in the query.
+def get_straddle_valuation(
+    underlying: str,
+    year: int,
+    month: int,
+    i: int,
+    path: str | Path,
+    chain_csv: str | Path | None = None,
+    prices_parquet: str | Path | None = None,
+) -> dict[str, Any]:
+    """Get straddle valuation with mv column.
+
+    Calls get_straddle_days and adds mv (mark-to-market value) column
+    computed using the asset's valuation model.
 
     Args:
-        table: Output from asset_straddle() with columns ['name', 'value']
-        prices_parquet: Path to the prices parquet file
+        Same as get_straddle_days
 
     Returns:
-        New table with daily value rows inserted after the last ticker row.
-        Daily rows have format: YYYY-MM-DD -> vol_value\\thedge_value\\thedge1_value...
-
-    Example:
-        >>> straddle = asset_straddle("data/amt.yml", "C Comdty", "|2023-12|2024-01|N|0|OVERRIDE||33.3|")
-        >>> result = straddle_days(straddle, "data/prices.parquet")
-        >>> # Date rows have tab-separated values for each ticker
+        Table with additional mv column
     """
+    # Get base table
+    table = get_straddle_days(underlying, year, month, i, path, chain_csv, prices_parquet)
 
+    columns = table["columns"]
+    rows = table["rows"]
 
-    # Copy existing rows
-    rows = [row[:] for row in table["rows"]]
+    # Find action column and check for ntry/xpry
+    if "action" not in columns:
+        # No action column, add all valuation columns as "-"
+        for row in rows:
+            row.extend(["-", "-", "-", "-", "-"])
+        columns.extend(["mv", "delta", "opnl", "hpnl", "pnl"])
+        return {"columns": columns, "rows": rows}
 
-    # Find straddle, vol, and hedge rows
-    straddle_str = None
-    vol_spec = None
-    hedge_specs = []  # List of (name, spec) tuples in order
-    for name, value in table["rows"]:
-        if name == "straddle":
-            straddle_str = value
-        elif name == "vol":
-            vol_spec = value
-        elif name.startswith("hedge") or name == "calc":
-            hedge_specs.append((name, value))
+    action_idx = columns.index("action")
 
-    if not straddle_str or not vol_spec:
-        return table  # Can't process without straddle and vol
+    ntry_idx = None
+    xpry_idx = None
+    for idx, row in enumerate(rows):
+        if row[action_idx] == "ntry":
+            ntry_idx = idx
+        elif row[action_idx] == "xpry":
+            xpry_idx = idx
 
-    # Parse straddle to get entry month: |ntry-ntrm|xpry-xprm|ntrc|...|
-    parts = straddle_str.strip("|").split("|")
-    if len(parts) < 1:
-        return table
+    if ntry_idx is None or xpry_idx is None:
+        # Missing ntry or xpry, add all valuation columns as "-"
+        for row in rows:
+            row.extend(["-", "-", "-", "-", "-"])
+        columns.extend(["mv", "delta", "opnl", "hpnl", "pnl"])
+        return {"columns": columns, "rows": rows}
 
-    entry_part = parts[0]  # "2023-12"
-    try:
-        ntry, ntrm = entry_part.split("-")
-        ntry = int(ntry)
-        ntrm = int(ntrm)
-    except ValueError:
-        return table
-
-    # Get number of days in the entry month
-    _, num_days = calendar.monthrange(ntry, ntrm)
-    start_date = f"{ntry}-{ntrm:02d}-01"
-    end_date = f"{ntry}-{ntrm:02d}-{num_days:02d}"
-
-    # Collect all ticker/field pairs to query
-    ticker_field_pairs = []  # List of (ticker, field) tuples
-    _, vol_ticker, vol_field = _split_ticker_specstr(vol_spec)
-    if vol_ticker:
-        ticker_field_pairs.append((vol_ticker, vol_field))
-
-    hedge_ticker_fields = []  # Keep track of hedge ticker/field for result mapping
-    for _, hedge_spec in hedge_specs:
-        _, hedge_ticker, hedge_field = _split_ticker_specstr(hedge_spec)
-        hedge_ticker_fields.append((hedge_ticker, hedge_field))
-        if hedge_ticker:
-            ticker_field_pairs.append((hedge_ticker, hedge_field))
-
-    # Query all prices in one go
-    prices_parquet = Path(prices_parquet)
-    con = duckdb.connect()
-    table_name = prices_parquet.stem
-    con.execute(f"CREATE VIEW {table_name} AS SELECT * FROM '{prices_parquet}'")
-
-    # Build a single query for all ticker/field pairs
-    all_prices: dict[tuple[str, str], dict[str, str]] = {}
-    if ticker_field_pairs:
-        # Build WHERE clause with OR conditions for each ticker/field pair
-        conditions = " OR ".join(
-            f"(ticker = '{t}' AND field = '{f}')" for t, f in ticker_field_pairs
-        )
-        query = f"""
-            SELECT ticker, field, date, value
-            FROM {table_name}
-            WHERE ({conditions})
-            AND date >= '{start_date}'
-            AND date <= '{end_date}'
-            ORDER BY date
-        """
-        result = con.execute(query).fetchall()
-
-        # Organize results by (ticker, field) -> {date -> value}
-        for ticker, field, date, value in result:
-            key = (ticker, field)
-            if key not in all_prices:
-                all_prices[key] = {}
-            all_prices[key][str(date)] = str(value)
-
-    con.close()
-
-    # Extract prices for vol and each hedge
-    vol_prices = all_prices.get((vol_ticker, vol_field), {}) if vol_ticker else {}
-    hedge_prices_list = []
-    for hedge_ticker, hedge_field in hedge_ticker_fields:
-        if hedge_ticker:
-            hedge_prices_list.append(all_prices.get((hedge_ticker, hedge_field), {}))
-        else:
-            hedge_prices_list.append({})
-
-    # Find where to insert daily rows (after the last ticker row: vol, hedge, hedge1, calc)
-    insert_idx = None
-    ticker_names = {"vol", "calc"} | {name for name, _ in hedge_specs}
-    for i, (name, _) in enumerate(rows):
-        if name in ticker_names:
-            insert_idx = i
-
-    if insert_idx is not None:
-        insert_idx += 1  # Insert after the last ticker row
-
-    # Build daily rows with tab-separated values
-    daily_rows = []
-    for day in range(1, num_days + 1):
-        date_str = f"{ntry}-{ntrm:02d}-{day:02d}"
-        values = [vol_prices.get(date_str, "none")]
-        for hedge_prices in hedge_prices_list:
-            values.append(hedge_prices.get(date_str, "none"))
-        # Join with tabs
-        combined_value = "\t".join(values)
-        daily_rows.append([date_str, combined_value])
-
-    # Insert daily rows
-    if insert_idx is not None:
-        rows = rows[:insert_idx] + daily_rows + rows[insert_idx:]
+    # Get model from first row
+    model_idx = columns.index("model") if "model" in columns else None
+    if model_idx is not None and rows:
+        model_name = rows[0][model_idx]
     else:
-        rows.extend(daily_rows)
+        model_name = ""
 
-    return {
-        "columns": ["name", "value"],
-        "rows": rows,
-    }
+    # Get model function
+    model_fn = MODEL_DISPATCH.get(model_name, model_default)
 
+    # Get fields to roll forward (vol and hedge columns)
+    rollforward_fields = _get_rollforward_fields(columns)
+
+    # Initialize rolled-forward data from ntry row
+    rolled_data = {}
+    ntry_row_dict = dict(zip(columns, rows[ntry_idx]))
+    for key in rollforward_fields:
+        if key in ntry_row_dict:
+            rolled_data[key] = ntry_row_dict[key]
+
+    # Get strike price for hpnl calculation (hedge at entry)
+    strike_col_idx = columns.index("strike") if "strike" in columns else None
+    strike_price = None
+    if strike_col_idx is not None:
+        try:
+            strike_price = float(rows[ntry_idx][strike_col_idx])
+        except (ValueError, TypeError):
+            pass
+
+    # Track previous day's values for PnL calculations
+    prev_mv = None
+    prev_delta = None
+    prev_hedge = None
+
+    # Compute mv, delta, opnl, hpnl, pnl for each row
+    for idx, row in enumerate(rows):
+        if idx < ntry_idx or idx > xpry_idx:
+            row.append("-")  # mv
+            row.append("-")  # delta
+            row.append("-")  # opnl
+            row.append("-")  # hpnl
+            row.append("-")  # pnl
+        else:
+            # Update rolled_data with any non-missing market values
+            row_dict = dict(zip(columns, row))
+            for key in rollforward_fields:
+                if key in row_dict and row_dict[key] != "none":
+                    rolled_data[key] = row_dict[key]
+
+            # Build model input: current row data + rolled-forward market data
+            model_input = row_dict.copy()
+            model_input.update(rolled_data)
+
+            result = model_fn(model_input)
+            mv_str = result["mv"]
+            delta_str = result["delta"]
+            row.append(mv_str)
+            row.append(delta_str)
+
+            # Get current hedge (rolled forward)
+            current_hedge = None
+            try:
+                current_hedge = float(rolled_data.get("hedge", ""))
+            except (ValueError, TypeError):
+                pass
+
+            # Compute PnL columns
+            if idx == ntry_idx:
+                # First day: opnl = 0, hpnl = 0, pnl = 0
+                row.append("0")  # opnl
+                row.append("0")  # hpnl
+                row.append("0")  # pnl
+            else:
+                # opnl = mv[today] - mv[yesterday]
+                opnl = "-"
+                if mv_str != "-" and prev_mv is not None:
+                    try:
+                        opnl = str(float(mv_str) - prev_mv)
+                    except (ValueError, TypeError):
+                        pass
+
+                # hpnl = -delta[yesterday] * (hedge[today] - hedge[yesterday]) / strike
+                hpnl = "-"
+                if (prev_delta is not None and current_hedge is not None and
+                    prev_hedge is not None and strike_price is not None and strike_price != 0):
+                    try:
+                        hpnl = str(-prev_delta * (current_hedge - prev_hedge) / strike_price)
+                    except (ValueError, TypeError):
+                        pass
+
+                # pnl = opnl + hpnl
+                pnl = "-"
+                if opnl != "-" and hpnl != "-":
+                    try:
+                        pnl = str(float(opnl) + float(hpnl))
+                    except (ValueError, TypeError):
+                        pass
+
+                row.append(opnl)
+                row.append(hpnl)
+                row.append(pnl)
+
+            # Update previous values for next iteration
+            try:
+                prev_mv = float(mv_str) if mv_str != "-" else None
+            except (ValueError, TypeError):
+                prev_mv = None
+            try:
+                prev_delta = float(delta_str) if delta_str != "-" else None
+            except (ValueError, TypeError):
+                prev_delta = None
+            prev_hedge = current_hedge
+
+    columns.append("mv")
+    columns.append("delta")
+    columns.append("opnl")
+    columns.append("hpnl")
+    columns.append("pnl")
+    return {"columns": columns, "rows": rows}
 
 
 # -------------------------------------
@@ -911,7 +1713,16 @@ def _main() -> int:
 
     p.add_argument("--fut", nargs=3, metavar=("SPEC", "YEAR", "MONTH"),
                    help="Compute futures ticker from spec string, year, and month.")
-    
+
+    p.add_argument("--prices-last", metavar="REGEX",
+                   help="Show last date for each ticker/field matching regex")
+
+    p.add_argument("--prices-query", metavar="SQL",
+                   help="Run arbitrary SQL query against prices parquet (table: prices)")
+
+    p.add_argument("--staddle-valuation", nargs=4, type=str, metavar=("UNDERLYING", "YEAR", "MONTH", "NDX"),
+                   help="Get straddle valuation, delta, pnls.")
+
     args = p.parse_args()
 
     def str2bool(s: str) -> bool:
@@ -983,12 +1794,25 @@ def _main() -> int:
 
     elif args.asset_tickers:
         underlying, year, month, i = args.asset_tickers
-        table = asset_straddle_tickers(args.path, underlying, int(year), int(month), args.chain_csv, int(i))
+        table = asset_straddle_tickers(underlying, int(year), int(month), int(i), args.path, args.chain_csv)
         loader.print_table(table)
 
     elif args.asset_days:
         underlying, year, month, i = args.asset_days
-        table = get_straddle_days(args.path, underlying, int(year), int(month), args.prices, args.chain_csv, int(i))
+        table = get_straddle_days(underlying, int(year), int(month), int(i), args.path, args.chain_csv, args.prices)
+        loader.print_table(table)
+
+    elif args.prices_last:
+        table = prices_last(args.prices, args.prices_last)
+        loader.print_table(table)
+
+    elif args.prices_query:
+        table = prices_query(args.prices, args.prices_query)
+        loader.print_table(table)
+
+    elif args.straddle_valuation:
+        underlying, year, month, i = args.straddle_valuation
+        table = get_straddle_valuation(underlying, int(year), int(month), int(i), args.path, args.chain_csv, args.prices)
         loader.print_table(table)
 
     else:

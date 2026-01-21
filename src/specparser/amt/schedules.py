@@ -10,8 +10,33 @@ and packing into straddle strings.
 import hashlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, List
+import calendar
+import datetime 
 from . import loader 
+
+
+# memoization 
+
+_MEMOIZE_ENABLED: bool = False
+
+def set_memoize_enabled(enabled: bool) -> None:
+    """Enable or disable memoization for schedule functions."""
+    global _MEMOIZE_ENABLED
+    _MEMOIZE_ENABLED = enabled
+
+def clear_schedule_caches() -> None:
+    """Clear all schedule-related caches."""
+    _SCHEDULE_CACHE.clear()
+    _EXPAND_YM_CACHE.clear()
+    _DAYS_YM_CACHE.clear()
+
+
+
+# -------------------------------------
+#  AMT schedule -> by asset, packed schedule
+# -------------------------------------
+
 
 # Pattern to match lowercase a, b, c, d (the values that need fixing)
 _ABCD_PATTERN = re.compile(r"^([abcd])$")
@@ -99,32 +124,47 @@ def _schedule_to_rows(underlying: str, schedule: list[str] | None) -> list[list[
         rows.append([0, 0, underlying, "", "", "", "", ""])
     return rows
 
+
+
+
+_SCHEDULE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_SCHEDULE_COLUMNS = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
 def get_schedule(path: str | Path, underlying: str) -> dict[str, Any]:
     """Get the expiry schedule for an asset by its Underlying value."""
+    path_str = str(Path(path).resolve())
+    cache_key = (path_str, underlying)
+    if _MEMOIZE_ENABLED and cache_key in _SCHEDULE_CACHE: 
+        return _SCHEDULE_CACHE[cache_key]
+
     data = loader.load_amt(path)
     asset_data = loader.get_asset(path, underlying)
-    columns = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
-    if not asset_data: return { "columns": columns, "rows": [], }
+    columns = _SCHEDULE_COLUMNS
+    if not asset_data:
+        result = { "columns": columns, "rows": [], }
+        if _MEMOIZE_ENABLED:
+            _SCHEDULE_CACHE[cache_key] = result
+        return result
     schedule_name = asset_data.get("Options")
-    schedules = data.get("expiry_schedules", {})
-    schedule = schedules.get(schedule_name) if schedule_name else None
+    scheds = data.get("expiry_schedules", {})
+    schedule = scheds.get(schedule_name) if schedule_name else None
     rows = _schedule_to_rows(underlying, schedule)
-    return { "columns": columns, "rows": rows, }
+    result = { "columns": columns, "rows": rows, }
+    if _MEMOIZE_ENABLED:
+        _SCHEDULE_CACHE[cache_key] = result
+    return result
+
+def get_schedule_count(path: str | Path, underlying: str) -> int:
+    return len(get_schedule(path,underlying)["rows"])
 
 
 def find_schedules(path: str | Path, pattern: str,live_only: bool = True) -> dict[str, Any]:
     """Find assets matching a regex pattern and return their schedule components."""
-    amt = loader.load_amt(path)
-    schedules = amt.get("expiry_schedules", {})
-    columns = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
     rows = []
-    for asset_data, underlying in loader._iter_assets(path,live_only=live_only,pattern=pattern):
-        if not asset_data: continue
-        schedule_name = asset_data.get("Options")
-        schedule = schedules.get(schedule_name) if schedule_name else None
-        rows.extend(_schedule_to_rows(underlying, schedule))
-    return { "columns": columns, "rows": rows, }
-
+    assets = [asset for _, asset in loader._iter_assets(path, live_only=live_only, pattern=pattern)]
+    for asset in assets:
+        shedule=get_schedule(path,asset)["rows"]
+        rows.extend(shedule)
+    return { "columns": _SCHEDULE_COLUMNS, "rows": rows, }
 
 # -------------------------------------
 # Straddle string parsing
@@ -134,48 +174,39 @@ def find_schedules(path: str | Path, pattern: str,live_only: bool = True) -> dic
 
 def _parse_straddle(s: str) -> tuple[str, str, str, str, str, str, str]:
     """Parse a straddle string into its 7 components.
-
     Returns: (ntr, xpr, ntrc, ntrv, xprc, xprv, wgt)
     """
-    # Remove only the leading and trailing pipe, preserving empty internal parts
-    # Using s[1:-1] instead of strip("|") to keep empty fields like ||
     if s.startswith("|") and s.endswith("|"):
         parts = s[1:-1].split("|")
     else:
-        parts = s.split("|")
+        raise ValueError(f"Invalid straddle format: expect |straddle|")
     if len(parts) != 7:
         raise ValueError(f"Invalid straddle format: expected 7 parts, got {len(parts)}")
     return tuple(parts)
 
-
 def ntr(s: str) -> str:
     """Extract entry date string (YYYY-MM) from straddle."""
-    return _parse_straddle(s)[0]
-
+    return s[1:8]
 
 def ntry(s: str) -> int:
     """Extract entry year from straddle."""
-    return int(_parse_straddle(s)[0].split("-")[0])
-
+    return int(s[1:5])
 
 def ntrm(s: str) -> int:
     """Extract entry month from straddle."""
-    return int(_parse_straddle(s)[0].split("-")[1])
-
+    return int(s[6:8])
 
 def xpr(s: str) -> str:
     """Extract expiry date string (YYYY-MM) from straddle."""
-    return _parse_straddle(s)[1]
-
+    return s[9:16]
 
 def xpry(s: str) -> int:
     """Extract expiry year from straddle."""
-    return int(_parse_straddle(s)[1].split("-")[0])
-
+    return int(s[9:13])
 
 def xprm(s: str) -> int:
     """Extract expiry month from straddle."""
-    return int(_parse_straddle(s)[1].split("-")[1])
+    return int(s[14:16])
 
 
 def ntrc(s: str) -> str:
@@ -273,11 +304,92 @@ def get_expand(path: str | Path, underlying: str, start_year: int, end_year: int
     straddles = _expand_and_pack(schedule, start_year, end_year)
     return straddles
 
+
+# -------------------------------------
+# Expand YM cache
+# -------------------------------------
+
+_EXPAND_YM_CACHE: dict[tuple[str, str, int, int], dict[str, Any]] = {}
 def get_expand_ym(path: str | Path, underlying: str, year: int, month: int) -> dict[str, Any]:
     """Expand a single asset's schedule for a specific year/month into straddle strings."""
+    path_str = str(Path(path).resolve())
+    cache_key = (path_str, underlying, year, month)
+    if _MEMOIZE_ENABLED and cache_key in _EXPAND_YM_CACHE:
+        return _EXPAND_YM_CACHE[cache_key]
+
     schedule = get_schedule(path, underlying)
     straddles = _pack_ym(schedule, year, month)
+    if _MEMOIZE_ENABLED:
+        _EXPAND_YM_CACHE[cache_key] = straddles
     return straddles
+
+
+# -------------------------------------
+# Days-in-month cache
+# -------------------------------------
+
+_DAYS_YM_CACHE: dict[str, list] = {}
+
+
+def get_days_ym(year: int, month: int) -> list:
+    """Return cached list of all days in a given year/month.
+
+    Args:
+        year: The year (e.g., 2024)
+        month: The month (1-12)
+
+    Returns:
+        List of date objects for every day in that month
+    """
+    key = f"{year}-{month:02d}"
+    if _MEMOIZE_ENABLED and key in _DAYS_YM_CACHE:
+        return _DAYS_YM_CACHE[key]
+
+    _, num_days = calendar.monthrange(year, month)
+    days = [datetime.date(year, month, day) for day in range(1, num_days + 1)]
+
+    if _MEMOIZE_ENABLED:
+        _DAYS_YM_CACHE[key] = days
+    return days
+
+
+def clear_days_cache() -> None:
+    """Clear the days-in-month cache."""
+    _DAYS_YM_CACHE.clear()
+
+
+# -------------------------------------
+# year month -> year month days
+# -------------------------------------
+
+
+def year_month_days(straddle) -> List[str]:
+    """
+    Return all calendar days from the 1st of (start_year,start_month)
+    through the last day of (end_year,end_month), inclusive.
+    """
+    start_year=int(straddle[1:5])
+    start_month=int(straddle[6:8])
+    end_year=int(straddle[9:13])
+    end_month=int(straddle[14:16])
+    if not (1 <= start_month <= 12 and 1 <= end_month <= 12):
+        raise ValueError("month must be in 1..12")
+    key = f"{start_year}-{start_month:02d}:{end_year}-{end_month:02d}"
+    if _MEMOIZE_ENABLED and key in _DAYS_YM_CACHE:
+        return _DAYS_YM_CACHE[key]
+
+    start = datetime.date(start_year, start_month, 1)
+    last_day = calendar.monthrange(end_year, end_month)[1]
+    end = datetime.date(end_year, end_month, last_day)
+    if start > end: raise ValueError("start must be <= end")
+
+    n_days = (end - start).days + 1
+    days = [start.fromordinal(start.toordinal() + i) for i in range(n_days)]
+    if _MEMOIZE_ENABLED:
+        _DAYS_YM_CACHE[key] = days
+
+    return days
+
 
 # -------------------------------------
 # CLI

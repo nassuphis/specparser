@@ -1,5 +1,9 @@
 # Plan: Normalize Tickers for Price Lookup
 
+> **Status: IMPLEMENTED** ✓
+>
+> All changes have been implemented and tested. See implementation notes at the end.
+
 ## Problem
 
 When querying prices from the parquet file in `get_straddle_days`, hedge tickers return "none" because:
@@ -160,3 +164,38 @@ LA Comdty |2025-01|2025-02|N|0|OVERRIDE||33.3| 2025-01-02 16.15 2590.0
 LA Comdty |2025-01|2025-02|N|0|OVERRIDE||33.3| 2025-01-03 16.51 2614.0
 ...
 ```
+
+---
+
+## Implementation Notes
+
+**Implemented on:** 2026-01-20
+
+### Files Modified
+
+1. **`src/specparser/amt/tickers.py`**:
+   - Added `_ACTUAL_CACHE` for reverse ticker mapping
+   - Added `fut_act2norm(csv_path, ticker)` function
+   - Updated `clear_normalized_cache()` to clear both caches
+   - Updated `get_straddle_days()` to normalize tickers before price lookup
+
+2. **`src/specparser/amt/__init__.py`**:
+   - Added `fut_act2norm` to `__all__` list
+   - Added lazy import mapping for `fut_act2norm`
+
+3. **`tests/test_amt.py`**:
+   - Added `fut_act2norm` to imports
+   - Added tests for `fut_act2norm`:
+     - `test_fut_act2norm` - basic lookup
+     - `test_fut_act2norm_caching` - cache behavior
+     - `test_fut_act2norm_and_norm2act_inverse` - verifies bidirectional mapping
+     - `test_clear_normalized_cache_clears_both` - both caches cleared
+
+### Verification
+
+Tested with CLI command:
+```bash
+uv run python -m specparser.amt.tickers data/amt.yml --asset-days 'LA Comdty' 2025 2 0
+```
+
+Hedge prices now correctly show numeric values instead of "none".

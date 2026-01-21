@@ -20,7 +20,6 @@ from .tickers import (
     live_tickers,
     fut_spec2ticker,
     asset_straddle,
-    straddle_days,
 )
 
 
@@ -35,7 +34,6 @@ def _main() -> int:
     p.add_argument("--chain-csv", metavar="CSV_PATH", help="CSV file with normalized_future,actual_future columns for ticker lookup")
     p.add_argument("--fut", nargs=3, metavar=("SPEC", "YEAR", "MONTH"), help="Compute futures ticker from spec string, year, and month")
     p.add_argument("--straddle", nargs=2, metavar=("UNDERLYING", "STRADDLE"), help="Get straddle info with tickers for an asset")
-    p.add_argument("--prices", metavar="PARQUET_PATH", help="Prices parquet file for straddle_days lookup (use with --straddle)")
     args = p.parse_args()
 
     if args.asset_tickers:
@@ -78,8 +76,6 @@ def _main() -> int:
         underlying, straddle_str = args.straddle
         try:
             table = asset_straddle(args.path, underlying, straddle_str, chain_csv=args.chain_csv)
-            if args.prices:
-                table = straddle_days(table, args.prices)
             print_table(table)
         except ValueError as e:
             print(f"Error: {e}")

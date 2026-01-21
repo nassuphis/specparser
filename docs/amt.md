@@ -516,6 +516,42 @@ table = get_expand_ym("data/amt.yml", "LA Comdty", 2024, 6)
 # Columns: ['asset', 'straddle']
 ```
 
+#### `year_month_days(start_year, start_month, end_year, end_month)`
+
+Generate all calendar days from the 1st of the start month through the last day of the end month.
+
+```python
+from specparser.amt import year_month_days
+
+# Get all days in January 2024
+days = year_month_days(2024, 1, 2024, 1)
+# Returns: [date(2024, 1, 1), date(2024, 1, 2), ..., date(2024, 1, 31)]
+
+# Get all days across multiple months
+days = year_month_days(2024, 1, 2024, 3)
+# Returns 91 days: Jan 1 through Mar 31
+
+# Get all days in a full year
+days = year_month_days(2024, 1, 2024, 12)
+# Returns 366 days (2024 is a leap year)
+
+# Span across year boundary
+days = year_month_days(2023, 12, 2024, 1)
+# Returns 62 days: Dec 1, 2023 through Jan 31, 2024
+```
+
+**Parameters:**
+- `start_year`: Starting year
+- `start_month`: Starting month (1-12)
+- `end_year`: Ending year
+- `end_month`: Ending month (1-12)
+
+**Returns:** List of `datetime.date` objects for all days in the range (inclusive)
+
+**Raises:**
+- `ValueError`: If month values are not in 1-12
+- `ValueError`: If start date is after end date
+
 ---
 
 ## CLI Usage
