@@ -15,6 +15,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 .DS_Store
+backtest.txt
 
 # C extensions
 *.so
