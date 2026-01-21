@@ -106,6 +106,8 @@ def _fix_schedule(underlying: str, schedule: list[str]) -> list[str]:
 
     return fixed_schedule
 
+
+
 def _schedule_to_rows(underlying: str, schedule: list[str] | None) -> list[list[Any]]:
     """Convert a schedule list to table rows with fixed values."""
     rows = []
@@ -124,8 +126,15 @@ def _schedule_to_rows(underlying: str, schedule: list[str] | None) -> list[list[
         rows.append([0, 0, underlying, "", "", "", "", ""])
     return rows
 
-
-
+def get_schedule_nocache(path: str | Path, underlying: str) -> dict[str, Any]:
+    data = loader.load_amt(path)
+    asset_data = loader.get_asset(path, underlying)
+    if not asset_data: return { "columns": _SCHEDULE_COLUMNS, "rows": [], }
+    schedule_name = asset_data.get("Options")
+    scheds = data.get("expiry_schedules", {})
+    schedule = scheds.get(schedule_name) if schedule_name else None
+    rows = _schedule_to_rows(underlying, schedule)
+    return {"columns": _SCHEDULE_COLUMNS, "rows": rows,}
 
 _SCHEDULE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 _SCHEDULE_COLUMNS = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
@@ -135,20 +144,7 @@ def get_schedule(path: str | Path, underlying: str) -> dict[str, Any]:
     cache_key = (path_str, underlying)
     if _MEMOIZE_ENABLED and cache_key in _SCHEDULE_CACHE: 
         return _SCHEDULE_CACHE[cache_key]
-
-    data = loader.load_amt(path)
-    asset_data = loader.get_asset(path, underlying)
-    columns = _SCHEDULE_COLUMNS
-    if not asset_data:
-        result = { "columns": columns, "rows": [], }
-        if _MEMOIZE_ENABLED:
-            _SCHEDULE_CACHE[cache_key] = result
-        return result
-    schedule_name = asset_data.get("Options")
-    scheds = data.get("expiry_schedules", {})
-    schedule = scheds.get(schedule_name) if schedule_name else None
-    rows = _schedule_to_rows(underlying, schedule)
-    result = { "columns": columns, "rows": rows, }
+    result = get_schedule_nocache(path,underlying)
     if _MEMOIZE_ENABLED:
         _SCHEDULE_CACHE[cache_key] = result
     return result
@@ -233,10 +229,35 @@ def wgt(s: str) -> str:
     """Extract weight from straddle."""
     return _parse_straddle(s)[6]
 
+def _year_month_plus(year:int,month:int,offset:int):
+    total_months = year * 12 + (month - 1) - offset
+    new_year = total_months // 12
+    new_month = (total_months % 12) + 1
+    return new_year,new_month
 
-def _pack_ym(table: dict[str, Any], xpry: int, xprm: int) -> list[list]:
+def _schedule2straddle(
+    xpry:int,
+    xprm:int,
+    ntrc:str,
+    ntrv:str,
+    xprc:str,
+    xprv:str,
+    wgt:float
+):
+    offset = {"N": 1, "F": 2}.get(ntrc, 0)
+    ntry , ntrm = _year_month_plus(xpry,xprm,offset)
+    straddle = (
+        f"|{ntry}-{ntrm:02d}"
+        f"|{xpry}-{xprm:02d}"
+        f"|{ntrc}|{ntrv}"
+        f"|{xprc}|{xprv}"
+        f"|{wgt}|"
+    )
+    return straddle
+ 
+def _schedules2straddles(table: dict[str, Any], xpry: int, xprm: int) -> list[list]:
     """pack schedules table for a specific year/month into straddle strings."""
-    asset_rows = table["rows"]
+    input_rows = table["rows"]
     cols = table["columns"]
     asset_idx = cols.index("asset")
     ntrc_idx = cols.index("ntrc")
@@ -246,33 +267,21 @@ def _pack_ym(table: dict[str, Any], xpry: int, xprm: int) -> list[list]:
     wgt_idx = cols.index("wgt")
 
     rows = []
-    for asset_row in asset_rows:
+    for asset_row in input_rows:
         asset = asset_row[asset_idx]
-        ntrc = asset_row[ntrc_idx]
-        ntrv = asset_row[ntrv_idx]
-        xprc = asset_row[xprc_idx]
-        xprv = asset_row[xprv_idx]
-        wgt = asset_row[wgt_idx]
-
-        # Compute entry year/month based on Near (N) or Far (F)
-        if ntrc == "N":
-            offset = 1
-        elif ntrc == "F":
-            offset = 2
-        else:
-            offset = 0
-        total_months = xpry * 12 + (xprm - 1) - offset
-        ntry = total_months // 12
-        ntrm = (total_months % 12) + 1
-
-        # Format: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
-        straddle = f"|{ntry}-{ntrm:02d}|{xpry}-{xprm:02d}|{ntrc}|{ntrv}|{xprc}|{xprv}|{wgt}|"
+        straddle = _schedule2straddle(
+            xpry,xprm,
+            asset_row[ntrc_idx],
+            asset_row[ntrv_idx],
+            asset_row[xprc_idx],
+            asset_row[xprv_idx],
+            asset_row[wgt_idx]
+        )
         rows.append([asset, straddle])
 
     return {"columns": ["asset", "straddle"], "rows": rows}
 
-
-def _expand_and_pack(
+def _schedules2straddle_yrs(
     table: dict[str, Any], 
     start_year: int, 
     end_year: int
@@ -281,28 +290,30 @@ def _expand_and_pack(
     rows = []
     for xpry in range(start_year, end_year + 1):
         for xprm in range(1, 13):
-            packed_table = _pack_ym(table, xpry, xprm)
+            packed_table = _schedules2straddles(table, xpry, xprm)
             rows.extend(packed_table["rows"])
     return {"columns": ["asset", "straddle"], "rows": rows}
 
 
-def expand(path: str | Path, start_year: int, end_year: int, pattern: str = ".", live_only: bool = True) -> dict[str, Any]:
-    """Expand all live schedules across a year/month range into straddle strings."""
-    found = find_schedules(path,pattern=pattern,live_only=live_only)
-    straddles =  _expand_and_pack(found, start_year, end_year)
-    return  straddles
-
-def expand_ym(path: str | Path, year: int, month: int,pattern: str = ".", live_only: bool = True) -> dict[str, Any]:
-    """Expand live schedules for a specific year/month into straddle strings."""
-    found = find_schedules( path, pattern=pattern, live_only=live_only )
-    straddles = _pack_ym(found, year, month)
-    return straddles
-
-def get_expand(path: str | Path, underlying: str, start_year: int, end_year: int) -> dict[str, Any]:
+def get_straddle_yrs(path: str | Path, underlying: str, start_year: int, end_year: int) -> dict[str, Any]:
     """Expand a single asset's schedule across a year range into straddle strings."""
     schedule = get_schedule(path, underlying)
-    straddles = _expand_and_pack(schedule, start_year, end_year)
+    straddles = _schedules2straddle_yrs(schedule, start_year, end_year)
     return straddles
+
+def find_straddle_ym(path: str | Path, year: int, month: int,pattern: str = ".", live_only: bool = True) -> dict[str, Any]:
+    """Expand live schedules for a specific year/month into straddle strings."""
+    found = find_schedules( path, pattern=pattern, live_only=live_only )
+    straddles = _schedules2straddles(found, year, month)
+    return straddles
+
+def find_straddle_yrs(path: str | Path, start_year: int, end_year: int, pattern: str = ".", live_only: bool = True) -> dict[str, Any]:
+    """Expand all live schedules across a year/month range into straddle strings."""
+    found = find_schedules(path,pattern=pattern,live_only=live_only)
+    straddles =  _schedules2straddle_yrs(found, start_year, end_year)
+    return  straddles
+
+
 
 
 # -------------------------------------
@@ -318,7 +329,7 @@ def get_expand_ym(path: str | Path, underlying: str, year: int, month: int) -> d
         return _EXPAND_YM_CACHE[cache_key]
 
     schedule = get_schedule(path, underlying)
-    straddles = _pack_ym(schedule, year, month)
+    straddles = _schedules2straddles(schedule, year, month)
     if _MEMOIZE_ENABLED:
         _EXPAND_YM_CACHE[cache_key] = straddles
     return straddles
@@ -363,7 +374,7 @@ def clear_days_cache() -> None:
 # -------------------------------------
 
 
-def year_month_days(straddle) -> List[str]:
+def straddle_days(straddle) -> List[str]:
     """
     Return all calendar days from the 1st of (start_year,start_month)
     through the last day of (end_year,end_month), inclusive.
@@ -389,6 +400,28 @@ def year_month_days(straddle) -> List[str]:
         _DAYS_YM_CACHE[key] = days
 
     return days
+
+
+def find_straddle_days(
+    path: str | Path, 
+    start_year: int, 
+    end_year: int, 
+    pattern: str = ".", 
+    live_only: bool = True
+) -> dict[str, Any]:
+    straddles = find_straddle_yrs(path,start_year,end_year,pattern,live_only)
+    cols = straddles["columns"]
+    asset_idx = cols.index("asset")
+    straddle_idx = cols.index("straddle")
+    straddle_days_rows = []
+    for row in straddles["rows"]:
+        asset = row[asset_idx]
+        straddle = row[straddle_idx]
+        days = straddle_days(straddle)
+        new_rows = [[asset,straddle,day] for day in days]
+        straddle_days_rows.extend(new_rows)
+    return {"columns":["asset","straddle","date"],"rows":straddle_days_rows}
+
 
 
 # -------------------------------------
@@ -443,17 +476,17 @@ def _main() -> int:
 
     elif args.expand:
         start_year, end_year = args.expand
-        table = expand(args.path, start_year, end_year)
+        table = find_straddle_yrs(args.path, start_year, end_year)
         print_table(table)
 
     elif args.expand_ym:
         year, month = args.expand_ym
-        table = expand_ym(args.path, year, month)
+        table = find_straddle_ym(args.path, year, month)
         print_table(table)
 
     elif args.get_expand:
         underlying, start_year, end_year = args.get_expand
-        table = get_expand(args.path, underlying, int(start_year), int(end_year))
+        table = get_straddle_yrs(args.path, underlying, int(start_year), int(end_year))
         if not table["rows"]:
             print(f"No schedule found for: {underlying}")
             return 1

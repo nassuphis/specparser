@@ -28,14 +28,14 @@ The current backtest processes 178,000 straddles, but spends significant time in
 - Parsed repeatedly via `_parse_straddle()` which splits into 7 parts
 - Accessor functions (`ntry()`, `xpry()`, etc.) each re-parse the entire string
 
-### Data Flow in `expand()` → `get_straddle_valuation()`
+### Data Flow in `find_straddle_yrs()` → `get_straddle_valuation()`
 ```
 find_schedules()           # Build row-wise table of schedules
     → _schedule_to_rows()  # Parse schedule strings into rows
     → _fix_schedule()      # Apply hash-based fixes
 
-_expand_and_pack()         # Iterate years × months × rows
-    → _pack_ym()           # Pack back into straddle strings
+_schedules2straddle_yrs()  # Iterate years × months × rows
+    → _schedules2straddles()  # Pack back into straddle strings
 
 get_straddle_valuation()   # Per-straddle processing
     → asset_straddle_tickers()  # Parse straddle string again
@@ -322,7 +322,7 @@ But this is polish - the core optimization doesn't need it.
 | String operations | Multiple splits/joins | 1 f-string concat |
 | Memory | Transient | ~10KB cache |
 
-**Measured speedup for `expand()`:** 12.6x (386ms → 31ms)
+**Measured speedup for `find_straddle_yrs()`:** 12.6x (386ms → 31ms)
 
 **Implementation:** See `src/specparser/amt/strings.py`
 
@@ -330,7 +330,7 @@ But this is polish - the core optimization doesn't need it.
 $ uv run python -m specparser.amt.strings
 Fast straddle expansion benchmark
 ==================================================
-schedules.expand(): 0.386s (177,840 rows)
+schedules.find_straddle_yrs(): 0.386s (177,840 rows)
 expand_fast():      0.031s (177,840 rows)
   - precompute:     0.001s (741 templates)
   - expand:         0.030s
@@ -391,7 +391,7 @@ Instead of packing/unpacking straddle strings, keep components as separate colum
 
 ### 3. Batch Straddle Generation
 
-Replace `_expand_and_pack()` with direct columnar generation:
+Replace `_schedules2straddle_yrs()` with direct columnar generation:
 
 ```python
 def expand_columnar(
@@ -492,13 +492,13 @@ def get_prices_for_straddles(
 ## Implementation Order
 
 ### Phase 0: Pre-computed Schedule Templates (Quick Win) ⭐
-**Priority: HIGH - Easy to implement, big impact on `expand()`**
+**Priority: HIGH - Easy to implement, big impact on `find_straddle_yrs()`**
 
 1. Add `_precompute_schedules()` called from `load_amt()` or lazily on first expand
 2. Cache structure: `path -> schedule_name -> [(ntrc, ntrv, xprc, xprv, wgt, entry_offset, schid, schcnt)]`
 3. Add `_get_asset_templates()` that computes (entry_offset, suffix) with bd pre-baked
 4. Add `expand_fast()` that just does f-string concatenation
-5. Keep `expand()` as fallback, have `expand_fast()` as default
+5. Keep `find_straddle_yrs()` as fallback, have `expand_fast()` as default
 
 **Files:** `schedules.py` (add cache + fast expand), `loader.py` (trigger precompute)
 
@@ -535,13 +535,13 @@ def get_prices_for_straddles(
 
 | Operation | Current | Phase 0 (Templates) | Phase 1-3 (Columnar) |
 |-----------|---------|---------------------|----------------------|
-| `expand()` | Parse + fix + pack per straddle | 1 `.format()` per straddle | Direct columnar gen |
+| `find_straddle_yrs()` | Parse + fix + pack per straddle | 1 `.format()` per straddle | Direct columnar gen |
 | Straddle string parsing | ~178k × 7 splits | 0 (pre-formatted) | 0 (columnar) |
 | Column index lookups | O(n) per access | Same | O(1) dict key |
 | Hash computation | Per straddle | Per (asset, schid) | Per (asset, schid) |
 | Price lookups | Already O(1) | Same | Same |
 
-**Phase 0 alone:** 50-100x speedup for `expand()` (seconds → tens of milliseconds)
+**Phase 0 alone:** 50-100x speedup for `find_straddle_yrs()` (seconds → tens of milliseconds)
 
 **Overall estimated improvement:** 20-40% reduction in total backtest time. Main wins:
 1. Template format eliminates expand overhead

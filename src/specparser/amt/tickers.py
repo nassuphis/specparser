@@ -1784,7 +1784,7 @@ def _main() -> int:
 
     elif args.expand_ym:
         pattern, live, year, month = args.expand_ym
-        table = schedules.expand_ym( args.path, int(year), int(month), pattern, str2bool(live) )
+        table = schedules.find_straddle_ym( args.path, int(year), int(month), pattern, str2bool(live) )
         loader.print_table(table)
 
     elif args.get_expand_ym:

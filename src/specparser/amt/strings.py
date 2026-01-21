@@ -176,10 +176,10 @@ def _benchmark():
 
     # Current implementation
     t0 = time.perf_counter()
-    current_result = schedules.expand(amt_path, start_year, end_year, ".", True)
+    current_result = schedules.find_straddle_yrs(amt_path, start_year, end_year, ".", True)
     t1 = time.perf_counter()
     current_time = t1 - t0
-    print(f"schedules.expand(): {current_time:.3f}s ({len(current_result['rows']):,} rows)")
+    print(f"schedules.find_straddle_yrs(): {current_time:.3f}s ({len(current_result['rows']):,} rows)")
 
     # New implementation
     t0 = time.perf_counter()

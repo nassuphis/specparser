@@ -215,7 +215,7 @@ def _main() -> int:
     # Generate table from AMT
     if args.amt and args.expand:
         start_year, end_year = args.expand
-        table = amt.expand(args.amt, start_year, end_year)
+        table = amt.find_straddle_yrs(args.amt, start_year, end_year)
 
         if args.to_parquet:
             table_to_parquet(table, args.to_parquet)

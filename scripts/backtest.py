@@ -115,7 +115,7 @@ def main():
     memoize = not args.no_memoize
 
     # Get all straddles for the pattern and year range
-    table = schedules.expand(args.amt, args.start_year, args.end_year, args.pattern, True)
+    table = schedules.find_straddle_yrs(args.amt, args.start_year, args.end_year, args.pattern, True)
 
     if not table["rows"]:
         print(f"No straddles found for pattern '{args.pattern}' in {args.start_year}-{args.end_year}", file=sys.stderr)

@@ -38,10 +38,10 @@ Write a table dict to a Parquet file.
 
 ```python
 from specparser.storage import table_to_parquet
-from specparser.amt import expand
+from specparser.amt import find_straddle_yrs
 
 # Generate table (straddle strings)
-table = expand("data/amt.yml", 2024, 2025)
+table = find_straddle_yrs("data/amt.yml", 2024, 2025)
 
 # Write to Parquet
 table_to_parquet(table, "straddles.parquet")
@@ -112,7 +112,7 @@ Write a table dict to a DuckDB database.
 from specparser.storage import table_to_duckdb
 from specparser.amt import expand
 
-table = expand("data/amt.yml", 2024, 2025)
+table = find_straddle_yrs("data/amt.yml", 2024, 2025)
 table_to_duckdb(table, "data.duckdb", "straddles")
 ```
 
@@ -203,7 +203,7 @@ from specparser.amt import expand
 from specparser.storage import table_to_duckdb, table_to_parquet, query_duckdb
 
 # Generate straddle data
-straddles = expand("data/amt.yml", 2024, 2025)
+straddles = find_straddle_yrs("data/amt.yml", 2024, 2025)
 
 # Store in DuckDB
 table_to_duckdb(straddles, "portfolio.duckdb", "straddles")

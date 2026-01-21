@@ -40,9 +40,9 @@ from specparser.amt import (
     get_schedule,
     find_schedules,
     _split_code_value,
-    expand,
-    expand_ym,
-    get_expand,
+    find_straddle_yrs,
+    find_straddle_ym,
+    get_straddle_yrs,
     get_expand_ym,
     # straddle parsing
     ntr,
@@ -712,10 +712,10 @@ class TestSchedules:
         all_sch = find_schedules(test_amt_file, ".", live_only=False)
         assert len(all_sch["rows"]) >= len(live["rows"])
 
-    def test_expand_ym(self, test_amt_file):
+    def test_find_straddle_ym(self, test_amt_file):
         """Test expanding schedules for a specific year/month."""
         clear_cache()
-        table = expand_ym(test_amt_file, 2024, 6, pattern="^CL", live_only=False)
+        table = find_straddle_ym(test_amt_file, 2024, 6, pattern="^CL", live_only=False)
         assert table["columns"] == ["asset", "straddle"]
         assert len(table["rows"]) == 2  # CL Comdty has 2 schedule components
 
@@ -725,18 +725,18 @@ class TestSchedules:
             assert row[1].startswith("|")
             assert row[1].endswith("|")
 
-    def test_expand(self, test_amt_file):
+    def test_find_straddle_yrs(self, test_amt_file):
         """Test expanding schedules across year range."""
         clear_cache()
-        table = expand(test_amt_file, 2024, 2024, pattern="^CL", live_only=False)
+        table = find_straddle_yrs(test_amt_file, 2024, 2024, pattern="^CL", live_only=False)
         # 12 months * 2 schedule components = 24 rows
         assert len(table["rows"]) == 24
         assert table["columns"] == ["asset", "straddle"]
 
-    def test_get_expand(self, test_amt_file):
-        """Test get_expand for single asset."""
+    def test_get_straddle_yrs(self, test_amt_file):
+        """Test get_straddle_yrs for single asset."""
         clear_cache()
-        table = get_expand(test_amt_file, "CL Comdty", 2024, 2024)
+        table = get_straddle_yrs(test_amt_file, "CL Comdty", 2024, 2024)
         # 12 months * 2 schedule components = 24 rows
         assert len(table["rows"]) == 24
 
@@ -746,16 +746,16 @@ class TestSchedules:
         table = get_expand_ym(test_amt_file, "CL Comdty", 2024, 6)
         assert len(table["rows"]) == 2
 
-    def test_expand_empty_pattern(self, test_amt_file):
-        """Test expand with pattern matching no assets."""
+    def test_find_straddle_yrs_empty_pattern(self, test_amt_file):
+        """Test find_straddle_yrs with pattern matching no assets."""
         clear_cache()
-        table = expand(test_amt_file, 2024, 2024, pattern="^NONEXISTENT", live_only=False)
+        table = find_straddle_yrs(test_amt_file, 2024, 2024, pattern="^NONEXISTENT", live_only=False)
         assert len(table["rows"]) == 0
 
     def test_straddle_format(self, test_amt_file):
         """Test straddle string format is correct."""
         clear_cache()
-        table = expand_ym(test_amt_file, 2024, 6, pattern="^CL", live_only=False)
+        table = find_straddle_ym(test_amt_file, 2024, 6, pattern="^CL", live_only=False)
 
         for row in table["rows"]:
             straddle = row[1]
@@ -2488,7 +2488,7 @@ class TestIntegration:
         assert len(schedule["rows"]) > 0
 
         # Expand for a year
-        expanded = get_expand(test_amt_file, asset, 2024, 2024)
+        expanded = get_straddle_yrs(test_amt_file, asset, 2024, 2024)
         assert len(expanded["rows"]) == 24  # 12 months * 2 components
 
     def test_asset_classification_workflow(self, test_amt_file):

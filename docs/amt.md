@@ -457,7 +457,7 @@ This spreads entries across the month to avoid clustering, with deterministic re
 
 ### Schedule Expansion
 
-#### `expand(path, start_year, end_year)`
+#### `find_straddle_yrs(path, start_year, end_year, pattern, live_only)`
 
 Expand all live schedules across a year/month range into straddle strings.
 
@@ -469,9 +469,9 @@ Computes the cartesian product of:
 Each row is packed into a pipe-delimited straddle string.
 
 ```python
-from specparser.amt import expand
+from specparser.amt import find_straddle_yrs
 
-table = expand("data/amt.yml", 2024, 2025)
+table = find_straddle_yrs("data/amt.yml", 2024, 2025)
 # Columns: ['asset', 'straddle']
 ```
 
@@ -483,25 +483,25 @@ Example: `|2023-12|2024-01|N|0|OVERRIDE||33.3|`
 - `ntrc = "N"` (Near): Entry is 1 month before expiry
 - `ntrc = "F"` (Far): Entry is 2 months before expiry
 
-#### `expand_ym(path, year, month)`
+#### `find_straddle_ym(path, year, month, pattern, live_only)`
 
 Expand all live schedules for a specific year/month into straddle strings.
 
 ```python
-from specparser.amt import expand_ym
+from specparser.amt import find_straddle_ym
 
-table = expand_ym("data/amt.yml", 2024, 6)
+table = find_straddle_ym("data/amt.yml", 2024, 6)
 # Columns: ['asset', 'straddle']
 ```
 
-#### `get_expand(path, underlying, start_year, end_year)`
+#### `get_straddle_yrs(path, underlying, start_year, end_year)`
 
 Expand a single asset's schedule across a year range into straddle strings.
 
 ```python
-from specparser.amt import get_expand
+from specparser.amt import get_straddle_yrs
 
-table = get_expand("data/amt.yml", "LA Comdty", 2024, 2025)
+table = get_straddle_yrs("data/amt.yml", "LA Comdty", 2024, 2025)
 # Columns: ['asset', 'straddle']
 ```
 
@@ -689,9 +689,9 @@ Where:
 ### Get all schedules for 2024-2025 as straddle strings
 
 ```python
-from specparser.amt import expand
+from specparser.amt import find_straddle_yrs
 
-table = expand("data/amt.yml", 2024, 2025)
+table = find_straddle_yrs("data/amt.yml", 2024, 2025)
 # Columns: ['asset', 'straddle']
 
 for row in table['rows'][:5]:
@@ -714,10 +714,10 @@ if table['rows']:
 ### Expand schedules for specific assets
 
 ```python
-from specparser.amt import expand
+from specparser.amt import find_straddle_yrs
 
 # Expand only commodities matching pattern
-table = expand("data/amt.yml", 2024, 2024, pattern="^CL.*")
+table = find_straddle_yrs("data/amt.yml", 2024, 2024, pattern="^CL.*")
 
 for row in table['rows'][:5]:
     asset, straddle = row
@@ -727,9 +727,9 @@ for row in table['rows'][:5]:
 ### Parse straddle strings
 
 ```python
-from specparser.amt import expand
+from specparser.amt import find_straddle_yrs
 
-table = expand("data/amt.yml", 2024, 2024)
+table = find_straddle_yrs("data/amt.yml", 2024, 2024)
 
 # Straddle format: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
 for row in table['rows'][:5]:
