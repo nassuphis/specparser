@@ -2278,10 +2278,10 @@ class TestNthGoodDayAfter:
 # -------------------------------------
 
 class TestStrikeColumns:
-    """Tests for strike columns (strike_vol, strike, strike1, ...) in get_straddle_days output."""
+    """Tests for strike columns (strike_vol, strike, strike1, ...) in get_straddle_actions output."""
 
     def _make_mock_output(self, actions):
-        """Create mock get_straddle_days output (before strike columns are added).
+        """Create mock get_straddle_actions output (before strike columns are added).
 
         Returns rows with: asset, straddle, date, vol, hedge, hedge1, action, model
         """
@@ -2296,7 +2296,7 @@ class TestStrikeColumns:
         return {"columns": columns, "rows": rows}
 
     def _add_strike_columns(self, table):
-        """Add strike columns to a table (simulates the logic in get_straddle_days)."""
+        """Add strike columns to a table (simulates the logic in get_straddle_actions)."""
         out_columns = table["columns"][:]
         out_rows = [row[:] for row in table["rows"]]
 
@@ -4387,3 +4387,882 @@ class TestArrowComputeInputOrientations:
         result = table_add_arrow(t, "a", 10)
         assert result["orientation"] == "arrow"
         assert result["rows"][0].to_pylist() == [11, 12, 13]
+
+
+# -------------------------------------
+# Tests for table_explode_arrow
+# -------------------------------------
+
+from specparser.amt.table import table_explode_arrow
+
+
+class TestTableExplodeArrow:
+    """Test table_explode_arrow function."""
+
+    def test_basic_explode(self):
+        """Test basic list column explosion."""
+        import pyarrow as pa
+        table = {
+            "orientation": "arrow",
+            "columns": ["id", "items"],
+            "rows": [
+                pa.array([1, 2, 3]),
+                pa.array([["a", "b"], ["c"], ["d", "e", "f"]], type=pa.list_(pa.string()))
+            ]
+        }
+        result = table_explode_arrow(table, "items")
+        assert len(result["rows"][0]) == 6  # 2 + 1 + 3
+        assert result["rows"][0].to_pylist() == [1, 1, 2, 3, 3, 3]
+        assert result["rows"][1].to_pylist() == ["a", "b", "c", "d", "e", "f"]
+
+    def test_empty_list_produces_no_rows(self):
+        """Test that empty lists produce no output rows."""
+        import pyarrow as pa
+        table = {
+            "orientation": "arrow",
+            "columns": ["id", "items"],
+            "rows": [
+                pa.array([1, 2, 3]),
+                pa.array([["a"], [], ["b"]], type=pa.list_(pa.string()))
+            ]
+        }
+        result = table_explode_arrow(table, "items")
+        assert result["rows"][0].to_pylist() == [1, 3]
+        assert result["rows"][1].to_pylist() == ["a", "b"]
+
+    def test_null_list_produces_no_rows(self):
+        """Test that null list values produce no output rows."""
+        import pyarrow as pa
+        table = {
+            "orientation": "arrow",
+            "columns": ["id", "items"],
+            "rows": [
+                pa.array([1, 2, 3]),
+                pa.array([["a"], None, ["b"]], type=pa.list_(pa.string()))
+            ]
+        }
+        result = table_explode_arrow(table, "items")
+        assert result["rows"][0].to_pylist() == [1, 3]
+        assert result["rows"][1].to_pylist() == ["a", "b"]
+
+    def test_non_list_column_raises_type_error(self):
+        """Test that non-list column raises TypeError."""
+        import pyarrow as pa
+        table = {
+            "orientation": "arrow",
+            "columns": ["id", "value"],
+            "rows": [
+                pa.array([1, 2, 3]),
+                pa.array(["a", "b", "c"])  # Not a list column
+            ]
+        }
+        with pytest.raises(TypeError, match="expected list type"):
+            table_explode_arrow(table, "value")
+
+    def test_accepts_column_by_index(self):
+        """Test that column can be specified by index."""
+        import pyarrow as pa
+        table = {
+            "orientation": "arrow",
+            "columns": ["id", "items"],
+            "rows": [
+                pa.array([1, 2]),
+                pa.array([["a", "b"], ["c"]], type=pa.list_(pa.string()))
+            ]
+        }
+        result = table_explode_arrow(table, 1)  # by index
+        assert result["rows"][1].to_pylist() == ["a", "b", "c"]
+
+    def test_converts_row_oriented_input(self):
+        """Test that row-oriented input is converted to arrow first."""
+        table = {
+            "orientation": "row",
+            "columns": ["id", "items"],
+            "rows": [[1, ["a", "b"]], [2, ["c"]]]
+        }
+        result = table_explode_arrow(table, "items")
+        assert result["orientation"] == "arrow"
+        assert result["rows"][0].to_pylist() == [1, 1, 2]
+        assert result["rows"][1].to_pylist() == ["a", "b", "c"]
+
+
+# -------------------------------------
+# Tests for straddle Arrow functions
+# -------------------------------------
+
+from specparser.amt.schedules import (
+    _build_month_calendar_arrow,
+    _get_month_calendar,
+    _build_ntrc_calendar_from_months,
+    _get_ntrc_calendar,
+    _ntrc_to_span,
+    find_straddle_days,
+    find_straddle_days_arrow,
+    find_straddle_days_numba,
+    clear_calendar_cache,
+)
+
+
+class TestMonthCalendar:
+    """Test month calendar functions."""
+
+    def test_build_month_calendar_basic(self):
+        """Test building month calendar for a single year."""
+        cal = _build_month_calendar_arrow(2024, 2024)
+        assert cal["columns"] == ["ym", "dates"]
+        assert len(cal["rows"][0]) == 12  # 12 months
+
+        yms = cal["rows"][0].to_pylist()
+        assert yms[0] == "2024-01"
+        assert yms[11] == "2024-12"
+
+        # January 2024 has 31 days
+        jan_dates = cal["rows"][1][0].as_py()
+        assert len(jan_dates) == 31
+
+        # February 2024 has 29 days (leap year)
+        feb_dates = cal["rows"][1][1].as_py()
+        assert len(feb_dates) == 29
+
+    def test_build_month_calendar_multi_year(self):
+        """Test building month calendar for multiple years."""
+        cal = _build_month_calendar_arrow(2023, 2025)
+        assert len(cal["rows"][0]) == 36  # 3 years * 12 months
+
+    def test_get_month_calendar_caches(self):
+        """Test that calendar is cached."""
+        clear_calendar_cache()
+        cal1 = _get_month_calendar(2024, 2024)
+        cal2 = _get_month_calendar(2024, 2024)
+        # Should be same object (cached)
+        assert cal1 is cal2
+
+    def test_get_month_calendar_expands_range(self):
+        """Test that cache is rebuilt for wider range."""
+        clear_calendar_cache()
+        cal1 = _get_month_calendar(2024, 2024)
+        # Request wider range
+        cal2 = _get_month_calendar(2020, 2030)
+        # Should be different (rebuilt)
+        assert cal1 is not cal2
+
+
+class TestNtrcCalendar:
+    """Test NTRC calendar functions."""
+
+    def test_build_ntrc_calendar_basic(self):
+        """Test building NTRC calendar from month calendar."""
+        month_cal = _build_month_calendar_arrow(2024, 2024)
+        ntrc_cal = _build_ntrc_calendar_from_months(month_cal)
+
+        assert ntrc_cal["columns"] == ["key", "dates"]
+        keys = ntrc_cal["rows"][0].to_pylist()
+
+        # Should have 2-month and 3-month spans
+        assert "2024-01-2" in keys
+        assert "2024-01-3" in keys
+
+    def test_ntrc_calendar_2month_span(self):
+        """Test 2-month span dates (Jan + Feb)."""
+        month_cal = _build_month_calendar_arrow(2024, 2024)
+        ntrc_cal = _build_ntrc_calendar_from_months(month_cal)
+
+        keys = ntrc_cal["rows"][0].to_pylist()
+        idx = keys.index("2024-01-2")
+        dates = ntrc_cal["rows"][1][idx].as_py()
+
+        # Jan (31) + Feb (29 in 2024) = 60 days
+        assert len(dates) == 60
+
+    def test_ntrc_calendar_3month_span(self):
+        """Test 3-month span dates (Jan + Feb + Mar)."""
+        month_cal = _build_month_calendar_arrow(2024, 2024)
+        ntrc_cal = _build_ntrc_calendar_from_months(month_cal)
+
+        keys = ntrc_cal["rows"][0].to_pylist()
+        idx = keys.index("2024-01-3")
+        dates = ntrc_cal["rows"][1][idx].as_py()
+
+        # Jan (31) + Feb (29) + Mar (31) = 91 days
+        assert len(dates) == 91
+
+
+class TestNtrcToSpan:
+    """Test NTRC to span mapping."""
+
+    def test_valid_ntrc_values(self):
+        """Test mapping valid NTRC values."""
+        import pyarrow as pa
+        ntrc = pa.array(["N", "F", "N", "F"])
+        span = _ntrc_to_span(ntrc)
+        assert span.to_pylist() == ["2", "3", "2", "3"]
+
+    def test_invalid_ntrc_raises(self):
+        """Test that invalid NTRC values raise ValueError."""
+        import pyarrow as pa
+        ntrc = pa.array(["N", "X", "F"])
+        with pytest.raises(ValueError, match="Invalid NTRC value: 'X'"):
+            _ntrc_to_span(ntrc)
+
+    def test_all_n_values(self):
+        """Test all N values."""
+        import pyarrow as pa
+        ntrc = pa.array(["N", "N", "N"])
+        span = _ntrc_to_span(ntrc)
+        assert span.to_pylist() == ["2", "2", "2"]
+
+    def test_all_f_values(self):
+        """Test all F values."""
+        import pyarrow as pa
+        ntrc = pa.array(["F", "F", "F"])
+        span = _ntrc_to_span(ntrc)
+        assert span.to_pylist() == ["3", "3", "3"]
+
+
+class TestFindStraddleDaysArrow:
+    """Test Arrow-based find_straddle_days_arrow."""
+
+    def test_empty_straddles(self, test_amt_file):
+        """Test with no matching straddles."""
+        # Pattern that matches nothing
+        result = find_straddle_days_arrow(test_amt_file, 2024, 2024, pattern="NOMATCH")
+        assert result["columns"] == ["asset", "straddle", "date"]
+        assert len(result["rows"][0]) == 0
+
+    def test_basic_expansion(self, test_amt_file):
+        """Test basic straddle expansion."""
+        result = find_straddle_days_arrow(test_amt_file, 2024, 2024, pattern="CL")
+        assert result["columns"] == ["asset", "straddle", "date"]
+        assert result["orientation"] == "arrow"
+        # Should have some rows
+        assert len(result["rows"][0]) > 0
+
+    def test_matches_legacy_output(self, test_amt_file):
+        """Test that arrow implementation matches standard."""
+        import pyarrow as pa
+        clear_calendar_cache()
+
+        # Run both implementations
+        standard = find_straddle_days(test_amt_file, 2024, 2024, pattern="CL")
+        arrow = find_straddle_days_arrow(test_amt_file, 2024, 2024, pattern="CL")
+
+        # Convert both to comparable format
+        standard_rows = table_to_rows(standard)["rows"]
+        arrow_rows = table_to_rows(arrow)["rows"]
+
+        # Sort for comparison (order might differ)
+        standard_sorted = sorted(standard_rows, key=lambda r: (r[0], r[1], str(r[2])))
+        arrow_sorted = sorted(arrow_rows, key=lambda r: (r[0], r[1], str(r[2])))
+
+        assert len(standard_sorted) == len(arrow_sorted), f"Row count mismatch: {len(standard_sorted)} vs {len(arrow_sorted)}"
+
+        for i, (std, arr) in enumerate(zip(standard_sorted, arrow_sorted)):
+            assert std[0] == arr[0], f"Row {i}: asset mismatch {std[0]} vs {arr[0]}"
+            assert std[1] == arr[1], f"Row {i}: straddle mismatch {std[1]} vs {arr[1]}"
+            # Compare dates (may be different types)
+            assert str(std[2]) == str(arr[2]), f"Row {i}: date mismatch {std[2]} vs {arr[2]}"
+
+
+class TestFindStraddleDaysNumba:
+    """Test Numba-based find_straddle_days_numba."""
+
+    def test_empty_straddles(self, test_amt_file):
+        """Test with no matching straddles."""
+        result = find_straddle_days_numba(test_amt_file, 2024, 2024, pattern="NOMATCH")
+        assert result["columns"] == ["asset", "straddle", "date"]
+        assert len(result["rows"][0]) == 0
+
+    def test_basic_expansion(self, test_amt_file):
+        """Test basic straddle expansion."""
+        result = find_straddle_days_numba(test_amt_file, 2024, 2024, pattern="CL")
+        assert result["columns"] == ["asset", "straddle", "date"]
+        assert result["orientation"] == "arrow"
+        # Should have some rows
+        assert len(result["rows"][0]) > 0
+
+    def test_parallel_matches_sequential(self, test_amt_file):
+        """Test that parallel version matches sequential."""
+        seq = find_straddle_days_numba(test_amt_file, 2024, 2024, pattern="CL", parallel=False)
+        par = find_straddle_days_numba(test_amt_file, 2024, 2024, pattern="CL", parallel=True)
+
+        seq_rows = table_to_rows(seq)["rows"]
+        par_rows = table_to_rows(par)["rows"]
+
+        seq_sorted = sorted(seq_rows, key=lambda r: (r[0], r[1], str(r[2])))
+        par_sorted = sorted(par_rows, key=lambda r: (r[0], r[1], str(r[2])))
+
+        assert len(seq_sorted) == len(par_sorted)
+        for s, p in zip(seq_sorted, par_sorted):
+            assert s == p
+
+    def test_matches_arrow_output(self, test_amt_file):
+        """Test that Numba implementation matches Arrow implementation."""
+        clear_calendar_cache()
+
+        arrow = find_straddle_days_arrow(test_amt_file, 2024, 2024, pattern="CL")
+        numba = find_straddle_days_numba(test_amt_file, 2024, 2024, pattern="CL")
+
+        arrow_rows = table_to_rows(arrow)["rows"]
+        numba_rows = table_to_rows(numba)["rows"]
+
+        arrow_sorted = sorted(arrow_rows, key=lambda r: (r[0], r[1], str(r[2])))
+        numba_sorted = sorted(numba_rows, key=lambda r: (r[0], r[1], str(r[2])))
+
+        assert len(arrow_sorted) == len(numba_sorted), \
+            f"Row count mismatch: {len(arrow_sorted)} vs {len(numba_sorted)}"
+
+        for i, (arr, num) in enumerate(zip(arrow_sorted, numba_sorted)):
+            assert arr[0] == num[0], f"Row {i}: asset mismatch {arr[0]} vs {num[0]}"
+            assert arr[1] == num[1], f"Row {i}: straddle mismatch {arr[1]} vs {num[1]}"
+            assert str(arr[2]) == str(num[2]), f"Row {i}: date mismatch {arr[2]} vs {num[2]}"
+
+
+class TestNumbaKernels:
+    """Test Numba kernel functions directly."""
+
+    def test_expand_basic(self):
+        """Single straddle: Jan 2025, 2 months."""
+        import numpy as np
+        import datetime
+        from specparser.amt._numba_kernels import expand_months_to_date32
+
+        year = np.array([2025], dtype=np.int32)
+        month = np.array([1], dtype=np.int32)
+        month_count = np.array([2], dtype=np.int32)
+
+        date32, parent_idx = expand_months_to_date32(year, month, month_count)
+
+        # Jan has 31 days, Feb 2025 has 28 days (not leap year)
+        assert len(date32) == 59
+        assert np.all(parent_idx == 0)
+
+        # Verify date range using Arrow
+        import pyarrow as pa
+        dates = pa.array(date32, type=pa.date32()).to_pylist()
+        assert dates[0] == datetime.date(2025, 1, 1)
+        assert dates[-1] == datetime.date(2025, 2, 28)
+
+    def test_expand_leap_year(self):
+        """Feb 2024 (leap year) should have 29 days."""
+        import numpy as np
+        from specparser.amt._numba_kernels import expand_months_to_date32
+
+        year = np.array([2024], dtype=np.int32)
+        month = np.array([2], dtype=np.int32)
+        month_count = np.array([1], dtype=np.int32)
+
+        date32, parent_idx = expand_months_to_date32(year, month, month_count)
+        assert len(date32) == 29  # Feb 2024 has 29 days
+
+    def test_expand_multiple(self):
+        """Two straddles with different spans."""
+        import numpy as np
+        from specparser.amt._numba_kernels import expand_months_to_date32
+
+        year = np.array([2024, 2025], dtype=np.int32)
+        month = np.array([1, 6], dtype=np.int32)
+        month_count = np.array([2, 3], dtype=np.int32)
+
+        date32, parent_idx = expand_months_to_date32(year, month, month_count)
+
+        # First: Jan(31) + Feb(29) = 60 days (2024 is leap year)
+        # Second: Jun(30) + Jul(31) + Aug(31) = 92 days
+        assert len(date32) == 60 + 92
+        assert np.sum(parent_idx == 0) == 60
+        assert np.sum(parent_idx == 1) == 92
+
+    def test_parallel_matches_sequential(self):
+        """Parallel version should produce identical output."""
+        import numpy as np
+        from specparser.amt._numba_kernels import (
+            expand_months_to_date32,
+            expand_months_to_date32_parallel,
+        )
+
+        year = np.array([2024, 2024, 2025], dtype=np.int32)
+        month = np.array([1, 6, 11], dtype=np.int32)
+        month_count = np.array([2, 3, 2], dtype=np.int32)
+
+        date32_seq, parent_seq = expand_months_to_date32(year, month, month_count)
+        date32_par, parent_par = expand_months_to_date32_parallel(year, month, month_count)
+
+        np.testing.assert_array_equal(date32_seq, date32_par)
+        np.testing.assert_array_equal(parent_seq, parent_par)
+
+    def test_ymd_to_date32_known_dates(self):
+        """Verify ymd_to_date32 against known values."""
+        from specparser.amt._numba_kernels import ymd_to_date32
+
+        # Unix epoch
+        assert ymd_to_date32(1970, 1, 1) == 0
+        # Known date: 2024-01-01 = 19723 days since epoch
+        assert ymd_to_date32(2024, 1, 1) == 19723
+        # Leap day 2024
+        assert ymd_to_date32(2024, 2, 29) == 19723 + 31 + 28  # Jan + Feb (minus 1 for day 1)
+
+    def test_is_leap_year(self):
+        """Test leap year detection."""
+        from specparser.amt._numba_kernels import is_leap_year
+
+        # Leap years
+        assert is_leap_year(2024) is True
+        assert is_leap_year(2000) is True  # divisible by 400
+
+        # Non-leap years
+        assert is_leap_year(2023) is False
+        assert is_leap_year(2100) is False  # divisible by 100 but not 400
+
+    def test_last_day_of_month(self):
+        """Test last day of month calculation."""
+        from specparser.amt._numba_kernels import last_day_of_month
+
+        assert last_day_of_month(2024, 1) == 31  # Jan
+        assert last_day_of_month(2024, 2) == 29  # Feb leap year
+        assert last_day_of_month(2023, 2) == 28  # Feb non-leap year
+        assert last_day_of_month(2024, 4) == 30  # Apr
+        assert last_day_of_month(2024, 12) == 31  # Dec
+
+    def test_add_months(self):
+        """Test add_months calculation."""
+        from specparser.amt._numba_kernels import add_months
+
+        assert add_months(2024, 1, 0) == (2024, 1)
+        assert add_months(2024, 1, 1) == (2024, 2)
+        assert add_months(2024, 11, 2) == (2025, 1)  # cross year
+        assert add_months(2024, 12, 1) == (2025, 1)
+
+
+# -------------------------------------
+# table_pivot_wider tests
+# -------------------------------------
+
+
+class TestTablePivotWider:
+    """Tests for table_pivot_wider()."""
+
+    def test_basic_pivot(self):
+        """Test basic long-to-wide pivot."""
+        from specparser.amt.table import table_pivot_wider
+
+        long_table = {
+            "orientation": "row",
+            "columns": ["id", "param", "value"],
+            "rows": [
+                [1, "vol", 0.2],
+                [1, "hedge", 100],
+                [2, "vol", 0.3],
+                [2, "hedge", 101],
+            ],
+        }
+
+        result = table_pivot_wider(long_table, names_from="param", values_from="value")
+
+        assert result["columns"] == ["id", "vol", "hedge"]
+        assert len(result["rows"]) == 2
+
+        # Check values
+        rows_by_id = {row[0]: row for row in result["rows"]}
+        assert rows_by_id[1] == [1, 0.2, 100]
+        assert rows_by_id[2] == [2, 0.3, 101]
+
+    def test_pivot_with_fill_value(self):
+        """Test pivot with missing values filled."""
+        from specparser.amt.table import table_pivot_wider
+
+        long_table = {
+            "orientation": "row",
+            "columns": ["id", "param", "value"],
+            "rows": [
+                [1, "vol", 0.2],
+                [1, "hedge", 100],
+                [2, "vol", 0.3],
+                # Missing: [2, "hedge", ...]
+            ],
+        }
+
+        result = table_pivot_wider(
+            long_table, names_from="param", values_from="value", fill_value="none"
+        )
+
+        rows_by_id = {row[0]: row for row in result["rows"]}
+        assert rows_by_id[2] == [2, 0.3, "none"]
+
+    def test_pivot_preserves_name_order(self):
+        """Test that column order matches first occurrence order."""
+        from specparser.amt.table import table_pivot_wider
+
+        long_table = {
+            "orientation": "row",
+            "columns": ["id", "param", "value"],
+            "rows": [
+                [1, "hedge", 100],
+                [1, "vol", 0.2],
+                [1, "spot", 50],
+            ],
+        }
+
+        result = table_pivot_wider(long_table, names_from="param", values_from="value")
+
+        # Order should be: hedge, vol, spot (first occurrence order)
+        assert result["columns"] == ["id", "hedge", "vol", "spot"]
+
+    def test_pivot_last_value_wins(self):
+        """Test that last value wins for duplicates."""
+        from specparser.amt.table import table_pivot_wider
+
+        long_table = {
+            "orientation": "row",
+            "columns": ["id", "param", "value"],
+            "rows": [
+                [1, "vol", 0.1],
+                [1, "vol", 0.2],  # duplicate - should win
+            ],
+        }
+
+        result = table_pivot_wider(long_table, names_from="param", values_from="value")
+
+        assert result["rows"][0] == [1, 0.2]
+
+    def test_pivot_multiple_id_cols(self):
+        """Test pivot with multiple id columns."""
+        from specparser.amt.table import table_pivot_wider
+
+        long_table = {
+            "orientation": "row",
+            "columns": ["asset", "straddle", "param", "value"],
+            "rows": [
+                ["CL", "S1", "vol", 0.2],
+                ["CL", "S1", "hedge", 100],
+                ["NG", "S2", "vol", 0.3],
+                ["NG", "S2", "hedge", 101],
+            ],
+        }
+
+        result = table_pivot_wider(long_table, names_from="param", values_from="value")
+
+        assert result["columns"] == ["asset", "straddle", "vol", "hedge"]
+        assert len(result["rows"]) == 2
+
+    def test_pivot_explicit_id_cols(self):
+        """Test pivot with explicitly specified id columns."""
+        from specparser.amt.table import table_pivot_wider
+
+        long_table = {
+            "orientation": "row",
+            "columns": ["id", "extra", "param", "value"],
+            "rows": [
+                [1, "a", "vol", 0.2],
+                [1, "a", "hedge", 100],
+            ],
+        }
+
+        # Only use 'id' as id column, ignore 'extra'
+        result = table_pivot_wider(
+            long_table, names_from="param", values_from="value", id_cols=["id"]
+        )
+
+        assert result["columns"] == ["id", "vol", "hedge"]
+
+    def test_pivot_empty_table(self):
+        """Test pivot with empty table."""
+        from specparser.amt.table import table_pivot_wider
+
+        empty_table = {
+            "orientation": "row",
+            "columns": ["id", "param", "value"],
+            "rows": [],
+        }
+
+        result = table_pivot_wider(empty_table, names_from="param", values_from="value")
+
+        assert result["columns"] == ["id"]
+        assert result["rows"] == []
+
+    def test_pivot_column_oriented_input(self):
+        """Test pivot works with column-oriented input."""
+        from specparser.amt.table import table_pivot_wider
+
+        col_table = {
+            "orientation": "column",
+            "columns": ["id", "param", "value"],
+            "rows": [[1, 1, 2, 2], ["vol", "hedge", "vol", "hedge"], [0.2, 100, 0.3, 101]],
+        }
+
+        result = table_pivot_wider(col_table, names_from="param", values_from="value")
+
+        assert result["columns"] == ["id", "vol", "hedge"]
+        assert len(result["rows"]) == 2
+
+
+# -------------------------------------
+# table_lag / table_lead tests
+# -------------------------------------
+
+
+class TestTableLag:
+    """Tests for table_lag() and table_lead()."""
+
+    def test_basic_lag(self):
+        """Test basic lag by 1."""
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "row",
+            "columns": ["date", "price"],
+            "rows": [
+                ["Jan-01", 100],
+                ["Jan-02", 101],
+                ["Jan-03", 102],
+            ],
+        }
+
+        result = table_lag(table, "price")
+
+        assert "price_lag1" in result["columns"]
+        price_lag_idx = result["columns"].index("price_lag1")
+
+        # Check lagged values
+        assert result["rows"][0][price_lag_idx] is None
+        assert result["rows"][1][price_lag_idx] == 100
+        assert result["rows"][2][price_lag_idx] == 101
+
+    def test_lag_with_n(self):
+        """Test lag by n > 1."""
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "row",
+            "columns": ["date", "price"],
+            "rows": [
+                ["Jan-01", 100],
+                ["Jan-02", 101],
+                ["Jan-03", 102],
+                ["Jan-04", 103],
+            ],
+        }
+
+        result = table_lag(table, "price", n=2)
+
+        price_lag_idx = result["columns"].index("price_lag2")
+
+        assert result["rows"][0][price_lag_idx] is None
+        assert result["rows"][1][price_lag_idx] is None
+        assert result["rows"][2][price_lag_idx] == 100
+        assert result["rows"][3][price_lag_idx] == 101
+
+    def test_lag_with_default(self):
+        """Test lag with custom default value."""
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "row",
+            "columns": ["price"],
+            "rows": [[100], [101], [102]],
+        }
+
+        result = table_lag(table, "price", default=0)
+
+        price_lag_idx = result["columns"].index("price_lag1")
+        assert result["rows"][0][price_lag_idx] == 0
+
+    def test_lag_with_custom_result_column(self):
+        """Test lag with custom result column name."""
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "row",
+            "columns": ["price"],
+            "rows": [[100], [101]],
+        }
+
+        result = table_lag(table, "price", result_column="prev_price")
+
+        assert "prev_price" in result["columns"]
+        assert "price_lag1" not in result["columns"]
+
+    def test_lag_zero(self):
+        """Test lag with n=0 (identity)."""
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "row",
+            "columns": ["price"],
+            "rows": [[100], [101]],
+        }
+
+        result = table_lag(table, "price", n=0, result_column="price_copy")
+
+        price_copy_idx = result["columns"].index("price_copy")
+        assert result["rows"][0][price_copy_idx] == 100
+        assert result["rows"][1][price_copy_idx] == 101
+
+    def test_lag_exceeds_rows(self):
+        """Test lag where n >= number of rows."""
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "row",
+            "columns": ["price"],
+            "rows": [[100], [101]],
+        }
+
+        result = table_lag(table, "price", n=5, default=-1)
+
+        price_lag_idx = result["columns"].index("price_lag5")
+        assert result["rows"][0][price_lag_idx] == -1
+        assert result["rows"][1][price_lag_idx] == -1
+
+    def test_lag_column_oriented(self):
+        """Test lag with column-oriented input."""
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "column",
+            "columns": ["date", "price"],
+            "rows": [["Jan-01", "Jan-02", "Jan-03"], [100, 101, 102]],
+        }
+
+        result = table_lag(table, "price")
+
+        # Should return column-oriented
+        assert result["orientation"] == "column"
+        assert "price_lag1" in result["columns"]
+
+        price_lag_idx = result["columns"].index("price_lag1")
+        lagged = result["rows"][price_lag_idx]
+        assert lagged == [None, 100, 101]
+
+    def test_basic_lead(self):
+        """Test basic lead by 1."""
+        from specparser.amt.table import table_lead
+
+        table = {
+            "orientation": "row",
+            "columns": ["date", "price"],
+            "rows": [
+                ["Jan-01", 100],
+                ["Jan-02", 101],
+                ["Jan-03", 102],
+            ],
+        }
+
+        result = table_lead(table, "price")
+
+        assert "price_lead1" in result["columns"]
+        price_lead_idx = result["columns"].index("price_lead1")
+
+        # Check lead values
+        assert result["rows"][0][price_lead_idx] == 101
+        assert result["rows"][1][price_lead_idx] == 102
+        assert result["rows"][2][price_lead_idx] is None
+
+    def test_lead_with_n(self):
+        """Test lead by n > 1."""
+        from specparser.amt.table import table_lead
+
+        table = {
+            "orientation": "row",
+            "columns": ["price"],
+            "rows": [[100], [101], [102], [103]],
+        }
+
+        result = table_lead(table, "price", n=2)
+
+        price_lead_idx = result["columns"].index("price_lead2")
+
+        assert result["rows"][0][price_lead_idx] == 102
+        assert result["rows"][1][price_lead_idx] == 103
+        assert result["rows"][2][price_lead_idx] is None
+        assert result["rows"][3][price_lead_idx] is None
+
+    def test_lag_negative_n_raises(self):
+        """Test that negative n raises ValueError."""
+        from specparser.amt.table import table_lag
+        import pytest
+
+        table = {"orientation": "row", "columns": ["price"], "rows": [[100]]}
+
+        with pytest.raises(ValueError, match="non-negative"):
+            table_lag(table, "price", n=-1)
+
+
+class TestTableLagArrow:
+    """Tests for table_lag/lead with Arrow tables."""
+
+    def test_lag_arrow(self):
+        """Test lag with Arrow-oriented table."""
+        import pyarrow as pa
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "arrow",
+            "columns": ["date", "price"],
+            "rows": [
+                pa.array(["Jan-01", "Jan-02", "Jan-03"]),
+                pa.array([100, 101, 102]),
+            ],
+        }
+
+        result = table_lag(table, "price")
+
+        assert result["orientation"] == "arrow"
+        assert "price_lag1" in result["columns"]
+
+        price_lag_idx = result["columns"].index("price_lag1")
+        lagged = result["rows"][price_lag_idx].to_pylist()
+
+        assert lagged == [None, 100, 101]
+
+    def test_lead_arrow(self):
+        """Test lead with Arrow-oriented table."""
+        import pyarrow as pa
+        from specparser.amt.table import table_lead
+
+        table = {
+            "orientation": "arrow",
+            "columns": ["price"],
+            "rows": [pa.array([100, 101, 102])],
+        }
+
+        result = table_lead(table, "price")
+
+        price_lead_idx = result["columns"].index("price_lead1")
+        lead_vals = result["rows"][price_lead_idx].to_pylist()
+
+        assert lead_vals == [101, 102, None]
+
+    def test_lag_arrow_with_default(self):
+        """Test lag Arrow with non-null default."""
+        import pyarrow as pa
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "arrow",
+            "columns": ["price"],
+            "rows": [pa.array([100.0, 101.0, 102.0])],
+        }
+
+        result = table_lag(table, "price", default=0.0)
+
+        price_lag_idx = result["columns"].index("price_lag1")
+        lagged = result["rows"][price_lag_idx].to_pylist()
+
+        assert lagged == [0.0, 100.0, 101.0]
+
+    def test_lag_arrow_n_exceeds_rows(self):
+        """Test lag Arrow where n >= number of rows."""
+        import pyarrow as pa
+        from specparser.amt.table import table_lag
+
+        table = {
+            "orientation": "arrow",
+            "columns": ["price"],
+            "rows": [pa.array([100, 101])],
+        }
+
+        result = table_lag(table, "price", n=5)
+
+        price_lag_idx = result["columns"].index("price_lag5")
+        lagged = result["rows"][price_lag_idx].to_pylist()
+
+        assert lagged == [None, None]

@@ -8,7 +8,7 @@ Tables are represented as Python dicts with three keys:
 
 ```python
 {
-    "orientation": "row" | "column",
+    "orientation": "row" | "column" | "arrow",
     "columns": ["col1", "col2", ...],
     "rows": [...]
 }
@@ -26,6 +26,54 @@ Tables are represented as Python dicts with three keys:
 {"orientation": "column", "columns": ["a", "b"], "rows": [[1, 3], [2, 4]]}
 # Column "a": [1, 3]
 # Column "b": [2, 4]
+```
+
+**Arrow-oriented** (PyArrow arrays):
+```python
+import pyarrow as pa
+{"orientation": "arrow", "columns": ["a", "b"], "rows": [pa.array([1, 3]), pa.array([2, 4])]}
+# Column "a": PyArrow array [1, 3]
+# Column "b": PyArrow array [2, 4]
+```
+
+---
+
+## Table Inspection
+
+### `table_orientation(table)`
+
+Get the orientation of a table.
+
+```python
+from specparser.amt import table_orientation
+
+t = {"orientation": "row", "columns": ["a", "b"], "rows": [[1, 2]]}
+table_orientation(t)  # "row"
+```
+
+### `table_nrows(table)`
+
+Get the number of rows in a table.
+
+```python
+from specparser.amt import table_nrows
+
+t = {"orientation": "row", "columns": ["a", "b"], "rows": [[1, 2], [3, 4]]}
+table_nrows(t)  # 2
+```
+
+### `table_validate(table, strict=False)`
+
+Validate table structure. Raises `ValueError` if invalid.
+
+```python
+from specparser.amt import table_validate
+
+t = {"orientation": "row", "columns": ["a", "b"], "rows": [[1, 2], [3, 4]]}
+table_validate(t)  # No error
+
+# With strict=True, checks that all rows have correct length
+table_validate(t, strict=True)
 ```
 
 ---
@@ -67,6 +115,42 @@ result = table_to_rows(t)
 - `table`: Input table dict
 
 **Returns:** Row-oriented table. If already row-oriented, returns the same object.
+
+---
+
+### `table_to_arrow(table)`
+
+Convert a table to Arrow orientation (PyArrow arrays).
+
+```python
+from specparser.amt import table_to_arrow
+
+t = {"orientation": "row", "columns": ["a", "b"], "rows": [[1, 2], [3, 4]]}
+result = table_to_arrow(t)
+# {"orientation": "arrow", "columns": ["a", "b"], "rows": [pa.array([1, 3]), pa.array([2, 4])]}
+```
+
+**Parameters:**
+- `table`: Input table dict
+
+**Returns:** Arrow-oriented table with PyArrow arrays. If already arrow-oriented, returns the same object.
+
+**Note:** Requires PyArrow to be installed.
+
+---
+
+### `table_to_jsonable(table)`
+
+Convert a table to a JSON-serializable format (converts Arrow arrays to Python lists).
+
+```python
+from specparser.amt import table_to_jsonable
+import json
+
+t = table_to_arrow({"orientation": "row", "columns": ["a"], "rows": [[1], [2]]})
+result = table_to_jsonable(t)
+json.dumps(result)  # Works - no PyArrow arrays
+```
 
 ---
 
@@ -385,6 +469,171 @@ result = table_chop(t, "value")
 
 ---
 
+## Join Operations
+
+### `table_left_join(left, right, left_on, right_on=None)`
+
+Left join two tables on key columns.
+
+```python
+from specparser.amt import table_left_join
+
+left = {"orientation": "row", "columns": ["id", "name"], "rows": [[1, "a"], [2, "b"], [3, "c"]]}
+right = {"orientation": "row", "columns": ["id", "value"], "rows": [[1, 100], [2, 200]]}
+
+result = table_left_join(left, right, "id")
+# All rows from left, matched values from right (None for id=3)
+```
+
+**Parameters:**
+- `left`: Left table
+- `right`: Right table
+- `left_on`: Column name in left table to join on
+- `right_on`: Column name in right table (defaults to `left_on`)
+
+**Returns:** Joined table with all left rows and matching right columns
+
+### `table_inner_join(left, right, left_on, right_on=None)`
+
+Inner join two tables on key columns.
+
+```python
+from specparser.amt import table_inner_join
+
+left = {"orientation": "row", "columns": ["id", "name"], "rows": [[1, "a"], [2, "b"], [3, "c"]]}
+right = {"orientation": "row", "columns": ["id", "value"], "rows": [[1, 100], [2, 200]]}
+
+result = table_inner_join(left, right, "id")
+# Only rows where id matches in both tables (id=1, id=2)
+```
+
+**Parameters:** Same as `table_left_join`
+
+**Returns:** Joined table with only matching rows
+
+---
+
+## Pivot Operations
+
+### `table_pivot_wider(table, names_from, values_from, id_cols=None)`
+
+Pivot a table from long to wide format.
+
+```python
+from specparser.amt import table_pivot_wider
+
+t = {
+    "orientation": "row",
+    "columns": ["date", "metric", "value"],
+    "rows": [
+        ["2024-01-01", "price", 100],
+        ["2024-01-01", "volume", 1000],
+        ["2024-01-02", "price", 105],
+        ["2024-01-02", "volume", 1200],
+    ]
+}
+
+result = table_pivot_wider(t, names_from="metric", values_from="value")
+# Columns: ["date", "price", "volume"]
+# Rows: [["2024-01-01", 100, 1000], ["2024-01-02", 105, 1200]]
+```
+
+**Parameters:**
+- `table`: Input table in long format
+- `names_from`: Column whose values become new column names
+- `values_from`: Column whose values fill the new columns
+- `id_cols`: Columns to keep as identifiers (default: all other columns)
+
+**Returns:** Wide-format table
+
+---
+
+## Window Operations
+
+### `table_lag(table, column, n=1, result_column=None, default=None)`
+
+Add a lagged column (previous row's value).
+
+```python
+from specparser.amt import table_lag
+
+t = {"orientation": "row", "columns": ["date", "value"], "rows": [
+    ["2024-01-01", 100],
+    ["2024-01-02", 105],
+    ["2024-01-03", 110],
+]}
+
+result = table_lag(t, "value", n=1, result_column="prev_value")
+# Adds column "prev_value" with [None, 100, 105]
+```
+
+**Parameters:**
+- `table`: Input table (must be pre-sorted)
+- `column`: Column to lag
+- `n`: Number of rows to lag (default: 1)
+- `result_column`: Name for lagged column (default: `{column}_lag`)
+- `default`: Value for first n rows (default: None)
+
+**Returns:** Table with lagged column added
+
+### `table_lead(table, column, n=1, result_column=None, default=None)`
+
+Add a lead column (next row's value).
+
+```python
+from specparser.amt import table_lead
+
+t = {"orientation": "row", "columns": ["date", "value"], "rows": [
+    ["2024-01-01", 100],
+    ["2024-01-02", 105],
+    ["2024-01-03", 110],
+]}
+
+result = table_lead(t, "value", n=1, result_column="next_value")
+# Adds column "next_value" with [105, 110, None]
+```
+
+**Parameters:** Same as `table_lag`
+
+**Returns:** Table with lead column added
+
+---
+
+## Explode Operations
+
+### `table_explode_arrow(table, column)`
+
+Explode a list-valued column into multiple rows (Arrow-native, strict).
+
+```python
+from specparser.amt import table_explode_arrow, table_to_arrow
+import pyarrow as pa
+
+t = {
+    "orientation": "arrow",
+    "columns": ["id", "tags"],
+    "rows": [
+        pa.array(["A", "B"]),
+        pa.array([["x", "y"], ["p", "q", "r"]], type=pa.list_(pa.string()))
+    ]
+}
+
+result = table_explode_arrow(t, "tags")
+# Rows expanded: A->x, A->y, B->p, B->q, B->r
+```
+
+**Parameters:**
+- `table`: Arrow-oriented table
+- `column`: Column name or index containing list values
+
+**Returns:** Table with list column expanded to individual rows
+
+**Raises:** `TypeError` if column is not a list type
+
+**Note:** Empty lists produce no output rows. Nulls also produce no output rows.
+
+---
+
 ## Display/Output
 
 ### `format_table(table)`
@@ -471,3 +720,161 @@ from specparser.amt.table import MAX_FORMAT_ROWS
 - Printing/displaying
 - `table_bind_rows()` operations
 - `table_chop()` operations
+
+**Arrow-oriented is better for:**
+- Very large datasets (millions of rows)
+- Numeric computations (vectorized operations)
+- Interop with PyArrow, Pandas, DuckDB
+- High-performance aggregations
+
+---
+
+## Arrow Compute Functions
+
+The table module provides PyArrow-backed compute functions that operate on Arrow-oriented tables. These functions are vectorized and highly efficient for large datasets.
+
+### Arithmetic
+
+| Function | Description |
+|----------|-------------|
+| `table_add_arrow(t, col1, col2, result)` | Add two columns |
+| `table_subtract_arrow(t, col1, col2, result)` | Subtract columns |
+| `table_multiply_arrow(t, col1, col2, result)` | Multiply columns |
+| `table_divide_arrow(t, col1, col2, result)` | Divide columns |
+| `table_negate_arrow(t, col, result)` | Negate column |
+| `table_abs_arrow(t, col, result)` | Absolute value |
+| `table_sign_arrow(t, col, result)` | Sign (-1, 0, 1) |
+| `table_power_arrow(t, col, exp, result)` | Raise to power |
+| `table_sqrt_arrow(t, col, result)` | Square root |
+| `table_exp_arrow(t, col, result)` | Exponential |
+| `table_ln_arrow(t, col, result)` | Natural log |
+| `table_log10_arrow(t, col, result)` | Log base 10 |
+| `table_log2_arrow(t, col, result)` | Log base 2 |
+| `table_round_arrow(t, col, result, decimals=0)` | Round |
+| `table_ceil_arrow(t, col, result)` | Ceiling |
+| `table_floor_arrow(t, col, result)` | Floor |
+| `table_trunc_arrow(t, col, result)` | Truncate |
+
+### Trigonometric
+
+| Function | Description |
+|----------|-------------|
+| `table_sin_arrow(t, col, result)` | Sine |
+| `table_cos_arrow(t, col, result)` | Cosine |
+| `table_tan_arrow(t, col, result)` | Tangent |
+| `table_asin_arrow(t, col, result)` | Arc sine |
+| `table_acos_arrow(t, col, result)` | Arc cosine |
+| `table_atan_arrow(t, col, result)` | Arc tangent |
+| `table_atan2_arrow(t, col1, col2, result)` | Two-argument arc tangent |
+
+### Comparison
+
+| Function | Description |
+|----------|-------------|
+| `table_equal_arrow(t, col1, col2, result)` | Equal (==) |
+| `table_not_equal_arrow(t, col1, col2, result)` | Not equal (!=) |
+| `table_less_arrow(t, col1, col2, result)` | Less than (<) |
+| `table_less_equal_arrow(t, col1, col2, result)` | Less or equal (<=) |
+| `table_greater_arrow(t, col1, col2, result)` | Greater than (>) |
+| `table_greater_equal_arrow(t, col1, col2, result)` | Greater or equal (>=) |
+
+### Null/Value Checks
+
+| Function | Description |
+|----------|-------------|
+| `table_is_null_arrow(t, col, result)` | Check if null |
+| `table_is_valid_arrow(t, col, result)` | Check if not null |
+| `table_is_nan_arrow(t, col, result)` | Check if NaN |
+| `table_is_finite_arrow(t, col, result)` | Check if finite |
+| `table_is_in_arrow(t, col, values, result)` | Check if in set |
+
+### Logical
+
+| Function | Description |
+|----------|-------------|
+| `table_and_arrow(t, col1, col2, result)` | Logical AND |
+| `table_or_arrow(t, col1, col2, result)` | Logical OR |
+| `table_xor_arrow(t, col1, col2, result)` | Logical XOR |
+| `table_invert_arrow(t, col, result)` | Logical NOT |
+
+### String
+
+| Function | Description |
+|----------|-------------|
+| `table_upper_arrow(t, col, result)` | Uppercase |
+| `table_lower_arrow(t, col, result)` | Lowercase |
+| `table_capitalize_arrow(t, col, result)` | Capitalize |
+| `table_title_arrow(t, col, result)` | Title case |
+| `table_strip_arrow(t, col, result)` | Strip whitespace |
+| `table_lstrip_arrow(t, col, result)` | Strip left |
+| `table_rstrip_arrow(t, col, result)` | Strip right |
+| `table_length_arrow(t, col, result)` | String length |
+| `table_starts_with_arrow(t, col, pattern, result)` | Starts with |
+| `table_ends_with_arrow(t, col, pattern, result)` | Ends with |
+| `table_contains_arrow(t, col, pattern, result)` | Contains |
+| `table_replace_substr_arrow(t, col, pattern, replacement, result)` | Replace substring |
+| `table_split_arrow(t, col, pattern, result)` | Split string |
+
+### Aggregates
+
+| Function | Description |
+|----------|-------------|
+| `table_summarize_arrow(t, group_by, aggs)` | Group by + aggregate |
+| `table_sum_arrow(t, col)` | Sum (scalar) |
+| `table_mean_arrow(t, col)` | Mean (scalar) |
+| `table_min_arrow(t, col)` | Min (scalar) |
+| `table_max_arrow(t, col)` | Max (scalar) |
+| `table_count_arrow(t, col)` | Count non-null (scalar) |
+| `table_count_distinct_arrow(t, col)` | Count distinct (scalar) |
+| `table_stddev_arrow(t, col)` | Std deviation (scalar) |
+| `table_variance_arrow(t, col)` | Variance (scalar) |
+| `table_first_arrow(t, col)` | First value (scalar) |
+| `table_last_arrow(t, col)` | Last value (scalar) |
+| `table_any_arrow(t, col)` | Any true (scalar) |
+| `table_all_arrow(t, col)` | All true (scalar) |
+
+### Cumulative
+
+| Function | Description |
+|----------|-------------|
+| `table_cumsum_arrow(t, col, result)` | Cumulative sum |
+| `table_cumprod_arrow(t, col, result)` | Cumulative product |
+| `table_cummin_arrow(t, col, result)` | Cumulative min |
+| `table_cummax_arrow(t, col, result)` | Cumulative max |
+| `table_cummean_arrow(t, col, result)` | Cumulative mean |
+| `table_diff_arrow(t, col, result, n=1)` | Difference from previous |
+
+### Selection/Filtering
+
+| Function | Description |
+|----------|-------------|
+| `table_if_else_arrow(t, cond, true_val, false_val, result)` | Conditional selection |
+| `table_coalesce_arrow(t, cols, result)` | First non-null |
+| `table_fill_null_arrow(t, col, value, result)` | Fill nulls with value |
+| `table_fill_null_forward_arrow(t, col, result)` | Forward fill nulls |
+| `table_fill_null_backward_arrow(t, col, result)` | Backward fill nulls |
+| `table_filter_arrow(t, mask)` | Filter rows by boolean mask |
+
+### Example Usage
+
+```python
+from specparser.amt import (
+    table_to_arrow, table_add_arrow, table_multiply_arrow,
+    table_cumsum_arrow, table_filter_arrow, table_greater_arrow
+)
+
+# Create Arrow table
+t = table_to_arrow({
+    "orientation": "row",
+    "columns": ["price", "quantity"],
+    "rows": [[100, 10], [105, 15], [95, 20], [110, 12]]
+})
+
+# Add computed columns
+t = table_multiply_arrow(t, "price", "quantity", "value")
+t = table_cumsum_arrow(t, "value", "cumulative_value")
+
+# Filter rows
+t = table_greater_arrow(t, "price", 100, "above_100")
+filtered = table_filter_arrow(t, "above_100")
+```

@@ -42,6 +42,42 @@ from specparser.amt import clear_cache
 clear_cache()
 ```
 
+#### `clear_ticker_caches()`
+
+Clear ticker-related caches (ticker schemas, futures lookups).
+
+```python
+from specparser.amt import clear_ticker_caches
+clear_ticker_caches()
+```
+
+#### `clear_schedule_caches()`
+
+Clear schedule-related caches.
+
+```python
+from specparser.amt import clear_schedule_caches
+clear_schedule_caches()
+```
+
+#### `clear_days_cache()`
+
+Clear the days-per-month cache.
+
+```python
+from specparser.amt import clear_days_cache
+clear_days_cache()
+```
+
+#### `clear_calendar_cache()`
+
+Clear the Arrow calendar cache (used by `find_straddle_days_arrow` and `find_straddle_days_numba`).
+
+```python
+from specparser.amt import clear_calendar_cache
+clear_calendar_cache()
+```
+
 ---
 
 ### Value Extraction
@@ -311,6 +347,17 @@ Each rule specifies:
 
 ### Ticker Functions
 
+#### `get_tickers_ym(path, underlying, year, month)`
+
+Get tickers for an asset for a specific year/month with BBGfc expansion.
+
+```python
+from specparser.amt import get_tickers_ym
+
+table = get_tickers_ym("data/amt.yml", "CL Comdty", 2024, 6)
+# Returns tickers with BBGfc specs expanded for June 2024
+```
+
 #### `get_tschemas(path, underlying)`
 
 Get all tickers for an asset by its Underlying value.
@@ -402,6 +449,187 @@ hedge      BBG:CL F24 Comdty:PX_LAST
 
 ---
 
+### Price Functions
+
+#### `load_all_prices(prices_parquet)`
+
+Load all prices from a parquet file into memory for fast lookups.
+
+```python
+from specparser.amt import load_all_prices
+
+# Load prices into memory (call once at startup)
+load_all_prices("data/prices.parquet")
+
+# Now price lookups are O(1) dict lookups instead of DuckDB queries
+```
+
+**Parameters:**
+- `prices_parquet`: Path to parquet file with columns `ticker`, `field`, `date`, `value`
+
+**Returns:** None (sets module-level `_PRICES_DICT`)
+
+#### `set_prices_dict(prices_dict)`
+
+Set the prices dict directly (alternative to `load_all_prices`).
+
+```python
+from specparser.amt import set_prices_dict
+
+# Set custom prices dict
+prices = {"CL1 Comdty|PX_LAST|2024-01-15": "75.50"}
+set_prices_dict(prices)
+```
+
+**Parameters:**
+- `prices_dict`: Dict mapping `"ticker|field|date"` keys to values, or `None` to clear
+
+#### `get_price(prices_dict, ticker, field, date_str)`
+
+Get a single price from a prices dict.
+
+```python
+from specparser.amt import get_price, load_all_prices
+
+# After loading prices
+load_all_prices("data/prices.parquet")
+from specparser.amt.tickers import _PRICES_DICT
+
+value = get_price(_PRICES_DICT, "CL1 Comdty", "PX_LAST", "2024-01-15")
+# Returns: "75.50" or "none" if not found
+```
+
+#### `clear_prices_dict()`
+
+Clear the module-level prices dict.
+
+```python
+from specparser.amt import clear_prices_dict
+
+clear_prices_dict()
+```
+
+#### `prices_last(prices_parquet, pattern)`
+
+Get the last price for tickers matching a pattern.
+
+```python
+from specparser.amt import prices_last
+
+table = prices_last("data/prices.parquet", "CL.*Comdty")
+# Columns: ['ticker', 'field', 'date', 'value']
+```
+
+**Parameters:**
+- `prices_parquet`: Path to parquet file
+- `pattern`: Regex pattern to match ticker names
+
+**Returns:** Table with the most recent price for each matching ticker
+
+#### `prices_query(prices_parquet, sql)`
+
+Run an arbitrary SQL query on the prices parquet file.
+
+```python
+from specparser.amt import prices_query
+
+table = prices_query("data/prices.parquet", """
+    SELECT ticker, field, date, value
+    FROM prices
+    WHERE ticker LIKE 'CL%'
+    AND date >= '2024-01-01'
+    ORDER BY date DESC
+    LIMIT 100
+""")
+```
+
+**Parameters:**
+- `prices_parquet`: Path to parquet file
+- `sql`: SQL query string (table is named `prices`)
+
+**Returns:** Table with query results
+
+---
+
+### Straddle Price Functions
+
+#### `get_prices(underlying, year, month, i, path, chain_csv=None, prices_parquet=None)`
+
+Get daily prices for a straddle from entry to expiry (price lookup only, no action/strike columns).
+
+```python
+from specparser.amt import get_prices, load_all_prices
+
+load_all_prices("data/prices.parquet")
+table = get_prices("CL Comdty", 2024, 6, 0, "data/amt.yml", "data/futs.csv")
+# Columns: ['asset', 'straddle', 'date', 'vol', 'hedge', ...]
+```
+
+**Parameters:**
+- `underlying`: Asset underlying value
+- `year`: Expiry year
+- `month`: Expiry month
+- `i`: Straddle selector index
+- `path`: Path to AMT YAML file
+- `chain_csv`: Optional CSV for futures ticker normalization
+- `prices_parquet`: Path to parquet for DuckDB fallback (if prices dict not loaded)
+
+**Returns:** Table with one row per day, columns for each price parameter
+
+#### `actions(prices_table, path)`
+
+Add action, model, and strike columns to a prices table.
+
+```python
+from specparser.amt import get_prices, actions, load_all_prices
+
+load_all_prices("data/prices.parquet")
+prices = get_prices("CL Comdty", 2024, 6, 0, "data/amt.yml", "data/futs.csv")
+table = actions(prices, "data/amt.yml")
+# Columns: [...prices..., 'action', 'model', 'strike_vol', 'strike', 'expiry']
+```
+
+**Parameters:**
+- `prices_table`: Output from `get_prices()` - must have 'asset' and 'straddle' columns
+- `path`: Path to AMT YAML file
+
+**Returns:** Table with added columns: action, model, strike_vol, strike, expiry
+
+#### `get_straddle_actions(underlying, year, month, i, path, chain_csv=None, prices_parquet=None, overrides_csv=None)`
+
+Get daily prices for a straddle with full action/strike columns (convenience function).
+
+```python
+from specparser.amt import get_straddle_actions, load_all_prices
+
+load_all_prices("data/prices.parquet")
+table = get_straddle_actions("CL Comdty", 2024, 6, 0, "data/amt.yml", "data/futs.csv")
+# Columns: ['asset', 'straddle', 'date', 'vol', 'hedge', ..., 'action', 'model', 'strike_vol', 'strike', 'expiry']
+```
+
+This is equivalent to calling `get_prices()` followed by `actions()`.
+
+#### `get_straddle_valuation(underlying, year, month, i, path, chain_csv=None, prices_parquet=None)`
+
+Get daily valuation (PnL) for a straddle.
+
+```python
+from specparser.amt import get_straddle_valuation, load_all_prices
+
+load_all_prices("data/prices.parquet")
+table = get_straddle_valuation("CL Comdty", 2024, 6, 0, "data/amt.yml", "data/futs.csv")
+# Columns: [..., 'mv', 'delta', 'opnl', 'hpnl', 'pnl']
+```
+
+**Additional columns:**
+- `mv`: Mark-to-market value
+- `delta`: Option delta
+- `opnl`: Option PnL (change in mv)
+- `hpnl`: Hedge PnL
+- `pnl`: Total PnL (opnl + hpnl)
+
+---
+
 ### Schedule Functions
 
 #### `get_schedule(path, underlying)`
@@ -415,6 +643,17 @@ from specparser.amt import get_schedule
 
 table = get_schedule("data/amt.yml", "LA Comdty")
 # Columns: ['schcnt', 'schid', 'asset', 'ntrc', 'ntrv', 'xprc', 'xprv', 'wgt']
+```
+
+#### `get_schedule_count(path, underlying)`
+
+Get the number of schedule components for an asset.
+
+```python
+from specparser.amt import get_schedule_count
+
+n = get_schedule_count("data/amt.yml", "LA Comdty")
+# Returns: 4 (if asset has 4 schedule components)
 ```
 
 #### `find_schedules(path, pattern)`
@@ -593,6 +832,47 @@ table = find_straddle_days("data/amt.yml", 2024, 2024, "LA Comdty")
 - `live_only`: If True, only include assets with `Live: true`
 
 **Returns:** Column-oriented table dict with columns: asset, straddle, date
+
+#### `find_straddle_days_arrow(path, start_year, end_year, pattern=".", live_only=True)`
+
+High-performance Arrow-based version of `find_straddle_days()`.
+
+```python
+from specparser.amt import find_straddle_days_arrow
+
+table = find_straddle_days_arrow("data/amt.yml", 2024, 2024)
+# Returns Arrow-oriented table with columns: ["asset", "straddle", "date"]
+```
+
+Uses PyArrow compute functions for vectorized date expansion. Approximately 2-5x faster than `find_straddle_days()` for large datasets.
+
+**Parameters:** Same as `find_straddle_days()`
+
+**Returns:** Arrow-oriented table dict with columns: asset, straddle, date
+
+#### `find_straddle_days_numba(path, start_year, end_year, pattern=".", live_only=True, parallel=False)`
+
+Highest-performance Numba JIT-compiled version of `find_straddle_days()`.
+
+```python
+from specparser.amt import find_straddle_days_numba
+
+# Sequential version (faster for small datasets)
+table = find_straddle_days_numba("data/amt.yml", 2024, 2024)
+
+# Parallel version (faster for very large datasets)
+table = find_straddle_days_numba("data/amt.yml", 2020, 2025, parallel=True)
+```
+
+Uses Numba-compiled kernels for date expansion. Approximately 10-100x faster than the Python loop version, with additional 2-4x speedup from parallel mode on multi-core systems.
+
+**Parameters:**
+- Same as `find_straddle_days()`, plus:
+- `parallel`: If True, use parallel Numba kernel (best for millions+ output rows)
+
+**Returns:** Arrow-oriented table dict with columns: asset, straddle, date
+
+**Note:** Requires Numba to be installed. First call has JIT compilation overhead.
 
 ---
 

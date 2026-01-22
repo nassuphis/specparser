@@ -910,6 +910,66 @@ def _resolve_column_index(table: dict[str, Any], column: str | int) -> int:
         raise ValueError(f"Column '{column}' not found in table columns: {table['columns']}")
 
 
+def table_explode_arrow(table: dict[str, Any], column: str | int) -> dict[str, Any]:
+    """Explode a list column into multiple rows (Arrow-native).
+
+    Uses pc.list_flatten() and pc.list_parent_indices() for efficient expansion.
+    This is a strict operation that requires the column to be a list type.
+
+    Args:
+        table: Table with a list-valued column (any orientation, converted to arrow)
+        column: Column name or index containing lists
+
+    Returns:
+        Arrow-oriented table with list column expanded to individual rows.
+        Empty lists and null values produce no output rows.
+
+    Raises:
+        TypeError: If the column is not a list type.
+
+    Notes:
+        Unlike table_unchop, this function:
+        - Requires the column to be a list type (raises TypeError otherwise)
+        - Does not wrap scalars as singleton lists
+        - Null list values produce no output rows (not one row with null)
+    """
+    _pa, _pc = _import_pyarrow()
+    tbl = table_to_arrow(table)
+    col_idx = _resolve_column_index(tbl, column)
+
+    list_col = tbl["rows"][col_idx]
+
+    # Validate list type
+    if not _pa.types.is_list(list_col.type) and not _pa.types.is_large_list(list_col.type):
+        raise TypeError(
+            f"Column '{tbl['columns'][col_idx]}' has type {list_col.type}, expected list type"
+        )
+
+    # list_parent_indices: for each element in the flattened list, gives the parent row index
+    # list_flatten: flattens all lists into a single array
+    parent_indices = _pc.list_parent_indices(list_col)
+    flat_values = _pc.list_flatten(list_col)
+
+    # Build output columns: take values by parent index for non-list columns
+    # Optimization: dictionary-encode string columns before take, then decode after.
+    # pc.take() on integers (dictionary indices) is much faster than on strings.
+    out_cols = []
+    for i, col in enumerate(tbl["rows"]):
+        if i == col_idx:
+            out_cols.append(flat_values)
+        elif _pa.types.is_string(col.type) or _pa.types.is_large_string(col.type):
+            # Dictionary encode: converts strings to int indices + dictionary
+            dict_encoded = col.dictionary_encode()
+            # Take on the encoded array (operates on int indices, fast)
+            taken = _pc.take(dict_encoded, parent_indices)
+            # Decode back to strings
+            out_cols.append(taken.dictionary_decode())
+        else:
+            out_cols.append(_pc.take(col, parent_indices))
+
+    return {"orientation": "arrow", "columns": tbl["columns"][:], "rows": out_cols}
+
+
 def table_unchop(table: dict[str, Any], column: str | int) -> dict[str, Any]:
     """Expand rows by unrolling a list-valued column into multiple rows.
 
@@ -926,8 +986,17 @@ def table_unchop(table: dict[str, Any], column: str | int) -> dict[str, Any]:
         - If a cell is not a list, it's treated as a single-element list
         - Uses extend + itertools.repeat for O(n*m) instead of O(n*k*m)
     """
-    # For arrow, convert to column-oriented first (list expansion requires Python)
+    # For arrow with list column, use native explode
     if _is_arrow(table):
+        _pa, _ = _import_pyarrow()
+        col_idx = _resolve_column_index(table, column)
+        col = table["rows"][col_idx]
+
+        # Check if column is list type - use native explode
+        if _pa.types.is_list(col.type) or _pa.types.is_large_list(col.type):
+            return table_explode_arrow(table, column)
+
+        # Non-list column: convert to column-oriented and use existing logic
         col_table = table_to_columns(table)
         result = table_unchop(col_table, column)
         return table_to_arrow(result)
@@ -2551,3 +2620,320 @@ def table_filter_arrow(
     new_cols = [_pc.filter(col, mask) for col in t["rows"]]
 
     return {"orientation": "arrow", "columns": t["columns"][:], "rows": new_cols}
+
+
+# -------------------------------------
+# Pivot operations
+# -------------------------------------
+
+
+def table_pivot_wider(
+    table: dict[str, Any],
+    names_from: str,
+    values_from: str,
+    id_cols: list[str] | None = None,
+    fill_value: Any = None,
+) -> dict[str, Any]:
+    """Pivot a table from long to wide format.
+
+    Takes a "long" table with name/value pairs and pivots it to "wide" format
+    where each unique name becomes a column.
+
+    Args:
+        table: Input table (any orientation)
+        names_from: Column containing the names that will become column headers
+        values_from: Column containing the values to spread
+        id_cols: Columns to use as row identifiers (default: all other columns)
+        fill_value: Value to use for missing combinations (default: None)
+
+    Returns:
+        Row-oriented table in wide format.
+
+    Semantics:
+        - Duplicate handling: last value wins for same (id_cols, name) pair
+        - Column ordering: preserves order of first occurrence of each name
+        - Designed for small tables (per-straddle partitions)
+
+    Example:
+        Input (long):
+            id    param   value
+            1     vol     0.2
+            1     hedge   100
+            2     vol     0.3
+            2     hedge   101
+
+        Output (wide):
+            id    vol     hedge
+            1     0.2     100
+            2     0.3     101
+    """
+    # Convert to row-oriented for uniform processing
+    tbl = table_to_rows(table)
+    columns = tbl["columns"]
+    rows = tbl["rows"]
+
+    # Resolve column indices
+    names_idx = columns.index(names_from)
+    values_idx = columns.index(values_from)
+
+    # Determine id columns (all columns except names_from and values_from)
+    if id_cols is None:
+        id_cols = [c for c in columns if c not in (names_from, values_from)]
+
+    id_indices = [columns.index(c) for c in id_cols]
+
+    # Build result: {id_tuple -> {name -> value}}
+    result_dict: dict[tuple, dict[str, Any]] = {}
+    name_order: list[str] = []  # Track order of first occurrence
+
+    for row in rows:
+        # Extract id values as tuple (hashable key)
+        id_key = tuple(row[i] for i in id_indices)
+
+        # Get name and value
+        name = row[names_idx]
+        value = row[values_idx]
+
+        # Track name order (first occurrence)
+        if name not in name_order:
+            name_order.append(name)
+
+        # Add to result (last value wins for duplicates)
+        if id_key not in result_dict:
+            result_dict[id_key] = {}
+        result_dict[id_key][name] = value
+
+    # Build output table
+    out_columns = id_cols + name_order
+    out_rows = []
+
+    for id_key, name_values in result_dict.items():
+        row = list(id_key)  # id column values
+        for name in name_order:
+            row.append(name_values.get(name, fill_value))
+        out_rows.append(row)
+
+    return {"orientation": "row", "columns": out_columns, "rows": out_rows}
+
+
+# -------------------------------------
+# Window functions (lag/lead)
+# -------------------------------------
+
+
+def table_lag(
+    table: dict[str, Any],
+    column: str,
+    n: int = 1,
+    default: Any = None,
+    result_column: str | None = None,
+) -> dict[str, Any]:
+    """Add a column with lagged values (shifted down by n rows).
+
+    IMPORTANT: Assumes table is pre-sorted. For partitioned data,
+    sort by partition columns then order column before calling.
+
+    Args:
+        table: Input table (any orientation)
+        column: Column to lag
+        n: Number of rows to lag (default: 1)
+        default: Value for first n rows where lag is undefined (default: None)
+        result_column: Name for result column (default: "{column}_lag{n}")
+
+    Returns:
+        Table with lagged column added (same orientation as input).
+
+    Example:
+        Input:              Output:
+        date    price       date    price   price_lag1
+        Jan-01  100         Jan-01  100     None
+        Jan-02  101         Jan-02  101     100
+        Jan-03  102         Jan-03  102     101
+    """
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+
+    if result_column is None:
+        result_column = f"{column}_lag{n}"
+
+    # Handle Arrow tables specially for efficiency
+    if _is_arrow(table):
+        return _table_lag_arrow(table, column, n, default, result_column)
+
+    # Convert to column-oriented for uniform processing
+    tbl = table_to_columns(table)
+    columns = tbl["columns"]
+    col_data = tbl["rows"]
+
+    col_idx = columns.index(column)
+    source_col = col_data[col_idx]
+    nrows = len(source_col)
+
+    # Build lagged column
+    if n == 0:
+        lagged = source_col[:]
+    elif n >= nrows:
+        lagged = [default] * nrows
+    else:
+        lagged = [default] * n + source_col[:-n]
+
+    # Add new column
+    new_columns = columns + [result_column]
+    new_data = col_data + [lagged]
+
+    result = {"orientation": "column", "columns": new_columns, "rows": new_data}
+
+    # Convert back to original orientation
+    if _is_column_oriented(table):
+        return result
+    else:
+        return table_to_rows(result)
+
+
+def _table_lag_arrow(
+    table: dict[str, Any],
+    column: str,
+    n: int,
+    default: Any,
+    result_column: str,
+) -> dict[str, Any]:
+    """Arrow-optimized lag implementation."""
+    _pa, _pc = _import_pyarrow()
+
+    col_idx = _resolve_column_index(table, column)
+    source_arr = table["rows"][col_idx]
+    nrows = len(source_arr)
+
+    if n == 0:
+        lagged_arr = source_arr
+    elif n >= nrows:
+        # All defaults - create array of correct type
+        if default is None:
+            lagged_arr = _pa.nulls(nrows, type=source_arr.type)
+        else:
+            lagged_arr = _pa.array([default] * nrows, type=source_arr.type)
+    else:
+        # Slice and prepend defaults
+        shifted = source_arr.slice(0, nrows - n)
+
+        if default is None:
+            prefix = _pa.nulls(n, type=source_arr.type)
+        else:
+            prefix = _pa.array([default] * n, type=source_arr.type)
+
+        lagged_arr = _pa.concat_arrays([prefix, shifted])
+
+    # Add new column
+    new_columns = table["columns"] + [result_column]
+    new_data = list(table["rows"]) + [lagged_arr]
+
+    return {"orientation": "arrow", "columns": new_columns, "rows": new_data}
+
+
+def table_lead(
+    table: dict[str, Any],
+    column: str,
+    n: int = 1,
+    default: Any = None,
+    result_column: str | None = None,
+) -> dict[str, Any]:
+    """Add a column with lead values (shifted up by n rows).
+
+    IMPORTANT: Assumes table is pre-sorted. For partitioned data,
+    sort by partition columns then order column before calling.
+
+    Args:
+        table: Input table (any orientation)
+        column: Column to lead
+        n: Number of rows to lead (default: 1)
+        default: Value for last n rows where lead is undefined (default: None)
+        result_column: Name for result column (default: "{column}_lead{n}")
+
+    Returns:
+        Table with lead column added (same orientation as input).
+
+    Example:
+        Input:              Output:
+        date    price       date    price   price_lead1
+        Jan-01  100         Jan-01  100     101
+        Jan-02  101         Jan-02  101     102
+        Jan-03  102         Jan-03  102     None
+    """
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+
+    if result_column is None:
+        result_column = f"{column}_lead{n}"
+
+    # Handle Arrow tables specially for efficiency
+    if _is_arrow(table):
+        return _table_lead_arrow(table, column, n, default, result_column)
+
+    # Convert to column-oriented for uniform processing
+    tbl = table_to_columns(table)
+    columns = tbl["columns"]
+    col_data = tbl["rows"]
+
+    col_idx = columns.index(column)
+    source_col = col_data[col_idx]
+    nrows = len(source_col)
+
+    # Build lead column
+    if n == 0:
+        lead_col = source_col[:]
+    elif n >= nrows:
+        lead_col = [default] * nrows
+    else:
+        lead_col = source_col[n:] + [default] * n
+
+    # Add new column
+    new_columns = columns + [result_column]
+    new_data = col_data + [lead_col]
+
+    result = {"orientation": "column", "columns": new_columns, "rows": new_data}
+
+    # Convert back to original orientation
+    if _is_column_oriented(table):
+        return result
+    else:
+        return table_to_rows(result)
+
+
+def _table_lead_arrow(
+    table: dict[str, Any],
+    column: str,
+    n: int,
+    default: Any,
+    result_column: str,
+) -> dict[str, Any]:
+    """Arrow-optimized lead implementation."""
+    _pa, _pc = _import_pyarrow()
+
+    col_idx = _resolve_column_index(table, column)
+    source_arr = table["rows"][col_idx]
+    nrows = len(source_arr)
+
+    if n == 0:
+        lead_arr = source_arr
+    elif n >= nrows:
+        # All defaults - create array of correct type
+        if default is None:
+            lead_arr = _pa.nulls(nrows, type=source_arr.type)
+        else:
+            lead_arr = _pa.array([default] * nrows, type=source_arr.type)
+    else:
+        # Slice and append defaults
+        shifted = source_arr.slice(n)
+
+        if default is None:
+            suffix = _pa.nulls(n, type=source_arr.type)
+        else:
+            suffix = _pa.array([default] * n, type=source_arr.type)
+
+        lead_arr = _pa.concat_arrays([shifted, suffix])
+
+    # Add new column
+    new_columns = table["columns"] + [result_column]
+    new_data = list(table["rows"]) + [lead_arr]
+
+    return {"orientation": "arrow", "columns": new_columns, "rows": new_data}

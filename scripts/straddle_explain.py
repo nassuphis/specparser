@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from specparser.amt import loader, schedules
 from specparser.amt.tickers import (
-    get_straddle_days,
+    get_straddle_actions,
     asset_straddle_tickers,
     _anchor_day,
     _add_calendar_days,
@@ -103,7 +103,7 @@ def explain_straddle(
 
     # Get straddle days table
     try:
-        table = get_straddle_days(underlying, year, month, straddle_idx, amt_path, chain_path, prices_path)
+        table = get_straddle_actions(underlying, year, month, straddle_idx, amt_path, chain_path, prices_path)
     except ValueError as e:
         if just_check:
             print("FALSE")

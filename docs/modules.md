@@ -274,28 +274,64 @@ Process AMT (Asset Management Table) YAML files for expiry schedules.
 
 The AMT module is structured as a subpackage:
 - `loader.py` - Loading, caching, and asset queries
-- `tickers.py` - Ticker extraction and expansion
+- `tickers.py` - Ticker extraction, price lookup, and straddle processing
 - `schedules.py` - Schedule expansion and straddle building
+- `table.py` - Table manipulation utilities (row/column/arrow orientations)
+- `_numba_kernels.py` - Numba JIT-compiled date expansion kernels
 
 **Key exports:**
 ```python
 from specparser.amt import (
     # Loading and caching
-    load_amt, clear_cache,
+    load_amt, clear_cache, clear_ticker_caches, clear_schedule_caches,
+    clear_days_cache, clear_calendar_cache,
+
     # Value extraction
     get_value, get_aum, get_leverage,
+
     # Asset queries
     get_asset, find_assets, cached_assets,
+
     # Table utilities
-    get_table, table_column, format_table, print_table,
+    get_table, table_column, table_to_columns, table_to_rows, table_to_arrow,
+    table_orientation, table_nrows, table_validate, table_select_columns,
+    table_add_column, table_drop_columns, table_bind_rows, table_unique_rows,
+    table_head, table_sample, table_replace_value, table_stack_cols,
+    table_left_join, table_inner_join, table_unchop, table_chop,
+    table_explode_arrow, table_pivot_wider, table_lag, table_lead,
+    format_table, print_table,
+
     # Asset tables
     assets, asset_class, asset_table, asset_group,
+
     # Ticker extraction
-    get_tschemas, find_tschemas, live_tickers, fut_spec2ticker, fut_norm2act, asset_straddle, straddle_days,
+    get_tschemas, find_tschemas, get_tickers_ym, find_tickers, find_tickers_ym,
+    fut_spec2ticker, fut_norm2act, fut_act2norm, asset_straddle_tickers,
+
+    # Price functions
+    load_all_prices, set_prices_dict, get_price, clear_prices_dict,
+    prices_last, prices_query,
+
+    # Straddle price/action functions
+    get_prices, actions, get_straddle_actions,
+    get_straddle_valuation,
+
     # Schedule processing
-    get_schedule, find_schedules,
+    get_schedule, get_schedule_count, find_schedules,
+
     # Schedule expansion (returns straddle strings)
-    expand, expand_ym, get_expand, get_expand_ym,
+    find_straddle_yrs, find_straddle_ym, get_straddle_yrs, get_expand_ym,
+
+    # Straddle day functions
+    straddle_days, count_straddle_days, count_straddles_days,
+    find_straddle_days, find_straddle_days_arrow, find_straddle_days_numba,
+
+    # Straddle parsing helpers
+    ntr, ntry, ntrm, xpr, xpry, xprm, ntrc, ntrv, xprc, xprv, wgt,
+
+    # Arrow compute functions (60+ functions for vectorized operations)
+    table_add_arrow, table_subtract_arrow, table_multiply_arrow,
+    table_cumsum_arrow, table_filter_arrow, table_summarize_arrow, # etc.
 )
 ```
 

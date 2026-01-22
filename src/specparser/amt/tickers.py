@@ -798,7 +798,7 @@ def _last_good_day_in_month(
     A "good day" is one where vol and all hedge columns are not "none".
 
     Args:
-        rows: Data rows from get_straddle_days output
+        rows: Data rows from get_straddle_actions output
         vol_idx: Index of vol column
         hedge_indices: List of hedge column indices
         date_idx: Index of date column
@@ -1091,7 +1091,7 @@ def _nth_good_day_after(
     - n > 0: Return Nth good day after Day 0
 
     Args:
-        rows: Data rows from get_straddle_days output
+        rows: Data rows from get_straddle_actions output
         vol_idx: Index of vol column
         hedge_indices: List of hedge column indices
         date_idx: Index of date column
@@ -1166,10 +1166,10 @@ def _compute_actions(
     overrides_path: str | Path | None = None
 ) -> list[str]:
     """
-    Compute action values for each row in get_straddle_days output.
+    Compute action values for each row in get_straddle_actions output.
 
     Args:
-        rows: Output rows from get_straddle_days (before action column added)
+        rows: Output rows from get_straddle_actions (before action column added)
         columns: Column names (to find vol/hedge indices)
         ntrc: Entry code from straddle
         ntrv: Entry value from straddle
@@ -1254,102 +1254,70 @@ def _compute_actions(
     return actions
 
 
-def get_straddle_days(
-    underlying: str,
-    year: int,
-    month: int,
-    i: int,
-    path: str | Path,
+# -------------------------------------
+# Refactored straddle price/action helpers
+# -------------------------------------
+
+
+def _build_ticker_map(
+    ticker_table: dict[str, Any],
     chain_csv: str | Path | None = None,
-    prices_parquet: str | Path | None = None,
-) -> dict[str, Any]:
-    """Get daily prices for a straddle from entry to expiry month.
-
-    Columns: ['asset', 'straddle', 'date', <param1>, <param2>, ...]
-    Where params are 'vol', 'hedge', 'hedge1', etc.
-
-    Uses the module-level _PRICES_DICT if set (via set_prices_dict or load_all_prices),
-    otherwise falls back to DuckDB queries on prices_parquet.
+) -> tuple[dict[str, tuple[str, str]], list[str]]:
+    """Build ticker map from ticker table.
 
     Args:
-        underlying: Asset underlying value
-        year: Expiry year
-        month: Expiry month
-        i: Straddle selector index (i % len(straddles))
-        path: Path to AMT YAML file
-        chain_csv: Optional CSV for futures ticker lookup
-        prices_parquet: Path to prices parquet file (for DuckDB fallback)
+        ticker_table: Output from asset_straddle_tickers()
+        chain_csv: Optional CSV for futures ticker normalization
 
     Returns:
-        Table with one row per day, columns for each param's price
+        (ticker_map, params_ordered) where:
+        - ticker_map: param -> (ticker, field) for price lookup
+        - params_ordered: list of params in order for output columns
     """
-    # Get ticker table from asset_straddle_tickers
-    table = asset_straddle_tickers(underlying, year, month, i, path, chain_csv)
+    param_idx = ticker_table["columns"].index("param")
+    ticker_idx = ticker_table["columns"].index("ticker")
+    field_idx = ticker_table["columns"].index("field")
 
-    if not table["rows"]:
-        return {"orientation": "row", "columns": ["asset", "straddle", "date"], "rows": []}
-
-    # All rows have same asset and straddle
-    asset = table["rows"][0][0]
-    straddle = table["rows"][0][1]
-
-    # Get model from Valuation.Model
-    asset_data = loader.get_asset(path, underlying)
-    if asset_data is not None:
-        valuation = asset_data.get("Valuation", {})
-        model = valuation.get("Model", "") if isinstance(valuation, dict) else ""
-    else:
-        model = ""
-
-    # Parse straddle to get date range
-    entry_year, entry_month = schedules.ntry(straddle), schedules.ntrm(straddle)
-    expiry_year, expiry_month = schedules.xpry(straddle), schedules.xprm(straddle)
-
-    # Map param -> (ticker, field) from input rows
-    # Input columns: ["asset", "straddle", "param", "source", "ticker", "field"]
-    param_idx = table["columns"].index("param")
-    ticker_idx = table["columns"].index("ticker")
-    field_idx = table["columns"].index("field")
-
-    ticker_map = {}  # param -> (ticker, field)
+    raw_ticker_map = {}  # param -> (ticker, field)
     params_ordered = []  # preserve order for output columns
-    for row in table["rows"]:
+    for row in ticker_table["rows"]:
         param = row[param_idx]
-        if param not in ticker_map:
+        if param not in raw_ticker_map:
             params_ordered.append(param)
-            ticker_map[param] = (row[ticker_idx], row[field_idx])
+            raw_ticker_map[param] = (row[ticker_idx], row[field_idx])
 
     # Normalize tickers for price lookup (prices DB uses normalized tickers)
-    # Only applies when chain_csv is provided
-    normalized_ticker_map = {}  # param -> (normalized_ticker, field)
+    ticker_map = {}
     if chain_csv is not None:
-        for param, (ticker, field) in ticker_map.items():
+        for param, (ticker, field) in raw_ticker_map.items():
             normalized = fut_act2norm(chain_csv, ticker)
             if normalized is not None:
-                normalized_ticker_map[param] = (normalized, field)
+                ticker_map[param] = (normalized, field)
             else:
-                # Ticker wasn't converted (not a futures ticker), use as-is
-                normalized_ticker_map[param] = (ticker, field)
+                ticker_map[param] = (ticker, field)
     else:
-        normalized_ticker_map = ticker_map
+        ticker_map = raw_ticker_map
 
-    # Generate all dates from entry month to expiry month (inclusive)
-    dates = []
-    current_year, current_month = entry_year, entry_month
-    while (current_year, current_month) <= (expiry_year, expiry_month):
-        dates.extend(schedules.get_days_ym(current_year, current_month))
-        # Advance to next month
-        if current_month == 12:
-            current_year += 1
-            current_month = 1
-        else:
-            current_month += 1
+    return ticker_map, params_ordered
 
-    # Build list of (ticker, field) pairs to query using normalized tickers
-    ticker_field_pairs = list(normalized_ticker_map.values())
 
-    # Organize: (ticker, field) -> {date_str -> value}
-    prices = {}
+def _lookup_straddle_prices(
+    dates: list,
+    ticker_map: dict[str, tuple[str, str]],
+    prices_parquet: str | Path | None = None,
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Lookup prices for all dates and ticker/field pairs.
+
+    Args:
+        dates: List of date objects to lookup
+        ticker_map: Mapping from param name to (ticker, field)
+        prices_parquet: Path to parquet for DuckDB fallback
+
+    Returns:
+        Dict mapping (ticker, field) -> {date_str -> value}
+    """
+    ticker_field_pairs = list(ticker_map.values())
+    prices: dict[tuple[str, str], dict[str, str]] = {}
 
     if _PRICES_DICT is not None:
         # Use preloaded dict - O(1) lookups
@@ -1367,8 +1335,6 @@ def get_straddle_days(
 
         con = _get_prices_connection(prices_parquet)
 
-        # Query all prices in one go
-        # Parquet schema: ticker, date, field, value
         conditions = " OR ".join(
             f"(ticker = '{t}' AND field = '{f}')" for t, f in ticker_field_pairs
         )
@@ -1389,95 +1355,343 @@ def get_straddle_days(
     else:
         raise ValueError("No prices available: call load_all_prices() or set_prices_dict() first, or provide prices_parquet")
 
-    # Output columns: asset, straddle, date, <params...>
-    out_columns = ["asset", "straddle", "date"] + params_ordered
+    return prices
 
+
+def _build_prices_table(
+    asset: str,
+    straddle: str,
+    dates: list,
+    params_ordered: list[str],
+    ticker_map: dict[str, tuple[str, str]],
+    prices: dict[tuple[str, str], dict[str, str]],
+) -> dict[str, Any]:
+    """Build the prices table with one row per day.
+
+    Args:
+        asset: Asset identifier
+        straddle: Straddle string
+        dates: List of date objects
+        params_ordered: List of param names in column order
+        ticker_map: param -> (ticker, field)
+        prices: (ticker, field) -> {date_str -> value}
+
+    Returns:
+        Table with columns: [asset, straddle, date, <params...>]
+    """
+    out_columns = ["asset", "straddle", "date"] + params_ordered
     out_rows = []
+
     for dt in dates:
         date_str = dt.isoformat()
         row = [asset, straddle, date_str]
         for param in params_ordered:
-            ticker, field = normalized_ticker_map[param]  # Use normalized for lookup
+            ticker, field = ticker_map[param]
             value = prices.get((ticker, field), {}).get(date_str, "none")
             row.append(value)
         out_rows.append(row)
 
-    # Compute action column
+    return {"orientation": "row", "columns": out_columns, "rows": out_rows}
+
+
+def _find_action_indices(table: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Find ntry and xpry row indices from action column.
+
+    Args:
+        table: Table with 'action' column
+
+    Returns:
+        (ntry_idx, xpry_idx) - row indices or None if not found
+    """
+    if "action" not in table["columns"]:
+        return None, None
+
+    action_idx = table["columns"].index("action")
+    ntry_idx = None
+    xpry_idx = None
+
+    for i, row in enumerate(table["rows"]):
+        if row[action_idx] == "ntry":
+            ntry_idx = i
+        elif row[action_idx] == "xpry":
+            xpry_idx = i
+
+    return ntry_idx, xpry_idx
+
+
+def _add_action_column(
+    table: dict[str, Any],
+    straddle: str,
+    underlying: str,
+    overrides_csv: str | Path | None = None,
+) -> dict[str, Any]:
+    """Add action column to prices table.
+
+    Args:
+        table: Prices table with columns [asset, straddle, date, <params...>]
+        straddle: Straddle string for parsing entry/expiry info
+        underlying: Asset underlying for override lookups
+        overrides_csv: Path to overrides CSV (for OVERRIDE code)
+
+    Returns:
+        Table with 'action' column added
+    """
     ntrc_val = schedules.ntrc(straddle)
     ntrv_val = schedules.ntrv(straddle)
     xprc_val = schedules.xprc(straddle)
     xprv_val = schedules.xprv(straddle)
+    entry_year, entry_month = schedules.ntry(straddle), schedules.ntrm(straddle)
+    expiry_year, expiry_month = schedules.xpry(straddle), schedules.xprm(straddle)
 
-    actions = _compute_actions(out_rows, out_columns, ntrc_val, ntrv_val, xprc_val, xprv_val, expiry_year, expiry_month, entry_year, entry_month, underlying)
+    actions = _compute_actions(
+        table["rows"], table["columns"],
+        ntrc_val, ntrv_val, xprc_val, xprv_val,
+        expiry_year, expiry_month, entry_year, entry_month,
+        underlying, overrides_csv
+    )
 
     # Add action to each row
-    for i, action in enumerate(actions):
-        out_rows[i].append(action)
-    out_columns.append("action")
+    new_rows = [row + [action] for row, action in zip(table["rows"], actions)]
+    new_columns = table["columns"] + ["action"]
 
-    # Add model column (same value for all rows)
-    for row in out_rows:
-        row.append(model)
-    out_columns.append("model")
+    return {"orientation": "row", "columns": new_columns, "rows": new_rows}
 
-    # Add strike columns (strike_vol, strike, strike1, ...)
-    # Find ntry and xpry row indices
-    ntry_idx = None
-    xpry_idx = None
-    for i, action in enumerate(actions):
-        if action == "ntry":
-            ntry_idx = i
-        elif action == "xpry":
-            xpry_idx = i
 
-    # Find vol column index in out_columns
-    vol_col_idx = out_columns.index("vol") if "vol" in out_columns else None
+def _add_model_column(
+    table: dict[str, Any],
+    underlying: str,
+    path: str | Path,
+) -> dict[str, Any]:
+    """Add model column to table.
+
+    Args:
+        table: Input table
+        underlying: Asset underlying
+        path: Path to AMT YAML file
+
+    Returns:
+        Table with 'model' column added
+    """
+    asset_data = loader.get_asset(path, underlying)
+    if asset_data is not None:
+        valuation = asset_data.get("Valuation", {})
+        model = valuation.get("Model", "") if isinstance(valuation, dict) else ""
+    else:
+        model = ""
+
+    new_rows = [row + [model] for row in table["rows"]]
+    new_columns = table["columns"] + ["model"]
+
+    return {"orientation": "row", "columns": new_columns, "rows": new_rows}
+
+
+def _add_strike_columns(
+    table: dict[str, Any],
+    ntry_idx: int | None,
+    xpry_idx: int | None,
+) -> dict[str, Any]:
+    """Add strike_vol, strike, strike1..., and expiry columns.
+
+    Values come from ntry row, shown only between ntry and xpry.
+
+    Args:
+        table: Table with prices, action, model columns
+        ntry_idx: Row index of entry trigger (or None)
+        xpry_idx: Row index of expiry trigger (or None)
+
+    Returns:
+        Table with strike and expiry columns added
+    """
+    columns = table["columns"]
+    rows = [row[:] for row in table["rows"]]  # Copy rows
+
+    # Find vol column index
+    vol_col_idx = columns.index("vol") if "vol" in columns else None
 
     # Find hedge column indices
     hedge_col_indices = []
-    for i, col in enumerate(out_columns):
+    for i, col in enumerate(columns):
         if col == "hedge" or (col.startswith("hedge") and col[5:].isdigit()):
             hedge_col_indices.append(i)
 
     # Get strike values from ntry row
     if ntry_idx is not None and vol_col_idx is not None:
-        strike_vol_value = out_rows[ntry_idx][vol_col_idx]
-        strike_values = [out_rows[ntry_idx][idx] for idx in hedge_col_indices]
+        strike_vol_value = rows[ntry_idx][vol_col_idx]
+        strike_values = [rows[ntry_idx][idx] for idx in hedge_col_indices]
     else:
         strike_vol_value = "-"
         strike_values = ["-"] * len(hedge_col_indices)
 
     # Add strike_vol column
-    for i, row in enumerate(out_rows):
-        # Show value only from ntry to xpry (inclusive)
+    new_columns = columns + ["strike_vol"]
+    for i, row in enumerate(rows):
         in_range = (ntry_idx is not None and i >= ntry_idx and
                     (xpry_idx is None or i <= xpry_idx))
         row.append(strike_vol_value if in_range else "-")
-    out_columns.append("strike_vol")
 
     # Add strike columns (one per hedge)
     for j in range(len(hedge_col_indices)):
         strike_col_name = "strike" if j == 0 else f"strike{j}"
-        for i, row in enumerate(out_rows):
+        for i, row in enumerate(rows):
             in_range = (ntry_idx is not None and i >= ntry_idx and
                         (xpry_idx is None or i <= xpry_idx))
             row.append(strike_values[j] if in_range else "-")
-        out_columns.append(strike_col_name)
+        new_columns.append(strike_col_name)
 
-    # Add expiry column (date at xpry, "-" before ntry and after xpry)
-    date_col_idx = out_columns.index("date") if "date" in out_columns else None
+    # Add expiry column
+    date_col_idx = columns.index("date") if "date" in columns else None
     if xpry_idx is not None and date_col_idx is not None:
-        expiry_value = out_rows[xpry_idx][date_col_idx]
+        expiry_value = rows[xpry_idx][date_col_idx]
     else:
         expiry_value = "-"
 
-    for i, row in enumerate(out_rows):
+    for i, row in enumerate(rows):
         in_range = (ntry_idx is not None and i >= ntry_idx and
                     (xpry_idx is None or i <= xpry_idx))
         row.append(expiry_value if in_range else "-")
-    out_columns.append("expiry")
+    new_columns.append("expiry")
 
-    return {"orientation": "row", "columns": out_columns, "rows": out_rows}
+    return {"orientation": "row", "columns": new_columns, "rows": rows}
+
+
+# -------------------------------------
+# Public API: Decomposed straddle functions
+# -------------------------------------
+
+
+def get_prices(
+    underlying: str,
+    year: int,
+    month: int,
+    i: int,
+    path: str | Path,
+    chain_csv: str | Path | None = None,
+    prices_parquet: str | Path | None = None,
+) -> dict[str, Any]:
+    """Get daily prices for a straddle from entry to expiry.
+
+    This is a focused function that ONLY handles price lookup.
+    Does NOT compute actions, strikes, or model columns.
+
+    Args:
+        underlying: Asset underlying value
+        year: Expiry year
+        month: Expiry month
+        i: Straddle selector index (i % len(straddles))
+        path: Path to AMT YAML file
+        chain_csv: Optional CSV for futures ticker lookup
+        prices_parquet: Path to prices parquet file (for DuckDB fallback)
+
+    Returns:
+        Table with columns: [asset, straddle, date, vol, hedge, ...]
+    """
+    # 1. Get ticker table
+    ticker_table = asset_straddle_tickers(underlying, year, month, i, path, chain_csv)
+
+    if not ticker_table["rows"]:
+        return {"orientation": "row", "columns": ["asset", "straddle", "date"], "rows": []}
+
+    # 2. Extract asset and straddle
+    asset = ticker_table["rows"][0][0]
+    straddle = ticker_table["rows"][0][1]
+
+    # 3. Generate dates using existing schedules.straddle_days()
+    dates = schedules.straddle_days(straddle)
+
+    # 4. Build ticker map
+    ticker_map, params_ordered = _build_ticker_map(ticker_table, chain_csv)
+
+    # 5. Lookup prices
+    prices = _lookup_straddle_prices(dates, ticker_map, prices_parquet)
+
+    # 6. Build and return table
+    return _build_prices_table(asset, straddle, dates, params_ordered, ticker_map, prices)
+
+
+def actions(
+    prices_table: dict[str, Any],
+    path: str | Path,
+    overrides_csv: str | Path | None = None,
+) -> dict[str, Any]:
+    """Add action, model, and strike columns to a prices table.
+
+    Args:
+        prices_table: Output from get_prices() - must have 'asset' and 'straddle' columns
+        path: Path to AMT YAML
+        overrides_csv: Path to overrides CSV (for OVERRIDE code)
+
+    Returns:
+        Table with added columns: action, model, strike_vol, strike, expiry
+    """
+    if not prices_table["rows"]:
+        return prices_table
+
+    # Extract asset (underlying) and straddle from first row
+    asset_idx = prices_table["columns"].index("asset")
+    straddle_idx = prices_table["columns"].index("straddle")
+    underlying = prices_table["rows"][0][asset_idx]
+    straddle = prices_table["rows"][0][straddle_idx]
+
+    # 1. Add action column
+    table = _add_action_column(prices_table, straddle, underlying, overrides_csv)
+
+    # 2. Add model column
+    table = _add_model_column(table, underlying, path)
+
+    # 3. Add strike columns
+    ntry_idx, xpry_idx = _find_action_indices(table)
+    table = _add_strike_columns(table, ntry_idx, xpry_idx)
+
+    return table
+
+
+def get_straddle_actions(
+    underlying: str,
+    year: int,
+    month: int,
+    i: int,
+    path: str | Path,
+    chain_csv: str | Path | None = None,
+    prices_parquet: str | Path | None = None,
+    overrides_csv: str | Path | None = None,
+) -> dict[str, Any]:
+    """Get daily prices for a straddle from entry to expiry month.
+
+    Columns: ['asset', 'straddle', 'date', <param1>, <param2>, ..., 'action', 'model', 'strike_vol', 'strike', 'expiry']
+    Where params are 'vol', 'hedge', 'hedge1', etc.
+
+    This is a convenience function that composes:
+    1. get_prices() - price lookup
+    2. actions() - action, model, and strike columns
+
+    For more control, use the individual functions directly.
+
+    Uses the module-level _PRICES_DICT if set (via set_prices_dict or load_all_prices),
+    otherwise falls back to DuckDB queries on prices_parquet.
+
+    Args:
+        underlying: Asset underlying value
+        year: Expiry year
+        month: Expiry month
+        i: Straddle selector index (i % len(straddles))
+        path: Path to AMT YAML file
+        chain_csv: Optional CSV for futures ticker lookup
+        prices_parquet: Path to prices parquet file (for DuckDB fallback)
+        overrides_csv: Path to overrides CSV (for OVERRIDE code)
+
+    Returns:
+        Table with one row per day, columns for each param's price plus action/strike columns
+    """
+    # Get prices table
+    prices_table = get_prices(
+        underlying, year, month, i, path, chain_csv, prices_parquet
+    )
+
+    if not prices_table["rows"]:
+        return prices_table
+
+    # Add actions, model, and strikes
+    return actions(prices_table, path, overrides_csv)
 
 
 def _get_rollforward_fields(columns: list[str]) -> set[str]:
@@ -1499,20 +1713,21 @@ def get_straddle_valuation(
     path: str | Path,
     chain_csv: str | Path | None = None,
     prices_parquet: str | Path | None = None,
+    overrides_csv: str | Path | None = None,
 ) -> dict[str, Any]:
     """Get straddle valuation with mv column.
 
-    Calls get_straddle_days and adds mv (mark-to-market value) column
+    Calls get_straddle_actions and adds mv (mark-to-market value) column
     computed using the asset's valuation model.
 
     Args:
-        Same as get_straddle_days
+        Same as get_straddle_actions
 
     Returns:
         Table with additional mv column
     """
     # Get base table
-    table = get_straddle_days(underlying, year, month, i, path, chain_csv, prices_parquet)
+    table = get_straddle_actions(underlying, year, month, i, path, chain_csv, prices_parquet, overrides_csv)
 
     columns = table["columns"]
     rows = table["rows"]
@@ -1800,7 +2015,7 @@ def _main() -> int:
 
     elif args.asset_days:
         underlying, year, month, i = args.asset_days
-        table = get_straddle_days(underlying, int(year), int(month), int(i), args.path, args.chain_csv, args.prices)
+        table = get_straddle_actions(underlying, int(year), int(month), int(i), args.path, args.chain_csv, args.prices)
         loader.print_table(table)
 
     elif args.prices_last:
