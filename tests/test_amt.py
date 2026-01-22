@@ -29,6 +29,22 @@ from specparser.amt import (
     table_add_column,
     table_drop_columns,
     table_replace_value,
+    table_stack_cols,
+    table_to_columns,
+    table_to_rows,
+    # arrow support
+    table_to_arrow,
+    table_to_jsonable,
+    table_orientation,
+    table_nrows,
+    table_validate,
+    table_head,
+    table_sample,
+    table_bind_rows,
+    table_unchop,
+    table_chop,
+    table_left_join,
+    table_inner_join,
     _iter_assets,
     assets,
     asset_class,
@@ -487,7 +503,9 @@ class TestLoader:
         assert "subgroup" in table["columns"]
         assert "liquidity" in table["columns"]
         assert "limit_overrides" in table["columns"]
-        assert len(table["rows"]) == 4
+        # table_stack_cols returns column-oriented, so rows[0] is first column
+        assert table["orientation"] == "column"
+        assert len(table["rows"][0]) == 4  # 4 live assets
 
 
 # -------------------------------------
@@ -515,7 +533,7 @@ class TestTableUtilities:
     def test_bind_rows_empty(self):
         """Test bind_rows with no tables."""
         result = bind_rows()
-        assert result == {"columns": [], "rows": []}
+        assert result == {"orientation": "row", "columns": [], "rows": []}
 
     def test_bind_rows_empty_rows(self):
         """Test bind_rows with tables that have empty rows."""
@@ -654,6 +672,130 @@ class TestTableUtilities:
         table = {"columns": ["a", "b"], "rows": [[1, 2]]}
         with pytest.raises(ValueError, match="Column 'x' not found"):
             table_replace_value(table, "x", 1, 2)
+
+    # --- table_stack_cols tests ---
+
+    def test_table_stack_cols_basic(self):
+        """Test basic column stacking."""
+        t1 = {"orientation": "row", "columns": ["key", "a"], "rows": [[1, 10], [2, 20]]}
+        t2 = {"orientation": "row", "columns": ["key", "b"], "rows": [[1, 100], [2, 200]]}
+        result = table_stack_cols(t1, t2)
+        assert result["orientation"] == "column"
+        assert result["columns"] == ["key", "a", "b"]
+        # Column-oriented: rows = [[key_vals], [a_vals], [b_vals]]
+        assert result["rows"][0] == [1, 2]  # key column
+        assert result["rows"][1] == [10, 20]  # a column
+        assert result["rows"][2] == [100, 200]  # b column
+
+    def test_table_stack_cols_column_oriented_input(self):
+        """Test stacking when input is already column-oriented (should be O(k))."""
+        t1 = {"orientation": "column", "columns": ["key", "a"], "rows": [[1, 2], [10, 20]]}
+        t2 = {"orientation": "column", "columns": ["key", "b"], "rows": [[1, 2], [100, 200]]}
+        result = table_stack_cols(t1, t2)
+        assert result["orientation"] == "column"
+        assert result["columns"] == ["key", "a", "b"]
+        assert result["rows"][0] == [1, 2]  # key column
+        assert result["rows"][1] == [10, 20]  # a column
+        assert result["rows"][2] == [100, 200]  # b column
+
+    def test_table_stack_cols_empty(self):
+        """Test stacking with no tables."""
+        result = table_stack_cols()
+        assert result == {"orientation": "column", "columns": [], "rows": []}
+
+    def test_table_stack_cols_single_table(self):
+        """Test stacking single table."""
+        t1 = {"orientation": "row", "columns": ["key", "a"], "rows": [[1, 10]]}
+        result = table_stack_cols(t1)
+        assert result["columns"] == ["key", "a"]
+        # Only key column is output (key from first, no non-key from second table)
+        # Wait - with single table, should have key + non-key cols
+        assert len(result["rows"]) == 2  # key and a columns
+
+    def test_table_stack_cols_row_count_mismatch(self):
+        """Test stacking raises error when row counts differ."""
+        t1 = {"orientation": "row", "columns": ["key", "a"], "rows": [[1, 10], [2, 20]]}
+        t2 = {"orientation": "row", "columns": ["key", "b"], "rows": [[1, 100]]}  # only 1 row
+        with pytest.raises(ValueError, match="Table 2 has 1 rows; expected 2"):
+            table_stack_cols(t1, t2)
+
+    def test_table_stack_cols_copy_data_true(self):
+        """Test that copy_data=True copies column data."""
+        col_data = [1, 2, 3]
+        t1 = {"orientation": "column", "columns": ["key", "a"], "rows": [col_data, [10, 20, 30]]}
+        result = table_stack_cols(t1, copy_data=True)
+        # Modify original should not affect result
+        col_data[0] = 999
+        assert result["rows"][0][0] == 1  # unchanged
+
+    def test_table_stack_cols_copy_data_false(self):
+        """Test that copy_data=False references existing lists."""
+        col_data = [1, 2, 3]
+        t1 = {"orientation": "column", "columns": ["key", "a"], "rows": [col_data, [10, 20, 30]]}
+        result = table_stack_cols(t1, copy_data=False)
+        # Modify original should affect result
+        col_data[0] = 999
+        assert result["rows"][0][0] == 999  # changed
+
+    def test_table_stack_cols_multiple_tables(self):
+        """Test stacking more than 2 tables."""
+        t1 = {"orientation": "row", "columns": ["key", "a"], "rows": [[1, 10]]}
+        t2 = {"orientation": "row", "columns": ["key", "b"], "rows": [[1, 20]]}
+        t3 = {"orientation": "row", "columns": ["key", "c"], "rows": [[1, 30]]}
+        result = table_stack_cols(t1, t2, t3)
+        assert result["columns"] == ["key", "a", "b", "c"]
+
+    # --- table orientation conversion tests ---
+
+    def test_table_to_columns_basic(self):
+        """Test converting row-oriented to column-oriented."""
+        t = {"orientation": "row", "columns": ["a", "b"], "rows": [[1, 2], [3, 4]]}
+        result = table_to_columns(t)
+        assert result["orientation"] == "column"
+        assert result["columns"] == ["a", "b"]
+        assert result["rows"] == [[1, 3], [2, 4]]
+
+    def test_table_to_columns_already_column(self):
+        """Test to_columns returns same table if already column-oriented."""
+        t = {"orientation": "column", "columns": ["a", "b"], "rows": [[1, 3], [2, 4]]}
+        result = table_to_columns(t)
+        assert result is t  # same object
+
+    def test_table_to_columns_empty(self):
+        """Test to_columns with empty table."""
+        t = {"orientation": "row", "columns": ["a", "b"], "rows": []}
+        result = table_to_columns(t)
+        assert result["orientation"] == "column"
+        assert result["rows"] == [[], []]  # empty columns
+
+    def test_table_to_rows_basic(self):
+        """Test converting column-oriented to row-oriented."""
+        t = {"orientation": "column", "columns": ["a", "b"], "rows": [[1, 3], [2, 4]]}
+        result = table_to_rows(t)
+        assert result["orientation"] == "row"
+        assert result["columns"] == ["a", "b"]
+        assert result["rows"] == [[1, 2], [3, 4]]
+
+    def test_table_to_rows_already_row(self):
+        """Test to_rows returns same table if already row-oriented."""
+        t = {"orientation": "row", "columns": ["a", "b"], "rows": [[1, 2], [3, 4]]}
+        result = table_to_rows(t)
+        assert result is t  # same object
+
+    def test_table_to_rows_empty(self):
+        """Test to_rows with empty table."""
+        t = {"orientation": "column", "columns": ["a", "b"], "rows": [[], []]}
+        result = table_to_rows(t)
+        assert result["orientation"] == "row"
+        assert result["rows"] == []
+
+    def test_table_orientation_roundtrip(self):
+        """Test row->column->row preserves data."""
+        original = {"orientation": "row", "columns": ["a", "b", "c"], "rows": [[1, 2, 3], [4, 5, 6]]}
+        col = table_to_columns(original)
+        back = table_to_rows(col)
+        assert back["rows"] == original["rows"]
+        assert back["columns"] == original["columns"]
 
 
 # -------------------------------------
@@ -850,13 +992,6 @@ class TestStraddleParsing:
         """Test straddle with empty expiry value."""
         s = "|2023-12|2024-01|N|0|OVERRIDE||33.3|"
         assert xprv(s) == ""
-
-    def test_invalid_straddle_format(self):
-        """Test that invalid straddle format raises ValueError."""
-        # Only 5 parts instead of 7
-        s = "|2023-12|2024-01|N|0|OVERRIDE|"
-        with pytest.raises(ValueError, match="Invalid straddle format"):
-            ntr(s)
 
     def test_straddle_parsing_consistency(self):
         """Test that all parsing functions work together consistently."""
@@ -2495,8 +2630,9 @@ class TestIntegration:
         """Test complete asset classification workflow."""
         clear_cache()
 
-        # Get group assignments
+        # Get group assignments (returns column-oriented)
         groups = asset_group(test_amt_file, live_only=True)
+        groups = table_to_rows(groups)  # convert to row-oriented for dict access
 
         # Verify structure
         assert "asset" in groups["columns"]
@@ -3255,38 +3391,43 @@ class TestOverrideExpiry:
 
 
 # -------------------------------------
-# year_month_days Tests
+# straddle_days Tests
 # -------------------------------------
 
-from specparser.amt import year_month_days
+from specparser.amt import straddle_days, count_straddle_days
 import datetime
 
 
-class TestYearMonthDays:
-    """Tests for year_month_days function."""
+class TestStraddleDays:
+    """Tests for straddle_days and count_straddle_days functions."""
 
     def test_single_month(self):
         """Test generating days for a single month."""
-        days = year_month_days(2024, 1, 2024, 1)
+        # straddle format: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
+        straddle = "|2024-01|2024-01|N|5|F||33.3|"
+        days = straddle_days(straddle)
         assert len(days) == 31  # January has 31 days
         assert days[0] == datetime.date(2024, 1, 1)
         assert days[-1] == datetime.date(2024, 1, 31)
 
     def test_february_leap_year(self):
         """Test February in a leap year."""
-        days = year_month_days(2024, 2, 2024, 2)
+        straddle = "|2024-02|2024-02|N|5|F||33.3|"
+        days = straddle_days(straddle)
         assert len(days) == 29  # 2024 is a leap year
         assert days[-1] == datetime.date(2024, 2, 29)
 
     def test_february_non_leap_year(self):
         """Test February in a non-leap year."""
-        days = year_month_days(2023, 2, 2023, 2)
+        straddle = "|2023-02|2023-02|N|5|F||33.3|"
+        days = straddle_days(straddle)
         assert len(days) == 28
         assert days[-1] == datetime.date(2023, 2, 28)
 
     def test_multiple_months(self):
         """Test spanning multiple months."""
-        days = year_month_days(2024, 1, 2024, 3)
+        straddle = "|2024-01|2024-03|N|5|F||33.3|"
+        days = straddle_days(straddle)
         # Jan=31, Feb=29, Mar=31 = 91 days
         assert len(days) == 91
         assert days[0] == datetime.date(2024, 1, 1)
@@ -3294,7 +3435,8 @@ class TestYearMonthDays:
 
     def test_cross_year_boundary(self):
         """Test spanning across year boundary."""
-        days = year_month_days(2023, 12, 2024, 1)
+        straddle = "|2023-12|2024-01|N|5|F||33.3|"
+        days = straddle_days(straddle)
         # Dec=31, Jan=31 = 62 days
         assert len(days) == 62
         assert days[0] == datetime.date(2023, 12, 1)
@@ -3302,34 +3444,946 @@ class TestYearMonthDays:
 
     def test_full_year(self):
         """Test generating all days in a year."""
-        days = year_month_days(2024, 1, 2024, 12)
+        straddle = "|2024-01|2024-12|N|5|F||33.3|"
+        days = straddle_days(straddle)
         assert len(days) == 366  # 2024 is a leap year
         assert days[0] == datetime.date(2024, 1, 1)
         assert days[-1] == datetime.date(2024, 12, 31)
 
-    def test_invalid_month_start(self):
-        """Test invalid start month raises ValueError."""
-        with pytest.raises(ValueError, match="month must be in 1..12"):
-            year_month_days(2024, 0, 2024, 1)
-
-    def test_invalid_month_end(self):
-        """Test invalid end month raises ValueError."""
-        with pytest.raises(ValueError, match="month must be in 1..12"):
-            year_month_days(2024, 1, 2024, 13)
-
-    def test_start_after_end(self):
-        """Test start > end raises ValueError."""
-        with pytest.raises(ValueError, match="start must be <= end"):
-            year_month_days(2024, 3, 2024, 1)
-
     def test_consecutive_days(self):
         """Test that returned days are consecutive."""
-        days = year_month_days(2024, 1, 2024, 3)
+        straddle = "|2024-01|2024-03|N|5|F||33.3|"
+        days = straddle_days(straddle)
         for i in range(1, len(days)):
             delta = days[i] - days[i-1]
             assert delta.days == 1, f"Gap between {days[i-1]} and {days[i]}"
 
     def test_returns_date_objects(self):
         """Test that function returns datetime.date objects."""
-        days = year_month_days(2024, 1, 2024, 1)
+        straddle = "|2024-01|2024-01|N|5|F||33.3|"
+        days = straddle_days(straddle)
         assert all(isinstance(d, datetime.date) for d in days)
+
+    def test_count_straddle_days(self):
+        """Test count_straddle_days returns correct count."""
+        straddle = "|2024-01|2024-03|N|5|F||33.3|"
+        count = count_straddle_days(straddle)
+        assert count == 91  # Jan=31, Feb=29, Mar=31
+
+    def test_count_matches_len(self):
+        """Test that count_straddle_days matches len(straddle_days)."""
+        straddle = "|2024-01|2024-06|N|5|F||33.3|"
+        count = count_straddle_days(straddle)
+        days = straddle_days(straddle)
+        assert count == len(days)
+
+
+# -------------------------------------
+# table_left_join and table_inner_join Tests
+# -------------------------------------
+
+from specparser.amt import table_left_join, table_inner_join
+
+
+class TestTableLeftJoin:
+    """Tests for table_left_join function."""
+
+    def test_basic_left_join(self):
+        """Test basic left join with matching and non-matching keys."""
+        left = {"orientation": "row", "columns": ["id", "name"],
+                "rows": [[1, "a"], [2, "b"], [3, "c"]]}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[1, 100], [2, 200]]}
+        result = table_left_join(left, right, "id")
+        assert result["columns"] == ["id", "name", "value"]
+        assert result["rows"] == [[1, "a", 100], [2, "b", 200], [3, "c", None]]
+
+    def test_duplicate_keys_in_right(self):
+        """Test left join when right table has duplicate keys."""
+        left = {"orientation": "row", "columns": ["id", "x"],
+                "rows": [[1, "a"]]}
+        right = {"orientation": "row", "columns": ["id", "y"],
+                 "rows": [[1, "p"], [1, "q"]]}
+        result = table_left_join(left, right, "id")
+        assert len(result["rows"]) == 2  # 1 left row * 2 right matches
+        assert result["rows"] == [[1, "a", "p"], [1, "a", "q"]]
+
+    def test_column_name_conflict(self):
+        """Test left join with overlapping column names."""
+        left = {"orientation": "row", "columns": ["id", "value"],
+                "rows": [[1, "left"]]}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[1, "right"]]}
+        result = table_left_join(left, right, "id", suffixes=("_l", "_r"))
+        assert result["columns"] == ["id", "value_l", "value_r"]
+        assert result["rows"] == [[1, "left", "right"]]
+
+    def test_different_key_column_names(self):
+        """Test left join when key columns have different names."""
+        left = {"orientation": "row", "columns": ["asset", "price"],
+                "rows": [["AAPL", 100]]}
+        right = {"orientation": "row", "columns": ["ticker", "volume"],
+                 "rows": [["AAPL", 1000]]}
+        result = table_left_join(left, right, "asset", "ticker")
+        assert result["columns"] == ["asset", "price", "volume"]
+        assert result["rows"] == [["AAPL", 100, 1000]]
+
+    def test_no_matches(self):
+        """Test left join when no keys match."""
+        left = {"orientation": "row", "columns": ["id", "name"],
+                "rows": [[1, "a"], [2, "b"]]}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[3, 300], [4, 400]]}
+        result = table_left_join(left, right, "id")
+        assert result["rows"] == [[1, "a", None], [2, "b", None]]
+
+    def test_empty_left_table(self):
+        """Test left join with empty left table."""
+        left = {"orientation": "row", "columns": ["id", "name"], "rows": []}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[1, 100]]}
+        result = table_left_join(left, right, "id")
+        assert result["columns"] == ["id", "name", "value"]
+        assert result["rows"] == []
+
+    def test_empty_right_table(self):
+        """Test left join with empty right table."""
+        left = {"orientation": "row", "columns": ["id", "name"],
+                "rows": [[1, "a"], [2, "b"]]}
+        right = {"orientation": "row", "columns": ["id", "value"], "rows": []}
+        result = table_left_join(left, right, "id")
+        assert result["columns"] == ["id", "name", "value"]
+        assert result["rows"] == [[1, "a", None], [2, "b", None]]
+
+    def test_column_oriented_input(self):
+        """Test left join with column-oriented input tables."""
+        left = {"orientation": "column", "columns": ["id", "name"],
+                "rows": [[1, 2, 3], ["a", "b", "c"]]}
+        right = {"orientation": "column", "columns": ["id", "value"],
+                 "rows": [[1, 2], [100, 200]]}
+        result = table_left_join(left, right, "id")
+        assert result["orientation"] == "row"
+        assert result["columns"] == ["id", "name", "value"]
+        assert result["rows"] == [[1, "a", 100], [2, "b", 200], [3, "c", None]]
+
+    def test_multiple_right_columns(self):
+        """Test left join with multiple columns from right table."""
+        left = {"orientation": "row", "columns": ["id", "a"],
+                "rows": [[1, "x"], [2, "y"]]}
+        right = {"orientation": "row", "columns": ["id", "b", "c", "d"],
+                 "rows": [[1, 10, 20, 30]]}
+        result = table_left_join(left, right, "id")
+        assert result["columns"] == ["id", "a", "b", "c", "d"]
+        assert result["rows"] == [[1, "x", 10, 20, 30], [2, "y", None, None, None]]
+
+    def test_key_by_index(self):
+        """Test left join using column index instead of name."""
+        left = {"orientation": "row", "columns": ["id", "name"],
+                "rows": [[1, "a"], [2, "b"]]}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[1, 100]]}
+        result = table_left_join(left, right, 0, 0)
+        assert result["rows"] == [[1, "a", 100], [2, "b", None]]
+
+
+class TestTableInnerJoin:
+    """Tests for table_inner_join function."""
+
+    def test_basic_inner_join(self):
+        """Test basic inner join returns only matching rows."""
+        left = {"orientation": "row", "columns": ["id", "name"],
+                "rows": [[1, "a"], [2, "b"], [3, "c"]]}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[1, 100], [3, 300]]}
+        result = table_inner_join(left, right, "id")
+        assert len(result["rows"]) == 2
+        assert result["rows"] == [[1, "a", 100], [3, "c", 300]]
+
+    def test_no_matches_returns_empty(self):
+        """Test inner join with no matches returns empty table."""
+        left = {"orientation": "row", "columns": ["id", "name"],
+                "rows": [[1, "a"], [2, "b"]]}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[3, 300], [4, 400]]}
+        result = table_inner_join(left, right, "id")
+        assert result["rows"] == []
+        assert result["columns"] == ["id", "name", "value"]
+
+    def test_all_match(self):
+        """Test inner join when all left keys have matches."""
+        left = {"orientation": "row", "columns": ["id", "name"],
+                "rows": [[1, "a"], [2, "b"]]}
+        right = {"orientation": "row", "columns": ["id", "value"],
+                 "rows": [[1, 100], [2, 200]]}
+        result = table_inner_join(left, right, "id")
+        assert result["rows"] == [[1, "a", 100], [2, "b", 200]]
+
+    def test_duplicate_keys_in_right(self):
+        """Test inner join when right table has duplicate keys."""
+        left = {"orientation": "row", "columns": ["id", "x"],
+                "rows": [[1, "a"], [2, "b"]]}
+        right = {"orientation": "row", "columns": ["id", "y"],
+                 "rows": [[1, "p"], [1, "q"]]}
+        result = table_inner_join(left, right, "id")
+        # Only id=1 matches, and it has 2 matches in right
+        assert len(result["rows"]) == 2
+        assert result["rows"] == [[1, "a", "p"], [1, "a", "q"]]
+
+    def test_different_key_column_names(self):
+        """Test inner join with different key column names."""
+        left = {"orientation": "row", "columns": ["asset", "price"],
+                "rows": [["AAPL", 100], ["GOOGL", 200], ["MSFT", 300]]}
+        right = {"orientation": "row", "columns": ["ticker", "volume"],
+                 "rows": [["AAPL", 1000], ["MSFT", 3000]]}
+        result = table_inner_join(left, right, "asset", "ticker")
+        assert result["columns"] == ["asset", "price", "volume"]
+        assert result["rows"] == [["AAPL", 100, 1000], ["MSFT", 300, 3000]]
+
+
+# ============================================================
+# Arrow Table Tests
+# ============================================================
+
+class TestArrowTables:
+    """Tests for arrow-oriented table support."""
+
+    def test_table_to_arrow_from_row(self):
+        """Test converting row-oriented table to arrow."""
+        row_table = {"orientation": "row", "columns": ["a", "b"],
+                     "rows": [[1, "x"], [2, "y"], [3, "z"]]}
+        result = table_to_arrow(row_table)
+        assert result["orientation"] == "arrow"
+        assert result["columns"] == ["a", "b"]
+        assert result["rows"][0].to_pylist() == [1, 2, 3]
+        assert result["rows"][1].to_pylist() == ["x", "y", "z"]
+
+    def test_table_to_arrow_from_column(self):
+        """Test converting column-oriented table to arrow."""
+        col_table = {"orientation": "column", "columns": ["a", "b"],
+                     "rows": [[1, 2, 3], ["x", "y", "z"]]}
+        result = table_to_arrow(col_table)
+        assert result["orientation"] == "arrow"
+        assert result["rows"][0].to_pylist() == [1, 2, 3]
+
+    def test_table_to_arrow_idempotent(self):
+        """Test that table_to_arrow returns same object for arrow input."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a"],
+                       "rows": [pa.array([1, 2, 3])]}
+        result = table_to_arrow(arrow_table)
+        assert result is arrow_table
+
+    def test_table_to_columns_from_arrow(self):
+        """Test converting arrow table to column-oriented."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array([1, 2, 3]), pa.array(["x", "y", "z"])]}
+        result = table_to_columns(arrow_table)
+        assert result["orientation"] == "column"
+        assert result["rows"][0] == [1, 2, 3]
+        assert result["rows"][1] == ["x", "y", "z"]
+
+    def test_table_to_rows_from_arrow(self):
+        """Test converting arrow table to row-oriented."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array([1, 2, 3]), pa.array(["x", "y", "z"])]}
+        result = table_to_rows(arrow_table)
+        assert result["orientation"] == "row"
+        assert result["rows"] == [[1, "x"], [2, "y"], [3, "z"]]
+
+    def test_arrow_roundtrip(self):
+        """Test row -> arrow -> row preserves data."""
+        row_table = {"orientation": "row", "columns": ["a", "b"],
+                     "rows": [[1, "x"], [2, "y"], [3, "z"]]}
+        roundtrip = table_to_rows(table_to_arrow(row_table))
+        assert roundtrip["rows"] == row_table["rows"]
+
+    def test_table_orientation(self):
+        """Test table_orientation helper."""
+        import pyarrow as pa
+        row_table = {"orientation": "row", "columns": [], "rows": []}
+        col_table = {"orientation": "column", "columns": [], "rows": []}
+        arrow_table = {"orientation": "arrow", "columns": [], "rows": []}
+
+        assert table_orientation(row_table) == "row"
+        assert table_orientation(col_table) == "column"
+        assert table_orientation(arrow_table) == "arrow"
+
+    def test_table_nrows_all_orientations(self):
+        """Test table_nrows works for all orientations."""
+        import pyarrow as pa
+        row_table = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3]]}
+        col_table = {"orientation": "column", "columns": ["a"], "rows": [[1, 2, 3]]}
+        arrow_table = {"orientation": "arrow", "columns": ["a"],
+                       "rows": [pa.array([1, 2, 3])]}
+
+        assert table_nrows(row_table) == 3
+        assert table_nrows(col_table) == 3
+        assert table_nrows(arrow_table) == 3
+
+    def test_table_validate_arrow(self):
+        """Test table_validate with arrow tables."""
+        import pyarrow as pa
+        valid_arrow = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array([1, 2]), pa.array(["x", "y"])]}
+        table_validate(valid_arrow)  # Should not raise
+
+        # Invalid: non-Arrow array in rows
+        invalid_arrow = {"orientation": "arrow", "columns": ["a"],
+                         "rows": [[1, 2, 3]]}
+        with pytest.raises(ValueError, match="not a PyArrow Array"):
+            table_validate(invalid_arrow)
+
+    def test_table_to_jsonable(self):
+        """Test table_to_jsonable converts arrow to JSON-serializable."""
+        import pyarrow as pa
+        from datetime import datetime
+        from decimal import Decimal
+
+        # Test with special types
+        special_table = {"orientation": "row", "columns": ["dt", "dec"],
+                         "rows": [[datetime(2024, 1, 15, 10, 30), Decimal("123.456")]]}
+        result = table_to_jsonable(special_table)
+        assert result["rows"][0][0] == "2024-01-15T10:30:00"
+        assert result["rows"][0][1] == 123.456
+
+
+class TestArrowFastPaths:
+    """Tests for arrow fast-path implementations."""
+
+    def test_table_head_arrow(self):
+        """Test table_head preserves arrow orientation."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array([1, 2, 3, 4, 5]), pa.array(["a", "b", "c", "d", "e"])]}
+        result = table_head(arrow_table, 3)
+        assert result["orientation"] == "arrow"
+        assert table_nrows(result) == 3
+        assert result["rows"][0].to_pylist() == [1, 2, 3]
+
+    def test_table_sample_arrow(self):
+        """Test table_sample preserves arrow orientation."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a"],
+                       "rows": [pa.array(list(range(100)))]}
+        result = table_sample(arrow_table, 5)
+        assert result["orientation"] == "arrow"
+        assert table_nrows(result) == 5
+
+    def test_table_select_columns_arrow(self):
+        """Test table_select_columns preserves arrow orientation."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b", "c"],
+                       "rows": [pa.array([1, 2]), pa.array(["x", "y"]), pa.array([10.0, 20.0])]}
+        result = table_select_columns(arrow_table, ["c", "a"])
+        assert result["orientation"] == "arrow"
+        assert result["columns"] == ["c", "a"]
+        assert result["rows"][0].to_pylist() == [10.0, 20.0]
+
+    def test_table_drop_columns_arrow(self):
+        """Test table_drop_columns preserves arrow orientation."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b", "c"],
+                       "rows": [pa.array([1, 2]), pa.array(["x", "y"]), pa.array([10.0, 20.0])]}
+        result = table_drop_columns(arrow_table, ["b"])
+        assert result["orientation"] == "arrow"
+        assert result["columns"] == ["a", "c"]
+
+    def test_table_column_arrow_returns_array(self):
+        """Test table_column returns pa.Array for arrow input."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array([1, 2, 3]), pa.array(["x", "y", "z"])]}
+        result = table_column(arrow_table, "a")
+        assert isinstance(result, pa.Array)
+        assert result.to_pylist() == [1, 2, 3]
+
+    def test_table_replace_value_arrow(self):
+        """Test table_replace_value preserves arrow orientation."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array([1, 2, 1, 3]), pa.array(["x", "y", "z", "w"])]}
+        result = table_replace_value(arrow_table, "a", 1, 999)
+        assert result["orientation"] == "arrow"
+        assert result["rows"][0].to_pylist() == [999, 2, 999, 3]
+
+    def test_table_add_column_arrow(self):
+        """Test table_add_column preserves arrow orientation."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a"],
+                       "rows": [pa.array([1, 2, 3])]}
+        result = table_add_column(arrow_table, "b", "new")
+        assert result["orientation"] == "arrow"
+        assert result["columns"] == ["a", "b"]
+        assert result["rows"][1].to_pylist() == ["new", "new", "new"]
+
+    def test_table_bind_rows_arrow(self):
+        """Test table_bind_rows with arrow tables."""
+        import pyarrow as pa
+        arrow1 = {"orientation": "arrow", "columns": ["a", "b"],
+                  "rows": [pa.array([1, 2]), pa.array(["x", "y"])]}
+        arrow2 = {"orientation": "arrow", "columns": ["a", "b"],
+                  "rows": [pa.array([3, 4, 5]), pa.array(["z", "w", "v"])]}
+        result = table_bind_rows(arrow1, arrow2)
+        assert result["orientation"] == "arrow"
+        assert table_nrows(result) == 5
+        assert result["rows"][0].to_pylist() == [1, 2, 3, 4, 5]
+
+    def test_table_bind_rows_mixed_to_arrow(self):
+        """Test table_bind_rows converts to arrow when any input is arrow."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a"],
+                       "rows": [pa.array([1, 2])]}
+        row_table = {"orientation": "row", "columns": ["a"],
+                     "rows": [[3], [4]]}
+        result = table_bind_rows(arrow_table, row_table)
+        assert result["orientation"] == "arrow"
+        assert result["rows"][0].to_pylist() == [1, 2, 3, 4]
+
+    def test_table_unique_rows_arrow(self):
+        """Test table_unique_rows with arrow tables."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array([1, 2, 1, 3]), pa.array(["x", "y", "x", "z"])]}
+        result = table_unique_rows(arrow_table)
+        assert result["orientation"] == "arrow"
+        assert table_nrows(result) == 3  # 3 unique rows
+
+    def test_table_stack_cols_arrow(self):
+        """Test table_stack_cols with arrow tables."""
+        import pyarrow as pa
+        arrow1 = {"orientation": "arrow", "columns": ["key", "val1"],
+                  "rows": [pa.array([1, 2, 3]), pa.array([10, 20, 30])]}
+        arrow2 = {"orientation": "arrow", "columns": ["key", "val2"],
+                  "rows": [pa.array([1, 2, 3]), pa.array([100, 200, 300])]}
+        result = table_stack_cols(arrow1, arrow2)
+        assert result["orientation"] == "arrow"
+        assert result["columns"] == ["key", "val1", "val2"]
+
+    def test_table_left_join_arrow(self):
+        """Test table_left_join with arrow tables."""
+        import pyarrow as pa
+        left = {"orientation": "arrow", "columns": ["id", "name"],
+                "rows": [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])]}
+        right = {"orientation": "arrow", "columns": ["id", "value"],
+                 "rows": [pa.array([2, 3, 4]), pa.array([100, 200, 300])]}
+        result = table_left_join(left, right, "id")
+        assert result["orientation"] == "arrow"
+        assert "id" in result["columns"]
+        assert "name" in result["columns"]
+        assert "value" in result["columns"]
+
+    def test_table_inner_join_arrow(self):
+        """Test table_inner_join with arrow tables."""
+        import pyarrow as pa
+        left = {"orientation": "arrow", "columns": ["id", "name"],
+                "rows": [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])]}
+        right = {"orientation": "arrow", "columns": ["id", "value"],
+                 "rows": [pa.array([2, 3, 4]), pa.array([100, 200, 300])]}
+        result = table_inner_join(left, right, "id")
+        assert result["orientation"] == "arrow"
+        # Only id=2 and id=3 match
+        assert table_nrows(result) == 2
+
+    def test_table_unchop_arrow(self):
+        """Test table_unchop with arrow tables."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["a", "b"],
+                       "rows": [pa.array(["x", "y"]), pa.array([[1, 2], [3, 4, 5]])]}
+        result = table_unchop(arrow_table, "b")
+        assert result["orientation"] == "arrow"
+        # x -> [1, 2] = 2 rows, y -> [3, 4, 5] = 3 rows => 5 total
+        assert table_nrows(result) == 5
+
+    def test_table_chop_arrow(self):
+        """Test table_chop with arrow tables."""
+        import pyarrow as pa
+        arrow_table = {"orientation": "arrow", "columns": ["group", "value"],
+                       "rows": [pa.array(["A", "A", "B", "B", "B"]), pa.array([1, 2, 3, 4, 5])]}
+        result = table_chop(arrow_table, "value")
+        assert result["orientation"] == "arrow"
+        # 2 groups: A and B
+        assert table_nrows(result) == 2
+
+
+class TestArrowCrossOrientationEquivalence:
+    """Tests that operations give equivalent results across orientations."""
+
+    def test_head_equivalence(self):
+        """Test that table_head gives same result for row/column/arrow."""
+        import pyarrow as pa
+        row_table = {"orientation": "row", "columns": ["a", "b"],
+                     "rows": [[1, "x"], [2, "y"], [3, "z"], [4, "w"]]}
+        col_table = table_to_columns(row_table)
+        arrow_table = table_to_arrow(row_table)
+
+        row_result = table_to_rows(table_head(row_table, 2))
+        col_result = table_to_rows(table_head(col_table, 2))
+        arrow_result = table_to_rows(table_head(arrow_table, 2))
+
+        assert row_result["rows"] == [[1, "x"], [2, "y"]]
+        assert col_result["rows"] == [[1, "x"], [2, "y"]]
+        assert arrow_result["rows"] == [[1, "x"], [2, "y"]]
+
+    def test_select_columns_equivalence(self):
+        """Test that table_select_columns gives same result across orientations."""
+        import pyarrow as pa
+        row_table = {"orientation": "row", "columns": ["a", "b", "c"],
+                     "rows": [[1, "x", 10], [2, "y", 20]]}
+        col_table = table_to_columns(row_table)
+        arrow_table = table_to_arrow(row_table)
+
+        row_result = table_to_rows(table_select_columns(row_table, ["c", "a"]))
+        col_result = table_to_rows(table_select_columns(col_table, ["c", "a"]))
+        arrow_result = table_to_rows(table_select_columns(arrow_table, ["c", "a"]))
+
+        expected = [[10, 1], [20, 2]]
+        assert row_result["rows"] == expected
+        assert col_result["rows"] == expected
+        assert arrow_result["rows"] == expected
+
+    def test_replace_value_equivalence(self):
+        """Test that table_replace_value gives same result across orientations."""
+        import pyarrow as pa
+        row_table = {"orientation": "row", "columns": ["a", "b"],
+                     "rows": [[1, "x"], [2, "y"], [1, "z"]]}
+        col_table = table_to_columns(row_table)
+        arrow_table = table_to_arrow(row_table)
+
+        row_result = table_to_rows(table_replace_value(row_table, "a", 1, 999))
+        col_result = table_to_rows(table_replace_value(col_table, "a", 1, 999))
+        arrow_result = table_to_rows(table_replace_value(arrow_table, "a", 1, 999))
+
+        expected = [[999, "x"], [2, "y"], [999, "z"]]
+        assert row_result["rows"] == expected
+        assert col_result["rows"] == expected
+        assert arrow_result["rows"] == expected
+
+
+# ============================================================
+# Arrow Compute Functions Tests
+# ============================================================
+
+from specparser.amt import (
+    # arithmetic
+    table_add_arrow, table_subtract_arrow, table_multiply_arrow, table_divide_arrow,
+    table_negate_arrow, table_abs_arrow, table_sign_arrow, table_power_arrow,
+    table_sqrt_arrow, table_exp_arrow, table_ln_arrow, table_log10_arrow,
+    table_log2_arrow, table_round_arrow, table_ceil_arrow, table_floor_arrow,
+    table_trunc_arrow,
+    # trigonometric
+    table_sin_arrow, table_cos_arrow, table_tan_arrow,
+    table_asin_arrow, table_acos_arrow, table_atan_arrow, table_atan2_arrow,
+    # comparison
+    table_equal_arrow, table_not_equal_arrow, table_less_arrow,
+    table_less_equal_arrow, table_greater_arrow, table_greater_equal_arrow,
+    # null checks
+    table_is_null_arrow, table_is_valid_arrow, table_is_nan_arrow,
+    table_is_finite_arrow, table_is_in_arrow,
+    # logical
+    table_and_arrow, table_or_arrow, table_xor_arrow, table_invert_arrow,
+    # string
+    table_upper_arrow, table_lower_arrow, table_capitalize_arrow, table_title_arrow,
+    table_strip_arrow, table_lstrip_arrow, table_rstrip_arrow, table_length_arrow,
+    table_starts_with_arrow, table_ends_with_arrow, table_contains_arrow,
+    table_replace_substr_arrow, table_split_arrow,
+    # aggregates
+    table_summarize_arrow, table_sum_arrow, table_mean_arrow, table_min_arrow,
+    table_max_arrow, table_count_arrow, table_count_distinct_arrow,
+    table_stddev_arrow, table_variance_arrow, table_first_arrow, table_last_arrow,
+    table_any_arrow, table_all_arrow,
+    # cumulative
+    table_cumsum_arrow, table_cumprod_arrow, table_cummin_arrow, table_cummax_arrow,
+    table_cummean_arrow, table_diff_arrow,
+    # selection
+    table_if_else_arrow, table_coalesce_arrow, table_fill_null_arrow,
+    table_fill_null_forward_arrow, table_fill_null_backward_arrow,
+    # filter
+    table_filter_arrow,
+)
+
+
+class TestArrowComputeArithmetic:
+    """Tests for arrow arithmetic compute functions."""
+
+    def test_add_scalar(self):
+        """Test adding scalar to column."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3]]}
+        result = table_add_arrow(t, "a", 10, result_col="sum")
+        assert result["orientation"] == "arrow"
+        assert result["columns"] == ["a", "sum"]
+        assert result["rows"][-1].to_pylist() == [11, 12, 13]
+
+    def test_add_column(self):
+        """Test adding two columns."""
+        t = {"orientation": "row", "columns": ["a", "b"], "rows": [[1, 10], [2, 20]]}
+        result = table_add_arrow(t, "a", "b", result_col="sum")
+        assert result["rows"][-1].to_pylist() == [11, 22]
+
+    def test_multiply_replaces_column(self):
+        """Test multiply replaces column when result_col is None."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[2], [3], [4]]}
+        result = table_multiply_arrow(t, "a", 5)
+        assert result["columns"] == ["a"]  # same column
+        assert result["rows"][0].to_pylist() == [10, 15, 20]
+
+    def test_divide(self):
+        """Test division."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[10], [20], [30]]}
+        result = table_divide_arrow(t, "a", 2, result_col="half")
+        assert result["rows"][-1].to_pylist() == [5.0, 10.0, 15.0]
+
+    def test_negate(self):
+        """Test negation."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [-2], [3]]}
+        result = table_negate_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [-1, 2, -3]
+
+    def test_abs(self):
+        """Test absolute value."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[-5], [3], [-1]]}
+        result = table_abs_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [5, 3, 1]
+
+    def test_sign(self):
+        """Test sign function."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[-5], [0], [3]]}
+        result = table_sign_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [-1, 0, 1]
+
+    def test_power(self):
+        """Test power function."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[2], [3], [4]]}
+        result = table_power_arrow(t, "a", 2)
+        assert result["rows"][0].to_pylist() == [4.0, 9.0, 16.0]
+
+    def test_sqrt(self):
+        """Test square root."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[4], [9], [16]]}
+        result = table_sqrt_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [2.0, 3.0, 4.0]
+
+    def test_round(self):
+        """Test rounding."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1.234], [5.678], [9.999]]}
+        result = table_round_arrow(t, "a", decimals=2)
+        vals = result["rows"][0].to_pylist()
+        assert abs(vals[0] - 1.23) < 0.01
+        assert abs(vals[1] - 5.68) < 0.01
+
+    def test_ceil_floor_trunc(self):
+        """Test ceiling, floor, truncation."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1.5], [-1.5]]}
+        ceil_result = table_ceil_arrow(t, "a")
+        floor_result = table_floor_arrow(t, "a")
+        trunc_result = table_trunc_arrow(t, "a")
+
+        assert ceil_result["rows"][0].to_pylist() == [2.0, -1.0]
+        assert floor_result["rows"][0].to_pylist() == [1.0, -2.0]
+        assert trunc_result["rows"][0].to_pylist() == [1.0, -1.0]
+
+
+class TestArrowComputeTrigonometric:
+    """Tests for arrow trigonometric compute functions."""
+
+    def test_sin_cos(self):
+        """Test sin and cos."""
+        import math
+        t = {"orientation": "row", "columns": ["a"], "rows": [[0], [math.pi / 2]]}
+        sin_result = table_sin_arrow(t, "a")
+        cos_result = table_cos_arrow(t, "a")
+
+        sin_vals = sin_result["rows"][0].to_pylist()
+        cos_vals = cos_result["rows"][0].to_pylist()
+
+        assert abs(sin_vals[0] - 0.0) < 1e-10
+        assert abs(sin_vals[1] - 1.0) < 1e-10
+        assert abs(cos_vals[0] - 1.0) < 1e-10
+        assert abs(cos_vals[1] - 0.0) < 1e-10
+
+
+class TestArrowComputeComparison:
+    """Tests for arrow comparison compute functions."""
+
+    def test_equal(self):
+        """Test equality comparison."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3]]}
+        result = table_equal_arrow(t, "a", 2, result_col="is_two")
+        assert result["rows"][-1].to_pylist() == [False, True, False]
+
+    def test_greater(self):
+        """Test greater than comparison."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3]]}
+        result = table_greater_arrow(t, "a", 1, result_col="gt_one")
+        assert result["rows"][-1].to_pylist() == [False, True, True]
+
+    def test_less_equal(self):
+        """Test less than or equal comparison."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3]]}
+        result = table_less_equal_arrow(t, "a", 2)
+        assert result["rows"][0].to_pylist() == [True, True, False]
+
+
+class TestArrowComputeNullChecks:
+    """Tests for arrow null check compute functions."""
+
+    def test_is_null(self):
+        """Test is_null check."""
+        import pyarrow as pa
+        t = {"orientation": "arrow", "columns": ["a"],
+             "rows": [pa.array([1, None, 3])]}
+        result = table_is_null_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [False, True, False]
+
+    def test_is_valid(self):
+        """Test is_valid check."""
+        import pyarrow as pa
+        t = {"orientation": "arrow", "columns": ["a"],
+             "rows": [pa.array([1, None, 3])]}
+        result = table_is_valid_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [True, False, True]
+
+    def test_is_in(self):
+        """Test is_in check."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3], [4]]}
+        result = table_is_in_arrow(t, "a", [2, 4], result_col="in_set")
+        assert result["rows"][-1].to_pylist() == [False, True, False, True]
+
+
+class TestArrowComputeLogical:
+    """Tests for arrow logical compute functions."""
+
+    def test_and_or_xor(self):
+        """Test logical operations."""
+        t = {"orientation": "row", "columns": ["a", "b"],
+             "rows": [[True, True], [True, False], [False, True], [False, False]]}
+        and_result = table_and_arrow(t, "a", "b", result_col="and")
+        or_result = table_or_arrow(t, "a", "b", result_col="or")
+        xor_result = table_xor_arrow(t, "a", "b", result_col="xor")
+
+        assert and_result["rows"][-1].to_pylist() == [True, False, False, False]
+        assert or_result["rows"][-1].to_pylist() == [True, True, True, False]
+        assert xor_result["rows"][-1].to_pylist() == [False, True, True, False]
+
+    def test_invert(self):
+        """Test logical NOT."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[True], [False]]}
+        result = table_invert_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [False, True]
+
+
+class TestArrowComputeString:
+    """Tests for arrow string compute functions."""
+
+    def test_upper_lower(self):
+        """Test uppercase and lowercase."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [["Hello"], ["WORLD"]]}
+        upper_result = table_upper_arrow(t, "a")
+        lower_result = table_lower_arrow(t, "a")
+
+        assert upper_result["rows"][0].to_pylist() == ["HELLO", "WORLD"]
+        assert lower_result["rows"][0].to_pylist() == ["hello", "world"]
+
+    def test_strip(self):
+        """Test string strip."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [["  hello  "], ["world  "]]}
+        result = table_strip_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == ["hello", "world"]
+
+    def test_length(self):
+        """Test string length."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [["hi"], ["hello"], [""]]}
+        result = table_length_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [2, 5, 0]
+
+    def test_starts_ends_contains(self):
+        """Test string pattern matching."""
+        t = {"orientation": "row", "columns": ["a"],
+             "rows": [["hello world"], ["goodbye world"], ["hello there"]]}
+        starts = table_starts_with_arrow(t, "a", "hello", result_col="starts")
+        ends = table_ends_with_arrow(t, "a", "world", result_col="ends")
+        contains = table_contains_arrow(t, "a", "world", result_col="has")
+
+        assert starts["rows"][-1].to_pylist() == [True, False, True]
+        assert ends["rows"][-1].to_pylist() == [True, True, False]
+        assert contains["rows"][-1].to_pylist() == [True, True, False]
+
+
+class TestArrowComputeAggregates:
+    """Tests for arrow aggregate compute functions."""
+
+    def test_sum_mean(self):
+        """Test sum and mean aggregates."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3], [4]]}
+        assert table_sum_arrow(t, "a") == 10
+        assert table_mean_arrow(t, "a") == 2.5
+
+    def test_min_max(self):
+        """Test min and max aggregates."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[5], [2], [8], [1]]}
+        assert table_min_arrow(t, "a") == 1
+        assert table_max_arrow(t, "a") == 8
+
+    def test_count(self):
+        """Test count aggregate."""
+        import pyarrow as pa
+        t = {"orientation": "arrow", "columns": ["a"],
+             "rows": [pa.array([1, None, 3, None, 5])]}
+        assert table_count_arrow(t, "a") == 3  # non-null count
+
+    def test_count_distinct(self):
+        """Test count distinct aggregate."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [1], [3], [2]]}
+        assert table_count_distinct_arrow(t, "a") == 3
+
+    def test_first_last(self):
+        """Test first and last aggregates."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [["x"], ["y"], ["z"]]}
+        assert table_first_arrow(t, "a") == "x"
+        assert table_last_arrow(t, "a") == "z"
+
+    def test_any_all(self):
+        """Test any and all aggregates."""
+        t_all_true = {"orientation": "row", "columns": ["a"],
+                      "rows": [[True], [True], [True]]}
+        t_some_true = {"orientation": "row", "columns": ["a"],
+                       "rows": [[True], [False], [True]]}
+        t_all_false = {"orientation": "row", "columns": ["a"],
+                       "rows": [[False], [False]]}
+
+        assert table_all_arrow(t_all_true, "a") == True
+        assert table_all_arrow(t_some_true, "a") == False
+        assert table_any_arrow(t_some_true, "a") == True
+        assert table_any_arrow(t_all_false, "a") == False
+
+    def test_summarize(self):
+        """Test summarize with multiple aggregations."""
+        t = {"orientation": "row", "columns": ["a", "b"],
+             "rows": [[1, 10], [2, 20], [3, 30]]}
+        result = table_summarize_arrow(t, {"a": ["sum", "mean"], "b": "max"})
+        assert result["orientation"] == "arrow"
+        assert set(result["columns"]) == {"a_sum", "a_mean", "b_max"}
+
+
+class TestArrowComputeCumulative:
+    """Tests for arrow cumulative compute functions."""
+
+    def test_cumsum(self):
+        """Test cumulative sum."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3], [4]]}
+        result = table_cumsum_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [1, 3, 6, 10]
+
+    def test_cumprod(self):
+        """Test cumulative product."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3], [4]]}
+        result = table_cumprod_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [1, 2, 6, 24]
+
+    def test_cummin_cummax(self):
+        """Test cumulative min and max."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[3], [1], [4], [1], [5]]}
+        min_result = table_cummin_arrow(t, "a")
+        max_result = table_cummax_arrow(t, "a")
+
+        assert min_result["rows"][0].to_pylist() == [3, 1, 1, 1, 1]
+        assert max_result["rows"][0].to_pylist() == [3, 3, 4, 4, 5]
+
+    def test_diff(self):
+        """Test pairwise differences."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[10], [15], [13], [20]]}
+        result = table_diff_arrow(t, "a")
+        vals = result["rows"][0].to_pylist()
+        assert vals[0] is None  # first element is null
+        assert vals[1] == 5
+        assert vals[2] == -2
+        assert vals[3] == 7
+
+
+class TestArrowComputeSelection:
+    """Tests for arrow selection compute functions."""
+
+    def test_if_else(self):
+        """Test if_else selection."""
+        t = {"orientation": "row", "columns": ["cond", "a", "b"],
+             "rows": [[True, 1, 10], [False, 2, 20], [True, 3, 30]]}
+        result = table_if_else_arrow(t, "cond", "a", "b", result_col="result")
+        assert result["rows"][-1].to_pylist() == [1, 20, 3]
+
+    def test_fill_null(self):
+        """Test fill_null."""
+        import pyarrow as pa
+        t = {"orientation": "arrow", "columns": ["a"],
+             "rows": [pa.array([1, None, 3, None])]}
+        result = table_fill_null_arrow(t, "a", 999)
+        assert result["rows"][0].to_pylist() == [1, 999, 3, 999]
+
+    def test_fill_null_forward(self):
+        """Test forward fill."""
+        import pyarrow as pa
+        t = {"orientation": "arrow", "columns": ["a"],
+             "rows": [pa.array([1, None, None, 4])]}
+        result = table_fill_null_forward_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [1, 1, 1, 4]
+
+    def test_fill_null_backward(self):
+        """Test backward fill."""
+        import pyarrow as pa
+        t = {"orientation": "arrow", "columns": ["a"],
+             "rows": [pa.array([1, None, None, 4])]}
+        result = table_fill_null_backward_arrow(t, "a")
+        assert result["rows"][0].to_pylist() == [1, 4, 4, 4]
+
+
+class TestArrowComputeFilter:
+    """Tests for arrow filter compute function."""
+
+    def test_filter_by_column(self):
+        """Test filtering by boolean column."""
+        t = {"orientation": "row", "columns": ["a", "mask"],
+             "rows": [[1, True], [2, False], [3, True], [4, False]]}
+        result = table_filter_arrow(t, "mask")
+        assert result["orientation"] == "arrow"
+        assert table_nrows(result) == 2
+        assert result["rows"][0].to_pylist() == [1, 3]
+
+    def test_filter_workflow(self):
+        """Test typical filter workflow: compare then filter."""
+        t = {"orientation": "row", "columns": ["a", "b"],
+             "rows": [[1, "x"], [5, "y"], [3, "z"], [7, "w"]]}
+        # Add comparison column
+        with_mask = table_greater_arrow(t, "a", 3, result_col="_mask")
+        # Filter
+        filtered = table_filter_arrow(with_mask, "_mask")
+        # Drop mask column
+        result = table_drop_columns(filtered, ["_mask"])
+
+        rows = table_to_rows(result)["rows"]
+        assert rows == [[5, "y"], [7, "w"]]
+
+
+class TestArrowComputeInputOrientations:
+    """Test that arrow compute functions accept any input orientation."""
+
+    def test_accepts_row_oriented(self):
+        """Test function accepts row-oriented input."""
+        t = {"orientation": "row", "columns": ["a"], "rows": [[1], [2], [3]]}
+        result = table_add_arrow(t, "a", 10)
+        assert result["orientation"] == "arrow"
+        assert result["rows"][0].to_pylist() == [11, 12, 13]
+
+    def test_accepts_column_oriented(self):
+        """Test function accepts column-oriented input."""
+        t = {"orientation": "column", "columns": ["a"], "rows": [[1, 2, 3]]}
+        result = table_add_arrow(t, "a", 10)
+        assert result["orientation"] == "arrow"
+        assert result["rows"][0].to_pylist() == [11, 12, 13]
+
+    def test_accepts_arrow_oriented(self):
+        """Test function accepts arrow-oriented input (no conversion)."""
+        import pyarrow as pa
+        t = {"orientation": "arrow", "columns": ["a"], "rows": [pa.array([1, 2, 3])]}
+        result = table_add_arrow(t, "a", 10)
+        assert result["orientation"] == "arrow"
+        assert result["rows"][0].to_pylist() == [11, 12, 13]

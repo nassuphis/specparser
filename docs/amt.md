@@ -516,41 +516,83 @@ table = get_expand_ym("data/amt.yml", "LA Comdty", 2024, 6)
 # Columns: ['asset', 'straddle']
 ```
 
-#### `year_month_days(start_year, start_month, end_year, end_month)`
+#### `count_straddle_days(straddle)`
 
-Generate all calendar days from the 1st of the start month through the last day of the end month.
+Count the number of calendar days in a straddle period.
 
 ```python
-from specparser.amt import year_month_days
+from specparser.amt import count_straddle_days
 
-# Get all days in January 2024
-days = year_month_days(2024, 1, 2024, 1)
-# Returns: [date(2024, 1, 1), date(2024, 1, 2), ..., date(2024, 1, 31)]
-
-# Get all days across multiple months
-days = year_month_days(2024, 1, 2024, 3)
-# Returns 91 days: Jan 1 through Mar 31
-
-# Get all days in a full year
-days = year_month_days(2024, 1, 2024, 12)
-# Returns 366 days (2024 is a leap year)
-
-# Span across year boundary
-days = year_month_days(2023, 12, 2024, 1)
-# Returns 62 days: Dec 1, 2023 through Jan 31, 2024
+# Count days in a straddle spanning Jan-Mar 2024
+n = count_straddle_days("|2024-01|2024-03|1|1|1|1|1|")
+# Returns: 91 (Jan 1 through Mar 31)
 ```
 
 **Parameters:**
+- `straddle`: Straddle string in format `|ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|`
+
+**Returns:** Integer count of days from entry month start to expiry month end (inclusive)
+
+#### `straddle_days(straddle)`
+
+Get all calendar days in a straddle period.
+
+```python
+from specparser.amt import straddle_days
+
+# Get all days in a straddle
+days = straddle_days("|2024-01|2024-03|1|1|1|1|1|")
+# Returns: [date(2024, 1, 1), date(2024, 1, 2), ..., date(2024, 3, 31)]
+```
+
+**Parameters:**
+- `straddle`: Straddle string in format `|ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|`
+
+**Returns:** List of `datetime.date` objects for all days from entry month start to expiry month end
+
+**Note:** Results are cached for performance when memoization is enabled.
+
+#### `count_straddles_days(straddles)`
+
+Count the total number of days across all straddles in a table.
+
+```python
+from specparser.amt import find_straddle_yrs, count_straddles_days
+
+straddles = find_straddle_yrs("data/amt.yml", 2024, 2024, "LA Comdty")
+total_days = count_straddles_days(straddles)
+# Returns: total count of days across all straddles
+```
+
+**Parameters:**
+- `straddles`: Table dict with `columns` containing "straddle" and `rows`
+
+**Returns:** Integer total count of days across all straddles
+
+#### `find_straddle_days(path, start_year, end_year, pattern=".", live_only=True)`
+
+Expand straddles to daily rows for all matching assets.
+
+```python
+from specparser.amt import find_straddle_days
+
+table = find_straddle_days("data/amt.yml", 2024, 2024, "LA Comdty")
+# Returns column-oriented table:
+# {
+#     "orientation": "column",
+#     "columns": ["asset", "straddle", "date"],
+#     "rows": [asset_col, straddle_col, date_col]
+# }
+```
+
+**Parameters:**
+- `path`: Path to AMT YAML file
 - `start_year`: Starting year
-- `start_month`: Starting month (1-12)
 - `end_year`: Ending year
-- `end_month`: Ending month (1-12)
+- `pattern`: Regex pattern to match Underlying values (default: "." matches all)
+- `live_only`: If True, only include assets with `Live: true`
 
-**Returns:** List of `datetime.date` objects for all days in the range (inclusive)
-
-**Raises:**
-- `ValueError`: If month values are not in 1-12
-- `ValueError`: If start date is after end date
+**Returns:** Column-oriented table dict with columns: asset, straddle, date
 
 ---
 

@@ -13,12 +13,19 @@ from pathlib import Path
 from typing import Any, List
 import calendar
 import datetime 
+import itertools
 from . import loader 
 
 
-# memoization 
+# memoization
 
-_MEMOIZE_ENABLED: bool = False
+_MEMOIZE_ENABLED: bool = True
+
+# Forward declare caches (initialized later, referenced by clear_schedule_caches)
+_SCHEDULE_CACHE: dict = {}
+_EXPAND_YM_CACHE: dict = {}
+_DAYS_YM_CACHE: dict = {}
+_STRADDLE_DAYS_CACHE: dict = {}
 
 def set_memoize_enabled(enabled: bool) -> None:
     """Enable or disable memoization for schedule functions."""
@@ -30,6 +37,7 @@ def clear_schedule_caches() -> None:
     _SCHEDULE_CACHE.clear()
     _EXPAND_YM_CACHE.clear()
     _DAYS_YM_CACHE.clear()
+    _STRADDLE_DAYS_CACHE.clear()
 
 
 
@@ -129,14 +137,13 @@ def _schedule_to_rows(underlying: str, schedule: list[str] | None) -> list[list[
 def get_schedule_nocache(path: str | Path, underlying: str) -> dict[str, Any]:
     data = loader.load_amt(path)
     asset_data = loader.get_asset(path, underlying)
-    if not asset_data: return { "columns": _SCHEDULE_COLUMNS, "rows": [], }
+    if not asset_data: return { "orientation": "row", "columns": _SCHEDULE_COLUMNS, "rows": [], }
     schedule_name = asset_data.get("Options")
     scheds = data.get("expiry_schedules", {})
     schedule = scheds.get(schedule_name) if schedule_name else None
     rows = _schedule_to_rows(underlying, schedule)
-    return {"columns": _SCHEDULE_COLUMNS, "rows": rows,}
+    return {"orientation": "row", "columns": _SCHEDULE_COLUMNS, "rows": rows,}
 
-_SCHEDULE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 _SCHEDULE_COLUMNS = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
 def get_schedule(path: str | Path, underlying: str) -> dict[str, Any]:
     """Get the expiry schedule for an asset by its Underlying value."""
@@ -160,7 +167,7 @@ def find_schedules(path: str | Path, pattern: str,live_only: bool = True) -> dic
     for asset in assets:
         shedule=get_schedule(path,asset)["rows"]
         rows.extend(shedule)
-    return { "columns": _SCHEDULE_COLUMNS, "rows": rows, }
+    return { "orientation": "row", "columns": _SCHEDULE_COLUMNS, "rows": rows, }
 
 # -------------------------------------
 # Straddle string parsing
@@ -279,11 +286,11 @@ def _schedules2straddles(table: dict[str, Any], xpry: int, xprm: int) -> list[li
         )
         rows.append([asset, straddle])
 
-    return {"columns": ["asset", "straddle"], "rows": rows}
+    return {"orientation": "row", "columns": ["asset", "straddle"], "rows": rows}
 
 def _schedules2straddle_yrs(
-    table: dict[str, Any], 
-    start_year: int, 
+    table: dict[str, Any],
+    start_year: int,
     end_year: int
 ) -> dict[str, Any]:
     """Expand a schedules table across a year/month range and pack into straddle strings."""
@@ -292,7 +299,7 @@ def _schedules2straddle_yrs(
         for xprm in range(1, 13):
             packed_table = _schedules2straddles(table, xpry, xprm)
             rows.extend(packed_table["rows"])
-    return {"columns": ["asset", "straddle"], "rows": rows}
+    return {"orientation": "row", "columns": ["asset", "straddle"], "rows": rows}
 
 
 def get_straddle_yrs(path: str | Path, underlying: str, start_year: int, end_year: int) -> dict[str, Any]:
@@ -320,7 +327,6 @@ def find_straddle_yrs(path: str | Path, start_year: int, end_year: int, pattern:
 # Expand YM cache
 # -------------------------------------
 
-_EXPAND_YM_CACHE: dict[tuple[str, str, int, int], dict[str, Any]] = {}
 def get_expand_ym(path: str | Path, underlying: str, year: int, month: int) -> dict[str, Any]:
     """Expand a single asset's schedule for a specific year/month into straddle strings."""
     path_str = str(Path(path).resolve())
@@ -338,9 +344,6 @@ def get_expand_ym(path: str | Path, underlying: str, year: int, month: int) -> d
 # -------------------------------------
 # Days-in-month cache
 # -------------------------------------
-
-_DAYS_YM_CACHE: dict[str, list] = {}
-
 
 def get_days_ym(year: int, month: int) -> list:
     """Return cached list of all days in a given year/month.
@@ -373,35 +376,52 @@ def clear_days_cache() -> None:
 # year month -> year month days
 # -------------------------------------
 
+def count_straddle_days(straddle: str) -> int:
+    ny = int(straddle[1:5])
+    nm = int(straddle[6:8])
+    xy = int(straddle[9:13])
+    xm = int(straddle[14:16])
+    start = datetime.date(ny, nm, 1)
+    end = datetime.date(xy, xm, calendar.monthrange(xy, xm)[1])
+    n = (end - start).days + 1
+    return(n)
 
-def straddle_days(straddle) -> List[str]:
-    """
-    Return all calendar days from the 1st of (start_year,start_month)
-    through the last day of (end_year,end_month), inclusive.
-    """
-    start_year=int(straddle[1:5])
-    start_month=int(straddle[6:8])
-    end_year=int(straddle[9:13])
-    end_month=int(straddle[14:16])
-    if not (1 <= start_month <= 12 and 1 <= end_month <= 12):
-        raise ValueError("month must be in 1..12")
-    key = f"{start_year}-{start_month:02d}:{end_year}-{end_month:02d}"
-    if _MEMOIZE_ENABLED and key in _DAYS_YM_CACHE:
-        return _DAYS_YM_CACHE[key]
 
-    start = datetime.date(start_year, start_month, 1)
-    last_day = calendar.monthrange(end_year, end_month)[1]
-    end = datetime.date(end_year, end_month, last_day)
-    if start > end: raise ValueError("start must be <= end")
-
-    n_days = (end - start).days + 1
-    days = [start.fromordinal(start.toordinal() + i) for i in range(n_days)]
+def straddle_days(straddle: str) -> list[datetime.date]:
+    key=straddle[1:16]
     if _MEMOIZE_ENABLED:
-        _DAYS_YM_CACHE[key] = days
+        hit = _STRADDLE_DAYS_CACHE.get(key)
+        if hit is not None:
+            return hit
 
+    sy = int(straddle[1:5])
+    sm = int(straddle[6:8])
+    ey = int(straddle[9:13])
+    em = int(straddle[14:16])
+
+    start = datetime.date(sy, sm, 1)
+    end = datetime.date(ey, em, calendar.monthrange(ey, em)[1])
+
+    n = (end - start).days + 1
+    base = start.toordinal()
+    days = [datetime.date.fromordinal(base + i) for i in range(n)]
+
+    if _MEMOIZE_ENABLED:
+        _STRADDLE_DAYS_CACHE[key] = days
     return days
 
-
+def count_straddles_days(
+    straddles: dict
+):
+    cols = straddles["columns"]
+    straddle_idx = cols.index("straddle")
+    days=0
+    for row in straddles["rows"]:
+        days=days+count_straddle_days(row[straddle_idx])
+    return days
+    
+# cols = list(map(list, zip(*rows)))
+# rows = list(map(list,zip(*cols)))    
 def find_straddle_days(
     path: str | Path, 
     start_year: int, 
@@ -409,20 +429,30 @@ def find_straddle_days(
     pattern: str = ".", 
     live_only: bool = True
 ) -> dict[str, Any]:
-    straddles = find_straddle_yrs(path,start_year,end_year,pattern,live_only)
+    straddles = find_straddle_yrs(path, start_year, end_year, pattern, live_only)
     cols = straddles["columns"]
     asset_idx = cols.index("asset")
     straddle_idx = cols.index("straddle")
-    straddle_days_rows = []
+    asset_col = []
+    straddle_col = []
+    date_col = []
+
+
     for row in straddles["rows"]:
         asset = row[asset_idx]
         straddle = row[straddle_idx]
         days = straddle_days(straddle)
-        new_rows = [[asset,straddle,day] for day in days]
-        straddle_days_rows.extend(new_rows)
-    return {"columns":["asset","straddle","date"],"rows":straddle_days_rows}
+        n = len(days)
+        asset_col.extend(itertools.repeat(asset,n))
+        straddle_col.extend(itertools.repeat(straddle,n))
+        date_col.extend(days)
 
 
+    return {
+        "orientation": "column",
+        "columns": ["asset", "straddle", "date"], 
+        "rows": [asset_col,straddle_col,date_col]
+    }
 
 # -------------------------------------
 # CLI

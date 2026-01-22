@@ -211,7 +211,7 @@ def get_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
 
     asset_data = loader.get_asset(path, underlying)
     if not asset_data:
-        result = {"columns": ["asset", "cls", "type", "param", "source", "ticker", "field"], "rows": []}
+        result = {"orientation": "row", "columns": ["asset", "cls", "type", "param", "source", "ticker", "field"], "rows": []}
         if _MEMOIZE_ENABLED:
             _TSCHEMAS_CACHE[cache_key] = result
         return result
@@ -241,6 +241,7 @@ def get_tschemas(path: str | Path, underlying: str) -> dict[str, Any]:
             rows.extend(_hedge_default(hedge, asset_underlying, asset_class, source))
 
     result = {
+        "orientation": "row",
         "columns": ["asset", "cls", "type", "param", "source", "ticker", "field"],
         "rows": rows,
     }
@@ -257,7 +258,7 @@ def find_tschemas(path: str | Path, pattern: str, live_only: bool = False) -> di
     for underlying in loader.table_column(assets_table, "asset"):
         table = get_tschemas(path, underlying)
         rows.extend(table["rows"])
-    return {"columns": columns, "rows": rows}
+    return {"orientation": "row", "columns": columns, "rows": rows}
 
 # -------------------------------------
 # Compute Tickers from Ticker schemas
@@ -465,7 +466,7 @@ def get_tickers_ym(
         else:
             ticker_dicts.append(tschema_dict)
     ticker_rows = [[row[col] for col in tschemas_table["columns"]] for row in ticker_dicts]
-    result = { "columns": tschemas_table["columns"], "rows": ticker_rows }
+    result = { "orientation": "row", "columns": tschemas_table["columns"], "rows": ticker_rows }
     if _MEMOIZE_ENABLED:
         _TICKERS_YM_CACHE[cache_key] = result
     return result
@@ -611,7 +612,7 @@ def asset_straddle_tickers(
     # Filter rows based on straddle rules
     filtered_rows = _filter_straddle_tickers(ticker_table["rows"], ticker_table["columns"], ntrc)
     # Build filtered table, then transform using table utilities
-    filtered_table = {"columns": ticker_table["columns"], "rows": filtered_rows}
+    filtered_table = {"orientation": "row", "columns": ticker_table["columns"], "rows": filtered_rows}
     # Drop cls and type columns
     filtered_table = loader.table_drop_columns(filtered_table, ["cls", "type"])
     # Add straddle column after asset
@@ -743,7 +744,7 @@ def prices_last(prices_parquet: str | Path, pattern: str) -> dict[str, Any]:
     con.close()
 
     rows = [[str(ticker), str(field), str(last_date)] for ticker, field, last_date in result]
-    return {"columns": ["ticker", "field", "last_date"], "rows": rows}
+    return {"orientation": "row", "columns": ["ticker", "field", "last_date"], "rows": rows}
 
 
 def prices_query(prices_parquet: str | Path, sql: str) -> dict[str, Any]:
@@ -766,7 +767,7 @@ def prices_query(prices_parquet: str | Path, sql: str) -> dict[str, Any]:
     rows = [[str(v) for v in row] for row in result.fetchall()]
     con.close()
 
-    return {"columns": columns, "rows": rows}
+    return {"orientation": "row", "columns": columns, "rows": rows}
 
 
 def _add_calendar_days(date_str: str, days: int) -> str:
@@ -1286,7 +1287,7 @@ def get_straddle_days(
     table = asset_straddle_tickers(underlying, year, month, i, path, chain_csv)
 
     if not table["rows"]:
-        return {"columns": ["asset", "straddle", "date"], "rows": []}
+        return {"orientation": "row", "columns": ["asset", "straddle", "date"], "rows": []}
 
     # All rows have same asset and straddle
     asset = table["rows"][0][0]
@@ -1476,7 +1477,7 @@ def get_straddle_days(
         row.append(expiry_value if in_range else "-")
     out_columns.append("expiry")
 
-    return {"columns": out_columns, "rows": out_rows}
+    return {"orientation": "row", "columns": out_columns, "rows": out_rows}
 
 
 def _get_rollforward_fields(columns: list[str]) -> set[str]:
@@ -1659,7 +1660,7 @@ def get_straddle_valuation(
     columns.append("opnl")
     columns.append("hpnl")
     columns.append("pnl")
-    return {"columns": columns, "rows": rows}
+    return {"orientation": "row", "columns": columns, "rows": rows}
 
 
 # -------------------------------------

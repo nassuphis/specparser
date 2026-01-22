@@ -132,12 +132,12 @@ def get_asset(path: str | Path, underlying: str) -> dict[str, Any] | None:
 def find_assets(path: str | Path, pattern: str, live_only: bool = False) -> dict[str, Any]:
     """Find all Underlying values matching a regex pattern."""
     rows = [[underlying] for _, underlying in _iter_assets(path, live_only=live_only, pattern=pattern)]
-    return {"columns": ["asset"], "rows": rows}
+    return {"orientation": "row", "columns": ["asset"], "rows": rows}
 
 def assets(path: str | Path, live_only: bool = False, pattern: str = ".") -> dict[str, Any]:
     """Get assets with their Underlying values."""
     rows = [[underlying] for _, underlying in _iter_assets(path, live_only=live_only, pattern=pattern)]
-    return {"columns": ["asset"], "rows": rows}
+    return {"orientation": "row", "columns": ["asset"], "rows": rows}
 
 def cached_assets(path: str | Path) -> dict[str, Any]:
     """List all asset Underlying values from the cache."""
@@ -146,7 +146,7 @@ def cached_assets(path: str | Path) -> dict[str, Any]:
     if path_str not in _ASSET_BY_UNDERLYING: load_amt(path)
     assets = _ASSET_BY_UNDERLYING.get(path_str, {})
     rows = [[u] for u in assets.keys()]
-    return { "columns": ["asset"], "rows": rows }
+    return {"orientation": "row", "columns": ["asset"], "rows": rows}
 
 def asset_class(path: str | Path, live_only: bool = False, pattern: str = ".") -> dict[str, Any]:
     """Get all live assets (WeightCap > 0) with their class and source information."""
@@ -196,7 +196,7 @@ def get_table(path: str | Path, key_path: str) -> dict[str, Any]:
     if not isinstance(rows, list):
         raise ValueError(f"'Rows' at '{key_path}' is not a list")
 
-    return { "columns": columns, "types": types, "rows": rows, }
+    return {"orientation": "row", "columns": columns, "types": types, "rows": rows}
 
 
 # Re-export table utilities from table.py for backward compatibility
@@ -208,7 +208,7 @@ from .table import (
     table_replace_value,
     table_bind_rows,
     table_unique_rows,
-    table_join,
+    table_stack_cols,
     format_table,
     print_table,
 )
@@ -326,11 +326,11 @@ def asset_table(
 #
 def asset_group(path: str | Path, live_only: bool = False, pattern: str = ".") -> dict[str, Any]:
     """live with group, subgroup, liquidity, and limit override."""
-    return table_join(
-        asset_table(path, "group_table", default="error",live_only=live_only,pattern=pattern),
-        asset_table(path, "subgroup_table", default="",live_only=live_only,pattern=pattern),
-        asset_table(path, "liquidity_table", default="1",live_only=live_only,pattern=pattern),
-        asset_table(path, "limit_overrides", default="",live_only=live_only,pattern=pattern),
+    return table_stack_cols(
+        asset_table(path, "group_table", default="error", live_only=live_only, pattern=pattern),
+        asset_table(path, "subgroup_table", default="", live_only=live_only, pattern=pattern),
+        asset_table(path, "liquidity_table", default="1", live_only=live_only, pattern=pattern),
+        asset_table(path, "limit_overrides", default="", live_only=live_only, pattern=pattern),
     )
 
 
@@ -408,7 +408,7 @@ def _main() -> int:
         try:
             table_names = [t.strip() for t in args.merge.split(",")]
             tables = [asset_table(args.path, name, live_only=True) for name in table_names]
-            print_table(table_join(*tables))
+            print_table(table_stack_cols(*tables))
         except ValueError as e:
             print(f"Error: {e}")
             return 1
@@ -540,13 +540,13 @@ group_table:
         # TEST1 Comdty -> commodities, TEST3 Rate -> other
         print("  asset_table: OK")
 
-        # Test table_join
+        # Test table_stack_cols
         t1 = {"columns": ["key", "a"], "rows": [["k1", 1], ["k2", 2]]}
         t2 = {"columns": ["key", "b"], "rows": [["k1", 10], ["k2", 20]]}
-        merged = table_join(t1, t2)
-        assert merged["columns"] == ["key", "a", "b"], f"table_join: wrong columns {merged['columns']}"
-        assert merged["rows"] == [["k1", 1, 10], ["k2", 2, 20]], f"table_join: wrong rows {merged['rows']}"
-        print("  table_join: OK")
+        merged = table_stack_cols(t1, t2)
+        assert merged["columns"] == ["key", "a", "b"], f"table_stack_cols: wrong columns {merged['columns']}"
+        assert merged["orientation"] == "column", f"table_stack_cols: wrong orientation {merged['orientation']}"
+        print("  table_stack_cols: OK")
 
         print("All loader self-tests passed!")
         return 0

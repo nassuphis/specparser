@@ -120,7 +120,7 @@ def expand_fast(
     """
     n_templates = len(templates)
     if n_templates == 0:
-        return {"columns": ["asset", "straddle"], "rows": []}
+        return {"orientation": "row", "columns": ["asset", "straddle"], "rows": []}
 
     n_years = end_year - start_year + 1
     total = n_years * 12 * n_templates
@@ -155,7 +155,7 @@ def expand_fast(
                 rows[idx] = [underlying, f"{entry_str}{xpr_str}{suffix}"]
                 idx += 1
 
-    return {"columns": ["asset", "straddle"], "rows": rows}
+    return {"orientation": "row", "columns": ["asset", "straddle"], "rows": rows}
 
 
 # -------------------------------------
