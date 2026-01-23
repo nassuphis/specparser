@@ -191,7 +191,7 @@ Even though caches aren't shared between workers, they still provide significant
 
 2. **Locality**: Tasks are distributed such that the same asset/month combinations tend to cluster. A worker processing "LA Comdty 2024-03" straddles will cache that data and reuse it.
 
-3. **Hierarchical caching**: Lower-level caches (tschemas, schedules) benefit higher-level functions. `get_straddle_days` calls `asset_straddle_tickers` which calls `get_tickers_ym` which calls `get_tschemas`. Each level benefits from caching.
+3. **Hierarchical caching**: Lower-level caches (tschemas, schedules) benefit higher-level functions. `get_straddle_days` calls `filter_tickers` which calls `get_tickers_ym` which calls `get_tschemas`. Each level benefits from caching.
 
 ## Cache Key Design
 

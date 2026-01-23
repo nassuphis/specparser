@@ -306,7 +306,7 @@ from specparser.amt import (
 
     # Ticker extraction
     get_tschemas, find_tschemas, get_tickers_ym, find_tickers, find_tickers_ym,
-    fut_spec2ticker, fut_norm2act, fut_act2norm, asset_straddle_tickers,
+    fut_spec2ticker, fut_norm2act, fut_act2norm, filter_tickers,
 
     # Price functions
     load_all_prices, set_prices_dict, get_price, clear_prices_dict,

@@ -95,7 +95,7 @@ Assets with `Source: "BBG"` fell through to `_hedge_default()`, which creates a 
 
 ### Placeholder Straddles for Missing Schedules
 
-**Assumption:** Assets without an `Options` field would cause `asset_straddle_tickers()` to raise `ValueError`.
+**Assumption:** Assets without an `Options` field would cause `filter_tickers()` to raise `ValueError`.
 
 **Reality:** The code returns a "placeholder" straddle with empty values:
 ```python
@@ -157,16 +157,16 @@ The `_schedule_to_rows()` function creates a placeholder row when schedule is em
 
 ### Column Removal from Output
 
-**Scenario:** Removed `cls` and `type` columns from `asset_straddle_tickers()` output.
+**Scenario:** Removed `cls` and `type` columns from `filter_tickers()` output.
 
 **What changed:**
 - Old output columns: `['asset', 'cls', 'type', 'param', 'source', 'ticker', 'field', 'straddle']`
 - New output columns: `['asset', 'param', 'source', 'ticker', 'field', 'straddle']`
 
 **Tests that needed updating:**
-1. `test_asset_straddle_tickers_basic` - Checks output column structure
-2. `test_asset_straddle_tickers_filters_near` - Used hardcoded index for `type` column
-3. `test_asset_straddle_tickers_filters_far` - Used hardcoded index for `type` column
+1. `test_filter_tickers_basic` - Checks output column structure
+2. `test_filter_tickers_filters_near` - Used hardcoded index for `type` column
+3. `test_filter_tickers_filters_far` - Used hardcoded index for `type` column
 
 **Tests that did NOT need updating:**
 - `TestStraddleTickerFiltering` unit tests - These test `_filter_straddle_tickers()` which still operates on the original 7-column input format internally
@@ -175,7 +175,7 @@ The `_schedule_to_rows()` function creates a placeholder row when schedule is em
 1. **Unit tests for internal logic** can remain unchanged (they test the internal API)
 2. **Integration tests for output format** need updating (they test the external API)
 
-The `_filter_straddle_tickers()` function receives rows with all 7 columns and filters them. The column removal happens *after* filtering in `asset_straddle_tickers()`. This separation meant:
+The `_filter_straddle_tickers()` function receives rows with all 7 columns and filters them. The column removal happens *after* filtering in `filter_tickers()`. This separation meant:
 - 8 unit tests for filtering rules: **unchanged**
 - 2 integration tests checking final output: **updated**
 

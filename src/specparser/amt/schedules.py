@@ -15,7 +15,10 @@ import calendar
 import datetime 
 import itertools
 from . import loader 
-
+from . import _numba_kernels
+import numpy as np
+from .table import table_to_arrow, table_nrows, _import_pyarrow
+pa, pc = _import_pyarrow()
 
 # memoization
 
@@ -803,21 +806,7 @@ def find_straddle_days_numba(
     Raises:
         ImportError: If Numba is not installed
     """
-    try:
-        from ._numba_kernels import (
-            expand_months_to_date32,
-            expand_months_to_date32_parallel,
-        )
-    except ImportError as e:
-        raise ImportError(
-            "Numba is required for find_straddle_days_numba. "
-            "Install with: pip install numba"
-        ) from e
-
-    import numpy as np
-    from .table import table_to_arrow, table_nrows, _import_pyarrow
-
-    pa, pc = _import_pyarrow()
+    
 
     # Step 1: Get straddles table and convert to arrow
     straddles = find_straddle_yrs(path, start_year, end_year, pattern, live_only)
@@ -868,11 +857,13 @@ def find_straddle_days_numba(
 
     # Step 3: Run Numba kernel
     if parallel:
-        date32, parent_idx = expand_months_to_date32_parallel(
+        date32, parent_idx = _numba_kernels.expand_months_to_date32_parallel(
             year_np, month_np, month_count_np
         )
     else:
-        date32, parent_idx = expand_months_to_date32(year_np, month_np, month_count_np)
+        date32, parent_idx = _numba_kernels.expand_months_to_date32(
+            year_np, month_np, month_count_np
+        )
 
     # Step 4: Build output table by gathering from source arrays using parent_idx
     asset_idx = straddles_arrow["columns"].index("asset")

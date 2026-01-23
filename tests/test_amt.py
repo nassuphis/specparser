@@ -84,7 +84,7 @@ from specparser.amt import (
     _tschma_dict_expand_split,
     find_tickers,
     find_tickers_ym,
-    asset_straddle_tickers,
+    filter_tickers,
 )
 from specparser.amt.tickers import (
     _parse_date_constraint,
@@ -1353,7 +1353,7 @@ class TestTickers:
 # -------------------------------------
 
 class TestTickerExpansion:
-    """Tests for find_tickers, find_tickers_ym, and asset_straddle_tickers."""
+    """Tests for find_tickers, find_tickers_ym, and filter_tickers."""
 
     def test_find_tickers_ym_basic(self, test_amt_file, chain_csv_file):
         """Test find_tickers_ym for specific month."""
@@ -1430,11 +1430,11 @@ class TestTickerExpansion:
         assert len(hedge_rows) == 1
         assert hedge_rows[0][5] == "NEW1 Comdty"
 
-    def test_asset_straddle_tickers_basic(self, test_amt_file, chain_csv_file):
-        """Test asset_straddle_tickers returns correct format."""
+    def test_filter_tickers_basic(self, test_amt_file, chain_csv_file):
+        """Test filter_tickers returns correct format."""
         clear_cache()
         clear_normalized_cache()
-        table = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         # Output columns (cls and type removed, straddle after asset)
         assert table["columns"] == ["asset", "straddle", "param", "source", "ticker", "field"]
         assert len(table["rows"]) > 0
@@ -1443,28 +1443,28 @@ class TestTickerExpansion:
             assert row[1].startswith("|")
             assert row[1].endswith("|")
 
-    def test_asset_straddle_tickers_modulo(self, test_amt_file, chain_csv_file):
-        """Test asset_straddle_tickers index wrapping."""
+    def test_filter_tickers_modulo(self, test_amt_file, chain_csv_file):
+        """Test filter_tickers index wrapping."""
         clear_cache()
         clear_normalized_cache()
         # CL Comdty has 2 schedule components (monthly_std)
         # Index 0 and 2 should give same result
-        table0 = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
-        table2 = asset_straddle_tickers("CL Comdty", 2024, 6, 2, test_amt_file, chain_csv_file)
+        table0 = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        table2 = filter_tickers("CL Comdty", 2024, 6, 2, test_amt_file, chain_csv_file)
         # Should be same straddle (0 % 2 == 2 % 2), straddle is at index 1
         assert table0["rows"][0][1] == table2["rows"][0][1]
 
-    def test_asset_straddle_tickers_different_index(self, test_amt_file, chain_csv_file):
-        """Test asset_straddle_tickers with different index gives different straddle."""
+    def test_filter_tickers_different_index(self, test_amt_file, chain_csv_file):
+        """Test filter_tickers with different index gives different straddle."""
         clear_cache()
         clear_normalized_cache()
-        table0 = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
-        table1 = asset_straddle_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
+        table0 = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        table1 = filter_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
         # Should be different straddles, straddle is at index 1
         assert table0["rows"][0][1] != table1["rows"][0][1]
 
-    def test_asset_straddle_tickers_no_schedule(self):
-        """Test asset_straddle_tickers behavior for asset without Options field."""
+    def test_filter_tickers_no_schedule(self):
+        """Test filter_tickers behavior for asset without Options field."""
         # Create temp file with asset that has no Options field
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
             f.write("""
@@ -1484,7 +1484,7 @@ amt:
             clear_cache()
             clear_normalized_cache()
             # Asset has no Options field - returns placeholder straddle with empty values
-            table = asset_straddle_tickers("NO_SCHED Test", 2024, 6, 0, path, None)
+            table = filter_tickers("NO_SCHED Test", 2024, 6, 0, path, None)
             assert len(table["rows"]) > 0
             # Straddle has empty ntrc, ntrv, xprc, xprv, wgt (straddle is at index 1)
             straddle = table["rows"][0][1]
@@ -1495,11 +1495,11 @@ amt:
             os.unlink(path)
             clear_cache()
 
-    def test_asset_straddle_tickers_straddle_format(self, test_amt_file, chain_csv_file):
+    def test_filter_tickers_straddle_format(self, test_amt_file, chain_csv_file):
         """Test that straddle string in result is valid."""
         clear_cache()
         clear_normalized_cache()
-        table = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         straddle = table["rows"][0][1]  # straddle is at index 1
         # Verify straddle format by parsing it (use s[1:-1] to preserve empty parts)
         parts = straddle[1:-1].split("|")
@@ -1659,12 +1659,12 @@ class TestStraddleTickerFiltering:
         assert ("Vol", "vol") in types_params  # param changed to "vol"
         assert ("Hedge", "hedge") in types_params
 
-    def test_asset_straddle_tickers_filters_near(self, test_amt_file, chain_csv_file):
-        """Test asset_straddle_tickers filters to Near vol for N straddle."""
+    def test_filter_tickers_filters_near(self, test_amt_file, chain_csv_file):
+        """Test filter_tickers filters to Near vol for N straddle."""
         clear_cache()
         clear_normalized_cache()
         # Index 0 should be an N straddle (first schedule entry is N1_OVERRIDE15)
-        table = asset_straddle_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         # Check straddle has ntrc=N (straddle is at index 1)
         straddle = table["rows"][0][1]
         parts = straddle[1:-1].split("|")
@@ -1674,12 +1674,12 @@ class TestStraddleTickerFiltering:
         vol_rows = [r for r in table["rows"] if r[2] == "vol"]
         assert len(vol_rows) == 1
 
-    def test_asset_straddle_tickers_filters_far(self, test_amt_file, chain_csv_file):
-        """Test asset_straddle_tickers filters to Far vol for F straddle."""
+    def test_filter_tickers_filters_far(self, test_amt_file, chain_csv_file):
+        """Test filter_tickers filters to Far vol for F straddle."""
         clear_cache()
         clear_normalized_cache()
         # Index 1 should be an F straddle (second schedule entry is Fa_OVERRIDEb_0.5)
-        table = asset_straddle_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
+        table = filter_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
         # Check straddle has ntrc=F (straddle is at index 1)
         straddle = table["rows"][0][1]
         parts = straddle[1:-1].split("|")
@@ -3388,6 +3388,51 @@ class TestOverrideExpiry:
             ntry=2024, ntrm=1, underlying="TEST", overrides_path=csv_file
         )
         assert actions == ["-", "-"]
+
+    def test_clear_override_cache(self, tmp_path):
+        """Test clear_override_cache resets the cache."""
+        from specparser.amt import clear_override_cache
+
+        csv_file = tmp_path / "overrides.csv"
+        csv_file.write_text("ticker,expiry\nTEST,2024-03-15\n")
+
+        # Load cache
+        cache1 = _load_overrides(csv_file)
+        assert ("TEST", "2024-03") in cache1
+
+        # Clear cache
+        clear_override_cache()
+
+        # Verify cache is reset (None, not empty dict)
+        assert tickers_module._OVERRIDE_CACHE is None
+
+
+# -------------------------------------
+# Cache Management Tests
+# -------------------------------------
+
+class TestCacheManagement:
+    """Tests for cache clearing functions."""
+
+    def test_clear_prices_connection_cache(self):
+        """Test clear_prices_connection_cache clears DuckDB connections."""
+        from specparser.amt import clear_prices_connection_cache
+        from specparser.amt import tickers as tickers_module
+
+        # Cache should be empty or clearable without error
+        clear_prices_connection_cache()
+        assert tickers_module._DUCKDB_CACHE == {}
+
+    def test_find_tickers_empty_year_range(self, test_amt_file):
+        """Test find_tickers returns empty table when start_year > end_year."""
+        from specparser.amt import find_tickers, clear_cache
+
+        clear_cache()
+        # start_year > end_year should return empty table
+        table = find_tickers(test_amt_file, ".", True, start_year=2025, end_year=2024)
+        assert table["rows"] == []
+        assert "orientation" in table
+        assert table["orientation"] == "row"
 
 
 # -------------------------------------

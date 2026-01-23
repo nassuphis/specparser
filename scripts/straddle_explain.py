@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from specparser.amt import loader, schedules
 from specparser.amt.tickers import (
     get_straddle_actions,
-    asset_straddle_tickers,
+    filter_tickers,
     _anchor_day,
     _add_calendar_days,
 )
@@ -177,7 +177,7 @@ def explain_straddle(
 
     # Get ticker information
     try:
-        ticker_table = asset_straddle_tickers(underlying, year, month, straddle_idx, amt_path, chain_path)
+        ticker_table = filter_tickers(underlying, year, month, straddle_idx, amt_path, chain_path)
         ticker_cols = ticker_table["columns"]
         ticker_rows = ticker_table["rows"]
 

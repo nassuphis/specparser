@@ -141,10 +141,10 @@ print_table(tickers)
 ### Section 8: Straddle Tickers
 
 ```python
-from specparser.amt import asset_straddle_tickers
+from specparser.amt import filter_tickers
 
 # Get tickers for a specific straddle
-tickers = asset_straddle_tickers(
+tickers = filter_tickers(
     asset="CL Comdty",
     year=2024,
     month=6,
@@ -162,7 +162,7 @@ print_table(tickers)
 - Hedge: always kept
 
 **Functions covered:**
-- `asset_straddle_tickers(asset, year, month, i, amt_path, chain_path)`
+- `filter_tickers(asset, year, month, i, amt_path, chain_path)`
 
 ### Section 9: Practical Examples
 
@@ -207,7 +207,7 @@ for month in range(1, 13):
 | `_split_ticker(ticker, param)` | Expand split ticker format |
 | `find_tickers_ym(...)` | Get tickers for one month |
 | `find_tickers(...)` | Get unique tickers for year range |
-| `asset_straddle_tickers(...)` | Get filtered tickers for straddle |
+| `filter_tickers(...)` | Get filtered tickers for straddle |
 
 ---
 

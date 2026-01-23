@@ -380,7 +380,7 @@ def _tschma_dict_bbgfc_ym(
     year: int,
     month: int,
     chain_csv: str | Path | None = None
-) -> list[dict]:
+) -> dict:
     spec = tschema_dict["ticker"]
 
     ticker = fut_spec2ticker(spec, year, month)
@@ -503,11 +503,14 @@ def find_tickers(
     for year in range(start_year, end_year + 1):
         for month in range(1, 13):
             table = find_tickers_ym(path, pattern, live_only, year, month, chain_csv)
-            if tables is None: 
+            if tables is None:
                 tables=table
             else:
                 tables = loader.table_unique_rows(loader.bind_rows(tables,table))
-                
+
+    # Return empty table if no iterations (start_year > end_year)
+    if tables is None:
+        return {"orientation": "row", "columns": ["asset", "source", "type", "param", "tschema", "ticker", "field"], "rows": []}
     return tables
 
 # -------------------------------------
@@ -569,7 +572,7 @@ def _filter_straddle_tickers(rows: list[list], columns: list[str], ntrc: str) ->
     return filtered
 
 
-def asset_straddle_tickers(
+def filter_tickers(
     asset: str,
     year: int,
     month: int,
@@ -736,11 +739,11 @@ def prices_last(prices_parquet: str | Path, pattern: str) -> dict[str, Any]:
     query = f"""
         SELECT ticker, field, MAX(date) AS last_date
         FROM {table_name}
-        WHERE regexp_matches(ticker, '{pattern}')
+        WHERE regexp_matches(ticker, ?)
         GROUP BY ticker, field
         ORDER BY ticker, field
     """
-    result = con.execute(query).fetchall()
+    result = con.execute(query, [pattern]).fetchall()
     con.close()
 
     rows = [[str(ticker), str(field), str(last_date)] for ticker, field, last_date in result]
@@ -938,6 +941,16 @@ def _clear_prices_cache():
     _DUCKDB_CACHE.clear()
 
 
+def clear_prices_connection_cache():
+    """Clear the cached DuckDB connections for prices parquet files.
+
+    Call this to release database connections and free memory,
+    especially in long-running processes or after processing many
+    different parquet files.
+    """
+    _clear_prices_cache()
+
+
 # -------------------------------------
 # Override expiry lookup
 # -------------------------------------
@@ -972,6 +985,16 @@ def _load_overrides(path: str | Path = "data/overrides.csv") -> dict[tuple[str, 
         pass  # Return empty cache if file not found or malformed
 
     return _OVERRIDE_CACHE
+
+
+def clear_override_cache():
+    """Clear the cached override expiry dates.
+
+    Call this to force reloading the overrides CSV file,
+    useful after modifying the file or in long-running processes.
+    """
+    global _OVERRIDE_CACHE
+    _OVERRIDE_CACHE = None
 
 
 def _override_expiry(
@@ -1266,7 +1289,7 @@ def _build_ticker_map(
     """Build ticker map from ticker table.
 
     Args:
-        ticker_table: Output from asset_straddle_tickers()
+        ticker_table: Output from filter_tickers()
         chain_csv: Optional CSV for futures ticker normalization
 
     Returns:
@@ -1335,17 +1358,24 @@ def _lookup_straddle_prices(
 
         con = _get_prices_connection(prices_parquet)
 
+        # Build parameterized query with placeholders
         conditions = " OR ".join(
-            f"(ticker = '{t}' AND field = '{f}')" for t, f in ticker_field_pairs
+            "(ticker = ? AND field = ?)" for _ in ticker_field_pairs
         )
+        # Flatten ticker/field pairs into params list
+        params: list[str] = []
+        for t, f in ticker_field_pairs:
+            params.extend([t, f])
+        params.extend([start_date, end_date])
+
         query = f"""
             SELECT ticker, field, date, value
             FROM prices
             WHERE ({conditions})
-            AND date >= '{start_date}'
-            AND date <= '{end_date}'
+            AND date >= ?
+            AND date <= ?
         """
-        result = con.execute(query).fetchall()
+        result = con.execute(query, params).fetchall()
 
         for ticker, field, dt, value in result:
             key = (ticker, field)
@@ -1586,7 +1616,7 @@ def get_prices(
         Table with columns: [asset, straddle, date, vol, hedge, ...]
     """
     # 1. Get ticker table
-    ticker_table = asset_straddle_tickers(underlying, year, month, i, path, chain_csv)
+    ticker_table = filter_tickers(underlying, year, month, i, path, chain_csv)
 
     if not ticker_table["rows"]:
         return {"orientation": "row", "columns": ["asset", "straddle", "date"], "rows": []}
@@ -1738,7 +1768,7 @@ def get_straddle_valuation(
         for row in rows:
             row.extend(["-", "-", "-", "-", "-"])
         columns.extend(["mv", "delta", "opnl", "hpnl", "pnl"])
-        return {"columns": columns, "rows": rows}
+        return {"orientation": "row", "columns": columns, "rows": rows}
 
     action_idx = columns.index("action")
 
@@ -1755,7 +1785,7 @@ def get_straddle_valuation(
         for row in rows:
             row.extend(["-", "-", "-", "-", "-"])
         columns.extend(["mv", "delta", "opnl", "hpnl", "pnl"])
-        return {"columns": columns, "rows": rows}
+        return {"orientation": "row", "columns": columns, "rows": rows}
 
     # Get model from first row
     model_idx = columns.index("model") if "model" in columns else None
@@ -1936,7 +1966,7 @@ def _main() -> int:
     p.add_argument("--prices-query", metavar="SQL",
                    help="Run arbitrary SQL query against prices parquet (table: prices)")
 
-    p.add_argument("--staddle-valuation", nargs=4, type=str, metavar=("UNDERLYING", "YEAR", "MONTH", "NDX"),
+    p.add_argument("--straddle-valuation", nargs=4, type=str, metavar=("UNDERLYING", "YEAR", "MONTH", "NDX"),
                    help="Get straddle valuation, delta, pnls.")
 
     args = p.parse_args()
@@ -2010,7 +2040,7 @@ def _main() -> int:
 
     elif args.asset_tickers:
         underlying, year, month, i = args.asset_tickers
-        table = asset_straddle_tickers(underlying, int(year), int(month), int(i), args.path, args.chain_csv)
+        table = filter_tickers(underlying, int(year), int(month), int(i), args.path, args.chain_csv)
         loader.print_table(table)
 
     elif args.asset_days:

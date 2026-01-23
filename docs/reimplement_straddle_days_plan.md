@@ -4,7 +4,7 @@
 
 1. **Rename**: `straddle_days` → `get_straddle_days` (reinforces it's a getter, not a finder)
 2. **Drop old format**: No backward compatibility with `['name', 'value']` format
-3. **Same signature as `asset_straddle_tickers`**: Calls it internally for consistency
+3. **Same signature as `filter_tickers`**: Calls it internally for consistency
 4. **Clean table output**: One column per param (vol, hedge, hedge1, etc.)
 
 ## Decisions
@@ -27,9 +27,9 @@ def get_straddle_days(
 ) -> dict[str, Any]:
 ```
 
-Same as `asset_straddle_tickers` plus `prices_parquet` parameter. Calls `asset_straddle_tickers` internally.
+Same as `filter_tickers` plus `prices_parquet` parameter. Calls `filter_tickers` internally.
 
-## Input (from `asset_straddle_tickers`)
+## Input (from `filter_tickers`)
 
 ```python
 {
@@ -67,7 +67,7 @@ Example: `|2024-05|2024-06|N|...|` → 2024-05-01 to 2024-06-30
 
 ## Implementation Steps
 
-### 1. Function Signature and Call `asset_straddle_tickers`
+### 1. Function Signature and Call `filter_tickers`
 ```python
 def get_straddle_days(
     path: str | Path,
@@ -95,8 +95,8 @@ def get_straddle_days(
     Returns:
         Table with one row per day, columns for each param's price
     """
-    # Get ticker table from asset_straddle_tickers
-    table = asset_straddle_tickers(path, underlying, year, month, chain_csv, i)
+    # Get ticker table from filter_tickers
+    table = filter_tickers(path, underlying, year, month, chain_csv, i)
 
     if not table["rows"]:
         return {"columns": ["asset", "straddle", "date"], "rows": []}
@@ -220,15 +220,15 @@ def get_straddle_days(
 3. Test with missing prices in parquet
 4. Test with multiple hedges (hedge, hedge1, hedge2)
 5. Test date range spanning year boundary (Dec 2024 to Jan 2025)
-6. Test empty ticker table (no rows from `asset_straddle_tickers`)
+6. Test empty ticker table (no rows from `filter_tickers`)
 
 ## Summary
 
 | Aspect | Old `straddle_days` | New `get_straddle_days` |
 |--------|---------------------|-------------------------|
 | Function name | `straddle_days` | `get_straddle_days` |
-| Input | Table with `['name', 'value']` | Same args as `asset_straddle_tickers` + `prices_parquet` |
-| Internal | Parses spec strings | Calls `asset_straddle_tickers` |
+| Input | Table with `['name', 'value']` | Same args as `filter_tickers` + `prices_parquet` |
+| Internal | Parses spec strings | Calls `filter_tickers` |
 | Output format | Mixed rows, tab-separated | Clean table: `['asset', 'straddle', 'date', 'vol', 'hedge', ...]` |
 | Date range | Entry month only | Entry month to expiry month (full period) |
 | Missing values | "none" | "none" |
