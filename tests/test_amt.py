@@ -79,9 +79,9 @@ from specparser.amt import (
     fut_spec2ticker,
     fut_norm2act,
     fut_act2norm,
-    clear_normalized_cache,
-    _tschma_dict_expand_bbgfc,
-    _tschma_dict_expand_split,
+    clear_chain_caches,
+    _tschema_dict_expand_bbgfc,
+    _tschema_dict_expand_split,
     find_tickers,
     find_tickers_ym,
     filter_tickers,
@@ -264,7 +264,7 @@ CLZ2024 Comdty,CL Z24 Comdty
 
     # Cleanup
     os.unlink(path)
-    clear_normalized_cache()
+    clear_chain_caches()
 
 
 # -------------------------------------
@@ -1207,7 +1207,7 @@ class TestTickers:
 
     def test_fut_norm2act(self, chain_csv_file):
         """Test normalized to actual ticker lookup."""
-        clear_normalized_cache()
+        clear_chain_caches()
         result = fut_norm2act(chain_csv_file, "CLF2024 Comdty")
         assert result == "CL F24 Comdty"
 
@@ -1217,7 +1217,7 @@ class TestTickers:
 
     def test_fut_norm2act_caching(self, chain_csv_file):
         """Test that CSV is cached."""
-        clear_normalized_cache()
+        clear_chain_caches()
         # First call loads CSV
         fut_norm2act(chain_csv_file, "CLF2024 Comdty")
         # Second call should use cache
@@ -1226,7 +1226,7 @@ class TestTickers:
 
     def test_fut_act2norm(self, chain_csv_file):
         """Test actual to normalized ticker lookup."""
-        clear_normalized_cache()
+        clear_chain_caches()
         result = fut_act2norm(chain_csv_file, "CL F24 Comdty")
         assert result == "CLF2024 Comdty"
 
@@ -1236,7 +1236,7 @@ class TestTickers:
 
     def test_fut_act2norm_caching(self, chain_csv_file):
         """Test that reverse CSV is cached."""
-        clear_normalized_cache()
+        clear_chain_caches()
         # First call loads CSV
         fut_act2norm(chain_csv_file, "CL F24 Comdty")
         # Second call should use cache
@@ -1245,7 +1245,7 @@ class TestTickers:
 
     def test_fut_act2norm_and_norm2act_inverse(self, chain_csv_file):
         """Test that fut_act2norm and fut_norm2act are inverses."""
-        clear_normalized_cache()
+        clear_chain_caches()
         # Normalized -> Actual -> Normalized
         normalized = "CLM2024 Comdty"
         actual = fut_norm2act(chain_csv_file, normalized)
@@ -1260,20 +1260,20 @@ class TestTickers:
         back_to_actual = fut_norm2act(chain_csv_file, normalized2)
         assert back_to_actual == actual2
 
-    def test_clear_normalized_cache_clears_both(self, chain_csv_file):
-        """Test that clear_normalized_cache clears both forward and reverse caches."""
-        clear_normalized_cache()
+    def test_clear_chain_caches_clears_both(self, chain_csv_file):
+        """Test that clear_chain_caches clears both forward and reverse caches."""
+        clear_chain_caches()
         # Populate both caches
         fut_norm2act(chain_csv_file, "CLF2024 Comdty")
         fut_act2norm(chain_csv_file, "CL F24 Comdty")
         # Clear caches
-        clear_normalized_cache()
+        clear_chain_caches()
         # Access internal caches to verify they're cleared
-        from specparser.amt.tickers import _NORMALIZED_CACHE, _ACTUAL_CACHE
+        from specparser.amt.chain import _NORMALIZED_CACHE, _ACTUAL_CACHE
         assert chain_csv_file not in _NORMALIZED_CACHE or str(chain_csv_file) not in _NORMALIZED_CACHE
         assert chain_csv_file not in _ACTUAL_CACHE or str(chain_csv_file) not in _ACTUAL_CACHE
 
-    def test_tschma_dict_expand_bbgfc(self):
+    def test_tschema_dict_expand_bbgfc(self):
         """Test expanding BBGfc row."""
         row = {
             "asset": "CL Comdty",
@@ -1285,17 +1285,17 @@ class TestTickers:
             "field": "PX_LAST"
         }
 
-        expanded = _tschma_dict_expand_bbgfc(row, 2024, 2024)
+        expanded = _tschema_dict_expand_bbgfc(row, 2024, 2024)
         assert len(expanded) == 12  # 12 months
 
         # Check first row
         assert expanded[0]["param"] == "hedgeX2024-01"
-        assert expanded[0]["source"] == "nBBG"  # No CSV provided
+        assert expanded[0]["source"] == "BBG"  # No CSV provided - defaults to BBG
         assert "CLF2024" in expanded[0]["ticker"]
 
-    def test_tschma_dict_expand_bbgfc_with_csv(self, chain_csv_file):
+    def test_tschema_dict_expand_bbgfc_with_csv(self, chain_csv_file):
         """Test expanding BBGfc row with CSV lookup."""
-        clear_normalized_cache()
+        clear_chain_caches()
         row = {
             "asset": "CL Comdty",
             "cls": "Commodity",
@@ -1306,13 +1306,13 @@ class TestTickers:
             "field": "PX_LAST"
         }
 
-        expanded = _tschma_dict_expand_bbgfc(row, 2024, 2024, chain_csv_file)
+        expanded = _tschema_dict_expand_bbgfc(row, 2024, 2024, chain_csv_file)
 
         # With CSV, some should be BBG, some might be nBBG
         bbg_rows = [r for r in expanded if r["source"] == "BBG"]
         assert len(bbg_rows) == 12  # All months in our test CSV
 
-    def test_tschma_dict_expand_split_normal(self):
+    def test_tschema_dict_expand_split_normal(self):
         """Test expand_split_ticker_row with normal ticker."""
         row = {
             "asset": "TEST",
@@ -1324,11 +1324,11 @@ class TestTickers:
             "field": "PX_LAST"
         }
 
-        result = _tschma_dict_expand_split(row)
+        result = _tschema_dict_expand_split(row)
         assert len(result) == 1
         assert result[0] == row
 
-    def test_tschma_dict_expand_split_split(self):
+    def test_tschema_dict_expand_split_split(self):
         """Test expand_split_ticker_row with split ticker."""
         row = {
             "asset": "TEST",
@@ -1340,7 +1340,7 @@ class TestTickers:
             "field": "PX_LAST"
         }
 
-        result = _tschma_dict_expand_split(row)
+        result = _tschema_dict_expand_split(row)
         assert len(result) == 2
         assert result[0]["ticker"] == "OLD1 Comdty"
         assert result[0]["param"] == "hedge<2024-06"
@@ -1358,7 +1358,7 @@ class TestTickerExpansion:
     def test_find_tickers_ym_basic(self, test_amt_file, chain_csv_file):
         """Test find_tickers_ym for specific month."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = find_tickers_ym(test_amt_file, "^CL", True, 2024, 6, chain_csv_file)
         assert table["columns"] == ["asset", "cls", "type", "param", "source", "ticker", "field"]
         assert len(table["rows"]) > 0
@@ -1369,7 +1369,7 @@ class TestTickerExpansion:
     def test_find_tickers_ym_hedge_expansion(self, test_amt_file, chain_csv_file):
         """Test that BBGfc hedge is expanded to specific ticker."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = find_tickers_ym(test_amt_file, "^CL", True, 2024, 6, chain_csv_file)
         # Find hedge row
         hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
@@ -1382,7 +1382,7 @@ class TestTickerExpansion:
     def test_find_tickers_year_range(self, test_amt_file, chain_csv_file):
         """Test find_tickers across year range."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = find_tickers(test_amt_file, "^CL", True, 2024, 2024, chain_csv_file)
         assert len(table["rows"]) > 0
         # Should have multiple hedge rows for different months (deduplicated)
@@ -1393,7 +1393,7 @@ class TestTickerExpansion:
     def test_find_tickers_deduplication(self, test_amt_file, chain_csv_file):
         """Test that find_tickers properly deduplicates."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = find_tickers(test_amt_file, "^CL", True, 2024, 2024, chain_csv_file)
         # Market and Vol tickers should only appear once (same across all months)
         market_rows = [r for r in table["rows"] if r[2] == "Market"]
@@ -1433,7 +1433,7 @@ class TestTickerExpansion:
     def test_filter_tickers_basic(self, test_amt_file, chain_csv_file):
         """Test filter_tickers returns correct format."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         # Output columns (cls and type removed, straddle after asset)
         assert table["columns"] == ["asset", "straddle", "param", "source", "ticker", "field"]
@@ -1446,7 +1446,7 @@ class TestTickerExpansion:
     def test_filter_tickers_modulo(self, test_amt_file, chain_csv_file):
         """Test filter_tickers index wrapping."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         # CL Comdty has 2 schedule components (monthly_std)
         # Index 0 and 2 should give same result
         table0 = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
@@ -1457,7 +1457,7 @@ class TestTickerExpansion:
     def test_filter_tickers_different_index(self, test_amt_file, chain_csv_file):
         """Test filter_tickers with different index gives different straddle."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table0 = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         table1 = filter_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
         # Should be different straddles, straddle is at index 1
@@ -1482,7 +1482,7 @@ amt:
 
         try:
             clear_cache()
-            clear_normalized_cache()
+            clear_chain_caches()
             # Asset has no Options field - returns placeholder straddle with empty values
             table = filter_tickers("NO_SCHED Test", 2024, 6, 0, path, None)
             assert len(table["rows"]) > 0
@@ -1498,7 +1498,7 @@ amt:
     def test_filter_tickers_straddle_format(self, test_amt_file, chain_csv_file):
         """Test that straddle string in result is valid."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         straddle = table["rows"][0][1]  # straddle is at index 1
         # Verify straddle format by parsing it (use s[1:-1] to preserve empty parts)
@@ -1508,7 +1508,7 @@ amt:
     def test_get_tickers_ym_basic(self, test_amt_file, chain_csv_file):
         """Test get_tickers_ym for single asset."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = get_tickers_ym(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file)
         assert table["columns"] == ["asset", "cls", "type", "param", "source", "ticker", "field"]
         assert len(table["rows"]) > 0
@@ -1519,7 +1519,7 @@ amt:
     def test_get_tickers_ym_expands_bbgfc(self, test_amt_file, chain_csv_file):
         """Test get_tickers_ym expands BBGfc hedge."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         table = get_tickers_ym(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file)
         hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
         assert len(hedge_rows) == 1
@@ -1662,7 +1662,7 @@ class TestStraddleTickerFiltering:
     def test_filter_tickers_filters_near(self, test_amt_file, chain_csv_file):
         """Test filter_tickers filters to Near vol for N straddle."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         # Index 0 should be an N straddle (first schedule entry is N1_OVERRIDE15)
         table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         # Check straddle has ntrc=N (straddle is at index 1)
@@ -1677,7 +1677,7 @@ class TestStraddleTickerFiltering:
     def test_filter_tickers_filters_far(self, test_amt_file, chain_csv_file):
         """Test filter_tickers filters to Far vol for F straddle."""
         clear_cache()
-        clear_normalized_cache()
+        clear_chain_caches()
         # Index 1 should be an F straddle (second schedule entry is Fa_OVERRIDEb_0.5)
         table = filter_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
         # Check straddle has ntrc=F (straddle is at index 1)

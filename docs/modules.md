@@ -22,7 +22,8 @@ src/specparser/
 │   ├── __main__.py      # CLI entry point
 │   ├── loader.py        # Loading, caching, asset queries
 │   ├── tickers.py       # Ticker extraction and expansion
-│   └── schedules.py     # Schedule expansion and straddle building
+│   ├── schedules.py     # Schedule expansion and straddle building
+│   └── chain.py         # Futures ticker normalization
 └── storage.py           # DuckDB/Parquet storage utilities
 ```
 
@@ -276,6 +277,7 @@ The AMT module is structured as a subpackage:
 - `loader.py` - Loading, caching, and asset queries
 - `tickers.py` - Ticker extraction, price lookup, and straddle processing
 - `schedules.py` - Schedule expansion and straddle building
+- `chain.py` - Futures ticker normalization (normalized ↔ actual BBG tickers)
 - `table.py` - Table manipulation utilities (row/column/arrow orientations)
 - `_numba_kernels.py` - Numba JIT-compiled date expansion kernels
 
@@ -306,7 +308,10 @@ from specparser.amt import (
 
     # Ticker extraction
     get_tschemas, find_tschemas, get_tickers_ym, find_tickers, find_tickers_ym,
-    fut_spec2ticker, fut_norm2act, fut_act2norm, filter_tickers,
+    fut_spec2ticker, filter_tickers,
+
+    # Futures chain (normalized ↔ actual ticker mapping)
+    fut_norm2act, fut_act2norm, clear_chain_caches,
 
     # Price functions
     load_all_prices, set_prices_dict, get_price, clear_prices_dict,

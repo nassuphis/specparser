@@ -48,7 +48,6 @@ def clear_schedule_caches() -> None:
 #  AMT schedule -> by asset, packed schedule
 # -------------------------------------
 
-
 # Pattern to match lowercase a, b, c, d (the values that need fixing)
 _ABCD_PATTERN = re.compile(r"^([abcd])$")
 
@@ -118,7 +117,7 @@ def _fix_schedule(underlying: str, schedule: list[str]) -> list[str]:
     return fixed_schedule
 
 
-
+_SCHEDULE_COLUMNS = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
 def _schedule_to_rows(underlying: str, schedule: list[str] | None) -> list[list[Any]]:
     """Convert a schedule list to table rows with fixed values."""
     rows = []
@@ -147,7 +146,7 @@ def get_schedule_nocache(path: str | Path, underlying: str) -> dict[str, Any]:
     rows = _schedule_to_rows(underlying, schedule)
     return {"orientation": "row", "columns": _SCHEDULE_COLUMNS, "rows": rows,}
 
-_SCHEDULE_COLUMNS = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
+
 def get_schedule(path: str | Path, underlying: str) -> dict[str, Any]:
     """Get the expiry schedule for an asset by its Underlying value."""
     path_str = str(Path(path).resolve())

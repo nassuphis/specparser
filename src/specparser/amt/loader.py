@@ -57,7 +57,6 @@ def load_amt(path: str | Path) -> dict[str, Any]:
 
     return data
 
-
 def clear_cache():
     """Clear the AMT file cache and underlying lookup cache."""
     _AMT_CACHE.clear()

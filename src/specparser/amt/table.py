@@ -2937,3 +2937,19 @@ def _table_lead_arrow(
     new_data = list(table["rows"]) + [lead_arr]
 
     return {"orientation": "arrow", "columns": new_columns, "rows": new_data}
+
+#
+# for notebooks
+#
+
+import pandas as pd
+def show_table(tbl):
+    """Display a table as a pandas DataFrame for pretty rendering."""
+    # Convert any non-row orientation to row first
+    if tbl.get("orientation") in ("column", "arrow"):
+        t = table_to_rows(tbl)
+    else:
+        t = tbl
+    return pd.DataFrame(t["rows"], columns=t["columns"])
+
+

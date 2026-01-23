@@ -2140,7 +2140,7 @@ Some functions raise exceptions, others return empty tables, others return `None
    - ✅ 1.3 CLI typo fix - Changed `--staddle-valuation` to `--straddle-valuation`
 
 2. **Next sprint**: ✅ DONE
-   - ✅ 1.1 Return type mismatch - Changed `_tschma_dict_bbgfc_ym` return type from `list[dict]` to `dict`
+   - ✅ 1.1 Return type mismatch - Changed `_tschema_dict_bbgfc_ym` return type from `list[dict]` to `dict`
    - ✅ 2.1 SQL injection in `prices_last()` - Now uses parameterized query with `?` placeholder
    - ✅ 2.2 SQL injection in `_lookup_straddle_prices()` - Now uses parameterized query with `?` placeholders
    - ✅ 6.1 Add missing "orientation" keys - Fixed two early returns in `get_straddle_valuation()`

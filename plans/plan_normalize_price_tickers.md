@@ -8,8 +8,8 @@
 
 When querying prices from the parquet file in `get_straddle_days`, hedge tickers return "none" because:
 
-1. `filter_tickers` calls `get_tickers_ym` which calls `_tschma_dict_bbgfc_ym`
-2. `_tschma_dict_bbgfc_ym` converts normalized tickers to actual BBG tickers via `fut_norm2act`:
+1. `filter_tickers` calls `get_tickers_ym` which calls `_tschema_dict_bbgfc_ym`
+2. `_tschema_dict_bbgfc_ym` converts normalized tickers to actual BBG tickers via `fut_norm2act`:
    - Normalized: `LAF2025 Comdty`
    - Actual: `LA F25 Comdty`
 3. The prices parquet file stores data with **normalized** ticker names
