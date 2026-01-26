@@ -363,7 +363,7 @@ def make_calendar_from_ranges_par(src):
 
 
 @njit(parallel=True)
-def make_calendar_from_specs_par(specs,eyp,emp,xyp,xmp):
+def make_calendar_from_specs_par(spec,ntr,xpr):
     """
     Expand straddle specs to calendar dates.
 
@@ -376,7 +376,7 @@ def make_calendar_from_specs_par(specs,eyp,emp,xyp,xmp):
         src_idx: int64 vector length N (originating row index)
         cal:     uint8 matrix shape (N, 10) encoding YYYY-MM-DD
     """
-    R = specs.shape[0]
+    R = ntr.shape[0]
     if R == 0:
         return np.empty(0, dtype=np.int64), np.empty((0, 10), dtype=np.uint8)
 
@@ -386,12 +386,11 @@ def make_calendar_from_specs_par(specs,eyp,emp,xyp,xmp):
 
     for r in range(R):
         # Parse entry yearmonth from positions 1-7: |YYYY-MM|
-        entry_y = read_4digits(specs[r], eyp)
-        entry_m = read_2digits(specs[r], emp)
-
+        entry_y = read_4digits(ntr[r,0:4],0)
+        entry_m = read_2digits(ntr[r,6:7],0)
         # Parse expiry yearmonth from positions 9-15: |YYYY-MM|
-        expiry_y = read_4digits(specs[r], xyp)
-        expiry_m = read_2digits(specs[r], xmp)
+        expiry_y = read_4digits(xpr[r,0:4],0)
+        expiry_m = read_2digits(xpr[r,6:7],0)
 
         days = days_between(entry_y, entry_m, expiry_y, expiry_m)
         src_starts[r + 1] = src_starts[r] + days
@@ -400,17 +399,17 @@ def make_calendar_from_specs_par(specs,eyp,emp,xyp,xmp):
 
     # Allocate output
     src_idx = np.empty(total, dtype=np.int64)
-    cal = np.empty((total, 10), dtype=np.uint8)
+    cal = np.empty((total, spec.shape[1]+10), dtype=np.uint8)
 
     # Pass 2: fill dates (parallel)
     for r in prange(R):
         p = src_starts[r]
 
         # Parse again (cheap, avoids storing intermediate arrays)
-        entry_y = read_4digits(specs[r], 1)
-        entry_m = read_2digits(specs[r], 6)
-        expiry_y = read_4digits(specs[r], 9)
-        expiry_m = read_2digits(specs[r], 14)
+        entry_y = read_4digits(ntr[r,0:4],0)
+        entry_m = read_2digits(ntr[r,6:7],0)
+        expiry_y = read_4digits(xpr[r,0:4],0)
+        expiry_m = read_2digits(xpr[r,6:7],0)
 
         ym_start = entry_y * 12 + (entry_m - 1)
         ym_end = expiry_y * 12 + (expiry_m - 1)
@@ -421,7 +420,8 @@ def make_calendar_from_specs_par(specs,eyp,emp,xyp,xmp):
             days = last_day_of_month(year, month)
 
             for d0 in range(days):
-                _write_yyyymmdd(cal[p], 0, year, month, d0)
+                cal[p,0:spec.shape[1]]=spec[r,:]
+                _write_yyyymmdd(cal[p,:], spec.shape[1], year, month, d0)
                 src_idx[p] = r
                 p += 1
 
