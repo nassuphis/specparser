@@ -363,7 +363,7 @@ def make_calendar_from_ranges_par(src):
 
 
 @njit(parallel=True)
-def make_calendar_from_specs_par(specs):
+def make_calendar_from_specs_par(specs,eyp,emp,xyp,xmp):
     """
     Expand straddle specs to calendar dates.
 
@@ -386,12 +386,12 @@ def make_calendar_from_specs_par(specs):
 
     for r in range(R):
         # Parse entry yearmonth from positions 1-7: |YYYY-MM|
-        entry_y = read_4digits(specs[r], 1)
-        entry_m = read_2digits(specs[r], 6)
+        entry_y = read_4digits(specs[r], eyp)
+        entry_m = read_2digits(specs[r], emp)
 
         # Parse expiry yearmonth from positions 9-15: |YYYY-MM|
-        expiry_y = read_4digits(specs[r], 9)
-        expiry_m = read_2digits(specs[r], 14)
+        expiry_y = read_4digits(specs[r], xyp)
+        expiry_m = read_2digits(specs[r], xmp)
 
         days = days_between(entry_y, entry_m, expiry_y, expiry_m)
         src_starts[r + 1] = src_starts[r] + days
@@ -784,3 +784,21 @@ def unfurl_concat_sep(mat: np.ndarray, values: np.ndarray, src_idx: np.ndarray, 
             out[p, W1 + 1 + k] = values[p, k]
 
     return out
+
+# -------------------------------------
+# straddle creation
+# -------------------------------------
+
+@njit
+def nth_occurrence(x, v, n):
+    idx = np.flatnonzero(x == v)
+    if idx.size < n: return -1  # or raise
+    return int(idx[n - 1])
+@njit
+def field(m,s):
+    si = nth_occurrence(m[0,:],ord("|"),s)
+    ei = nth_occurrence(m[0,:],ord("|"),s+1)
+    ss = slice(si+1,ei)
+    return m[:,ss]
+
+
