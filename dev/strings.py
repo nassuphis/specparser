@@ -386,11 +386,11 @@ def make_calendar_from_specs_par(spec,ntr,xpr):
 
     for r in range(R):
         # Parse entry yearmonth from positions 1-7: |YYYY-MM|
-        entry_y = read_4digits(ntr[r,0:4],0)
-        entry_m = read_2digits(ntr[r,6:7],0)
+        entry_y = read_4digits(ntr[r],0)
+        entry_m = read_2digits(ntr[r],5)
         # Parse expiry yearmonth from positions 9-15: |YYYY-MM|
-        expiry_y = read_4digits(xpr[r,0:4],0)
-        expiry_m = read_2digits(xpr[r,6:7],0)
+        expiry_y = read_4digits(xpr[r],0)
+        expiry_m = read_2digits(xpr[r],5)
 
         days = days_between(entry_y, entry_m, expiry_y, expiry_m)
         src_starts[r + 1] = src_starts[r] + days
@@ -406,10 +406,10 @@ def make_calendar_from_specs_par(spec,ntr,xpr):
         p = src_starts[r]
 
         # Parse again (cheap, avoids storing intermediate arrays)
-        entry_y = read_4digits(ntr[r,0:4],0)
-        entry_m = read_2digits(ntr[r,6:7],0)
-        expiry_y = read_4digits(xpr[r,0:4],0)
-        expiry_m = read_2digits(xpr[r,6:7],0)
+        entry_y = read_4digits(ntr[r],0)
+        entry_m = read_2digits(ntr[r],5)
+        expiry_y = read_4digits(xpr[r],0)
+        expiry_m = read_2digits(xpr[r],5)
 
         ym_start = entry_y * 12 + (entry_m - 1)
         ym_end = expiry_y * 12 + (expiry_m - 1)
@@ -788,6 +788,17 @@ def unfurl_concat_sep(mat: np.ndarray, values: np.ndarray, src_idx: np.ndarray, 
 # -------------------------------------
 # straddle creation
 # -------------------------------------
+
+@njit
+def nth_occurrence_char(s: str, ch: str, n: int) -> int:
+    # n is 1-based
+    cnt = 0
+    for i, c in enumerate(s):
+        if c == ch:
+            cnt += 1
+            if cnt == n:
+                return i
+    return -1
 
 @njit
 def nth_occurrence(x, v, n):
