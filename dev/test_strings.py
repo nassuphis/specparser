@@ -8,18 +8,32 @@ import pytest
 
 from strings import (
     # Conversion utilities
-    u8mat2S,
-    str2u8,
+    u8m2S,
+    u8m2s,
+    u82S,
+    u82s,
+    s2u8,
     strs2u8mat,
     sep,
-    # Date parsing
+    make_u8mat,
+    # Date reading
+    read_1digit,
+    read_2digits,
+    read_4digits,
     get_uint8_ym,
     get_uint8_ymd,
+    # Date writing
+    make_ym,
+    add_months_ym,
+    add_months_ym_inplace,
+    add_months2specs_inplace,
     # Calendar functions
     is_leap_year,
     last_day_of_month,
     days_between,
+    add_months,
     make_ym_matrix,
+    make_ymd_matrix,
     make_calendar_from_ranges,
     make_calendar_from_ranges_par,
     make_calendar_from_specs_par,
@@ -36,6 +50,7 @@ from strings import (
     # Constants
     ASCII_0,
     ASCII_DASH,
+    ASCII_SPACE,
 )
 
 
@@ -43,19 +58,19 @@ from strings import (
 # Conversion Utilities
 # -------------------------------------
 
-class TestStr2U8:
+class TestS2U8:
     def test_ascii(self):
-        result = str2u8("hello")
+        result = s2u8("hello")
         expected = np.array([104, 101, 108, 108, 111], dtype=np.uint8)
         np.testing.assert_array_equal(result, expected)
 
     def test_empty(self):
-        result = str2u8("")
+        result = s2u8("")
         assert len(result) == 0
         assert result.dtype == np.uint8
 
     def test_digits(self):
-        result = str2u8("2024")
+        result = s2u8("2024")
         expected = np.array([50, 48, 50, 52], dtype=np.uint8)  # ASCII codes
         np.testing.assert_array_equal(result, expected)
 
@@ -97,49 +112,109 @@ class TestStrs2U8Mat:
         assert result.shape == (1, 5)
 
 
-class TestU8Mat2S:
+class TestMakeU8Mat:
+    def test_basic(self):
+        result = make_u8mat(3, 5)
+        assert result.shape == (3, 5)
+        assert result.dtype == np.uint8
+        assert np.all(result == ASCII_SPACE)
+
+    def test_custom_fill(self):
+        result = make_u8mat(2, 4, fill=ASCII_0)
+        assert result.shape == (2, 4)
+        assert np.all(result == ASCII_0)
+
+
+class TestU8m2S:
     def test_roundtrip(self):
         original = ["hello", "world", "test!"]
         u8mat = strs2u8mat(original)
-        result = u8mat2S(u8mat)
+        result = u8m2S(u8mat)
         # Convert back to python strings for comparison
         result_strs = [s.decode('utf-8') for s in result]
         assert result_strs == original
 
     def test_shape(self):
         u8mat = np.array([[65, 66], [67, 68]], dtype=np.uint8)  # AB, CD
-        result = u8mat2S(u8mat)
+        result = u8m2S(u8mat)
         assert result.shape == (2,)
         assert result[0] == b"AB"
         assert result[1] == b"CD"
 
 
+class TestU8m2s:
+    def test_returns_string_dtype(self):
+        u8mat = strs2u8mat(["hello", "world"])
+        result = u8m2s(u8mat)
+        assert result.dtype == np.dtypes.StringDType()
+        assert result[0] == "hello"
+        assert result[1] == "world"
+
+
+class TestU82S:
+    def test_vector_to_bytes(self):
+        vec = s2u8("hello")
+        result = u82S(vec)
+        assert result == b"hello"
+
+
+class TestU82s:
+    def test_vector_to_string(self):
+        vec = s2u8("hello")
+        result = u82s(vec)
+        assert result.dtype == np.dtypes.StringDType()
+        # Returns 0-d array, item() extracts the scalar
+        assert result.item() == "hello"
+
+
 # -------------------------------------
-# Date Parsing
+# Date Reading
 # -------------------------------------
+
+class TestReadDigits:
+    def test_read_1digit(self):
+        row = s2u8("5")
+        assert read_1digit(row, 0) == 5
+
+    def test_read_2digits(self):
+        row = s2u8("42")
+        assert read_2digits(row, 0) == 42
+
+    def test_read_2digits_with_offset(self):
+        row = s2u8("XX12YY")
+        assert read_2digits(row, 2) == 12
+
+    def test_read_4digits(self):
+        row = s2u8("2024")
+        assert read_4digits(row, 0) == 2024
+
+    def test_read_4digits_with_offset(self):
+        row = s2u8("|2024-06|")
+        assert read_4digits(row, 1) == 2024
+
 
 class TestGetUint8Ym:
     def test_basic(self):
-        row = str2u8("2024-06")
+        row = s2u8("2024-06")
         y, m = get_uint8_ym(row)
         assert y == 2024
         assert m == 6
 
     def test_january(self):
-        row = str2u8("2001-01")
+        row = s2u8("2001-01")
         y, m = get_uint8_ym(row)
         assert y == 2001
         assert m == 1
 
     def test_december(self):
-        row = str2u8("2025-12")
+        row = s2u8("2025-12")
         y, m = get_uint8_ym(row)
         assert y == 2025
         assert m == 12
 
     def test_longer_string(self):
         # Extra characters after YYYY-MM are ignored
-        row = str2u8("2024-06-15extra")
+        row = s2u8("2024-06-15extra")
         y, m = get_uint8_ym(row)
         assert y == 2024
         assert m == 6
@@ -147,21 +222,21 @@ class TestGetUint8Ym:
 
 class TestGetUint8Ymd:
     def test_basic(self):
-        row = str2u8("2024-06-15")
+        row = s2u8("2024-06-15")
         y, m, d = get_uint8_ymd(row)
         assert y == 2024
         assert m == 6
         assert d == 15
 
     def test_first_of_month(self):
-        row = str2u8("2024-01-01")
+        row = s2u8("2024-01-01")
         y, m, d = get_uint8_ymd(row)
         assert y == 2024
         assert m == 1
         assert d == 1
 
     def test_end_of_month(self):
-        row = str2u8("2024-02-29")
+        row = s2u8("2024-02-29")
         y, m, d = get_uint8_ymd(row)
         assert y == 2024
         assert m == 2
@@ -179,6 +254,73 @@ class TestGetUint8Ymd:
         # Last day of March 2024
         y, m, d = get_uint8_ymd(cal[-1])
         assert (y, m, d) == (2024, 3, 31)
+
+
+# -------------------------------------
+# Date Writing
+# -------------------------------------
+
+class TestMakeYm:
+    def test_basic(self):
+        result = make_ym(2024, 6)
+        assert len(result) == 7
+        assert u82S(result) == b"2024-06"
+
+    def test_january(self):
+        result = make_ym(2001, 1)
+        assert u82S(result) == b"2001-01"
+
+    def test_december(self):
+        result = make_ym(2025, 12)
+        assert u82S(result) == b"2025-12"
+
+
+class TestAddMonthsYm:
+    def test_add_zero(self):
+        spec = s2u8("2024-06")
+        result = add_months_ym(spec, 0)
+        assert u82S(result) == b"2024-06"
+
+    def test_add_one(self):
+        spec = s2u8("2024-06")
+        result = add_months_ym(spec, 1)
+        assert u82S(result) == b"2024-07"
+
+    def test_cross_year(self):
+        spec = s2u8("2024-11")
+        result = add_months_ym(spec, 3)
+        assert u82S(result) == b"2025-02"
+
+    def test_add_12(self):
+        spec = s2u8("2024-06")
+        result = add_months_ym(spec, 12)
+        assert u82S(result) == b"2025-06"
+
+
+class TestAddMonthsYmInplace:
+    def test_basic(self):
+        row = np.empty(7, dtype=np.uint8)
+        spec = s2u8("2024-06")
+        add_months_ym_inplace(row, spec, 3)
+        assert u82S(row) == b"2024-09"
+
+    def test_cross_year(self):
+        row = np.empty(7, dtype=np.uint8)
+        spec = s2u8("2024-11")
+        add_months_ym_inplace(row, spec, 3)
+        assert u82S(row) == b"2025-02"
+
+
+class TestAddMonths2SpecsInplace:
+    def test_batch(self):
+        targets = np.empty((3, 7), dtype=np.uint8)
+        sources = strs2u8mat(["2024-01", "2024-06", "2024-11"])
+        months = np.array([1, 6, 3], dtype=np.int64)
+
+        add_months2specs_inplace(targets, sources, months)
+
+        results = [u82S(targets[i]) for i in range(3)]
+        assert results == [b"2024-02", b"2024-12", b"2025-02"]
 
 
 # -------------------------------------
@@ -244,25 +386,64 @@ class TestDaysBetween:
         assert days_between(2023, 12, 2024, 1) == 31 + 31
 
 
+class TestAddMonths:
+    def test_same_year(self):
+        y, m = add_months(2024, 1, 5)
+        assert (y, m) == (2024, 6)
+
+    def test_cross_year(self):
+        y, m = add_months(2024, 11, 3)
+        assert (y, m) == (2025, 2)
+
+    def test_add_zero(self):
+        y, m = add_months(2024, 6, 0)
+        assert (y, m) == (2024, 6)
+
+
 class TestMakeYmMatrix:
     def test_single_month(self):
         result = make_ym_matrix(np.array([2024, 1, 2024, 1]))
-        assert result.shape == (31, 10)  # 31 days, 10 chars "YYYY-MM-DD"
-        # Check first and last dates
-        first = u8mat2S(result[:1]).astype("U10")[0]
-        last = u8mat2S(result[-1:]).astype("U10")[0]
-        assert first == "2024-01-01"
-        assert last == "2024-01-31"
+        assert result.shape == (1, 7)  # 1 month, 7 chars "YYYY-MM"
+        assert u82S(result[0]) == b"2024-01"
 
-    def test_february_leap(self):
-        result = make_ym_matrix(np.array([2024, 2, 2024, 2]))
-        assert result.shape == (29, 10)  # Leap year February
-        last = u8mat2S(result[-1:]).astype("U10")[0]
-        assert last == "2024-02-29"
+    def test_three_months(self):
+        result = make_ym_matrix(np.array([2024, 1, 2024, 3]))
+        assert result.shape == (3, 7)
+        assert u82S(result[0]) == b"2024-01"
+        assert u82S(result[1]) == b"2024-02"
+        assert u82S(result[2]) == b"2024-03"
+
+    def test_cross_year(self):
+        result = make_ym_matrix(np.array([2024, 11, 2025, 2]))
+        assert result.shape == (4, 7)
+        assert u82S(result[0]) == b"2024-11"
+        assert u82S(result[3]) == b"2025-02"
 
     def test_empty_range(self):
         # End before start -> empty
         result = make_ym_matrix(np.array([2024, 3, 2024, 1]))
+        assert result.shape[0] == 0
+
+
+class TestMakeYmdMatrix:
+    def test_single_month(self):
+        result = make_ymd_matrix(np.array([2024, 1, 2024, 1]))
+        assert result.shape == (31, 10)  # 31 days, 10 chars "YYYY-MM-DD"
+        # Check first and last dates
+        first = u8m2S(result[:1])[0].decode()
+        last = u8m2S(result[-1:])[0].decode()
+        assert first == "2024-01-01"
+        assert last == "2024-01-31"
+
+    def test_february_leap(self):
+        result = make_ymd_matrix(np.array([2024, 2, 2024, 2]))
+        assert result.shape == (29, 10)  # Leap year February
+        last = u8m2S(result[-1:])[0].decode()
+        assert last == "2024-02-29"
+
+    def test_empty_range(self):
+        # End before start -> empty
+        result = make_ymd_matrix(np.array([2024, 3, 2024, 1]))
         assert result.shape[0] == 0
 
 
@@ -422,7 +603,7 @@ class TestCartesianProduct:
 
         assert result.shape == (6, 2)  # 2*3 rows, 1+1 cols
 
-        strs = [s.decode('utf-8') for s in u8mat2S(result)]
+        strs = [s.decode('utf-8') for s in u8m2S(result)]
         assert strs == ["AX", "AY", "AZ", "BX", "BY", "BZ"]
 
     def test_different_widths(self):
@@ -432,7 +613,7 @@ class TestCartesianProduct:
 
         assert result.shape == (4, 5)  # 2*2 rows, 2+3 cols
 
-        strs = [s.decode('utf-8') for s in u8mat2S(result)]
+        strs = [s.decode('utf-8') for s in u8m2S(result)]
         assert strs == ["AAXXX", "AAYYY", "BBXXX", "BBYYY"]
 
     def test_single_element(self):
@@ -448,7 +629,7 @@ class TestCartesianProduct:
         v2 = strs2u8mat(["a", "b"])
         result = cartesian_product((v1, v2))
 
-        strs = [s.decode('utf-8') for s in u8mat2S(result)]
+        strs = [s.decode('utf-8') for s in u8m2S(result)]
         assert strs == ["1a", "1b", "2a", "2b", "3a", "3b"]
 
     def test_with_separator(self):
@@ -459,7 +640,7 @@ class TestCartesianProduct:
 
         assert result.shape == (4, 4)  # 2+1+1 cols
 
-        strs = [s.decode('utf-8') for s in u8mat2S(result)]
+        strs = [s.decode('utf-8') for s in u8m2S(result)]
         assert strs == ["AA|X", "AA|Y", "BB|X", "BB|Y"]
 
     def test_three_matrices(self):
@@ -470,7 +651,7 @@ class TestCartesianProduct:
 
         assert result.shape == (8, 3)  # 2*2*2 rows
 
-        strs = [s.decode('utf-8') for s in u8mat2S(result)]
+        strs = [s.decode('utf-8') for s in u8m2S(result)]
         expected = [
             "AX1", "AX2", "AY1", "AY2",
             "BX1", "BX2", "BY1", "BY2",
@@ -486,7 +667,7 @@ class TestCartesianProduct:
 
         assert result.shape == (2, 5)  # 1+1+1+1+1 cols
 
-        strs = [s.decode('utf-8') for s in u8mat2S(result)]
+        strs = [s.decode('utf-8') for s in u8m2S(result)]
         assert strs == ["A|X|1", "B|X|1"]
 
     def test_realistic_straddle_format(self):
@@ -501,7 +682,7 @@ class TestCartesianProduct:
         # 2 assets * 2 entries * 1 expiry = 4 rows
         assert result.shape == (4, 2 + 1 + 7 + 1 + 7)  # 18 cols
 
-        strs = [s.decode('utf-8') for s in u8mat2S(result)]
+        strs = [s.decode('utf-8') for s in u8m2S(result)]
         assert strs == [
             "CL|2024-01|2024-03",
             "CL|2024-02|2024-03",
@@ -600,7 +781,7 @@ class TestUnfurl:
         assert out.shape == (6, 2)
         assert len(src_idx) == 6
 
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["AA", "AA", "BB", "CC", "CC", "CC"]
 
         np.testing.assert_array_equal(src_idx, [0, 0, 1, 2, 2, 2])
@@ -612,7 +793,7 @@ class TestUnfurl:
         out, src_idx = unfurl(mat, counts)
 
         assert out.shape == (3, 2)
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["AA", "AA", "CC"]
         np.testing.assert_array_equal(src_idx, [0, 0, 2])
 
@@ -623,7 +804,7 @@ class TestUnfurl:
         out, src_idx = unfurl(mat, counts)
 
         assert out.shape == (5, 4)
-        assert all(s.decode('utf-8') == "TEST" for s in u8mat2S(out))
+        assert all(s.decode('utf-8') == "TEST" for s in u8m2S(out))
         np.testing.assert_array_equal(src_idx, [0, 0, 0, 0, 0])
 
     def test_large_total_no_overflow(self):
@@ -656,7 +837,7 @@ class TestUnfurlBySpec:
 
         assert out.shape == (6, 5)  # 4 (mat width) + 1 (item width)
 
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["STR1N", "STR1F", "STR2N", "STR2N", "STR2F", "STR2F"]
 
         np.testing.assert_array_equal(src_idx, [0, 0, 1, 1, 1, 1])
@@ -674,7 +855,7 @@ class TestUnfurlBySpec:
 
         assert out.shape == (5, 4)  # 2 (mat width) + 2 (item width)
 
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["AANN", "AAFF", "BBXX", "BBYY", "BBZZ"]
 
     def test_varying_counts(self):
@@ -689,7 +870,7 @@ class TestUnfurlBySpec:
         out, src_idx = unfurl_by_spec(mat, spec)
 
         assert out.shape == (6, 2)  # 1 + 1
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["AX", "B1", "B2", "B3", "CP", "CQ"]
 
     def test_empty_spec(self):
@@ -712,13 +893,13 @@ class TestUnfurlBySpecSep:
             [2, ord('N'), ord('F')],
             [1, ord('X'), 0],
         ], dtype=np.uint8)
-        sep = np.uint8(ord('|'))
+        sep_byte = np.uint8(ord('|'))
 
-        out, src_idx = unfurl_by_spec_sep(mat, spec, sep)
+        out, src_idx = unfurl_by_spec_sep(mat, spec, sep_byte)
 
         assert out.shape == (3, 6)  # 4 + 1 + 1
 
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["STR1|N", "STR1|F", "STR2|X"]
 
 
@@ -731,7 +912,7 @@ class TestUnfurlConcat:
         out = unfurl_concat(mat, values, src_idx)
 
         assert out.shape == (3, 3)  # 2 + 1
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["AAX", "AAY", "BBZ"]
 
     def test_with_calendar(self):
@@ -748,7 +929,7 @@ class TestUnfurlConcat:
         assert result.shape == (60, 12)  # 2 + 10
 
         # Check first and last
-        strs = u8mat2S(result).astype("U12")
+        strs = u8m2S(result).astype("U12")
         assert strs[0] == "CL2024-01-01"
         assert strs[30] == "CL2024-01-31"
         assert strs[31] == "GC2024-02-01"
@@ -760,12 +941,12 @@ class TestUnfurlConcatSep:
         mat = strs2u8mat(["AA", "BB"])
         values = strs2u8mat(["XX", "YY", "ZZ"])
         src_idx = np.array([0, 1, 1], dtype=np.int64)
-        sep = np.uint8(ord('|'))
+        sep_byte = np.uint8(ord('|'))
 
-        out = unfurl_concat_sep(mat, values, src_idx, sep)
+        out = unfurl_concat_sep(mat, values, src_idx, sep_byte)
 
         assert out.shape == (3, 5)  # 2 + 1 + 2
-        strs = [s.decode('utf-8') for s in u8mat2S(out)]
+        strs = [s.decode('utf-8') for s in u8m2S(out)]
         assert strs == ["AA|XX", "BB|YY", "BB|ZZ"]
 
 
@@ -780,7 +961,7 @@ class TestIntegration:
         src_idx, cal = make_calendar_from_ranges(src)
 
         # Convert to strings
-        date_strs = u8mat2S(cal).astype("U10")
+        date_strs = u8m2S(cal).astype("U10")
 
         assert len(date_strs) == 30  # June has 30 days
         assert date_strs[0] == "2024-06-01"
@@ -794,7 +975,7 @@ class TestIntegration:
         pipe = sep(b"|")
 
         combinations = cartesian_product((assets, pipe, yms))
-        combo_strs = [s.decode('utf-8') for s in u8mat2S(combinations)]
+        combo_strs = [s.decode('utf-8') for s in u8m2S(combinations)]
 
         assert len(combo_strs) == 4
         assert "CL|2024-01" in combo_strs
@@ -831,7 +1012,7 @@ class TestIntegration:
         assert result.shape[0] == 31 + 30 + 29  # 90 rows
         assert result.shape[1] == 6 + 1 + 10  # 17 cols
 
-        strs = u8mat2S(result).astype("U17")
+        strs = u8m2S(result).astype("U17")
         assert strs[0] == "ASSET1|2024-01-01"
         assert strs[30] == "ASSET1|2024-01-31"
         assert strs[31] == "ASSET2|2024-06-01"

@@ -37,7 +37,7 @@ def make_u8mat(length,width,fill=ASCII_SPACE):
 @njit
 def sep(chars: bytes, n: int = 1) -> np.ndarray:
     """fill matrix uint8mat with byte-string"""
-    res = make_uint8mat(n,len(chars))
+    res = make_u8mat(n,len(chars))
     for i in range(n):
         for j in range(len(chars)):
             res[i,j]=chars[j]
