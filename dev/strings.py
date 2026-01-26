@@ -206,6 +206,16 @@ def add_months2specs_inplace(targets,sources,months):
         add_months_ym_inplace(target,source,n)
 
 @njit
+def add_months2specs_inplace_NF(targets,sources,months):
+    for i in range(targets.shape[0]):
+        target=targets[i]
+        source=sources[i]
+        if months[i]==b'N'[0]: 
+            add_months_ym_inplace(target,source,1)
+        elif months[i]==b'F'[0]: 
+            add_months_ym_inplace(target,source,2)
+
+@njit
 def make_ym_matrix(vals):
     starty, startm, endy, endm = vals
     """
