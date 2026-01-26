@@ -276,6 +276,7 @@ Process AMT (Asset Management Table) YAML files for expiry schedules.
 The AMT module is structured as a subpackage:
 - `loader.py` - Loading, caching, and asset queries
 - `tickers.py` - Ticker extraction, price lookup, and straddle processing
+- `asset_straddle_tickers.py` - Straddle-specific ticker extraction (vol/hedge)
 - `schedules.py` - Schedule expansion and straddle building
 - `chain.py` - Futures ticker normalization (normalized ↔ actual BBG tickers)
 - `table.py` - Table manipulation utilities (row/column/arrow orientations)
@@ -359,7 +360,13 @@ uv run python -m specparser.amt.schedules data/amt.yml --expand-ym 2024 6
 uv run python -m specparser.amt.schedules data/amt.yml --get-expand "Asset Name" 2024 2025
 ```
 
-See [AMT Reference](amt.md) for detailed documentation.
+**CLI (specparser.amt.asset_straddle_tickers):**
+```bash
+uv run python -m specparser.amt.asset_straddle_tickers data/amt.yml --get "CL Comdty" --ym 2024-06 --ntrc N
+uv run python -m specparser.amt.asset_straddle_tickers data/amt.yml --find "Comdty$" --start 2024-01 --end 2024-12
+```
+
+See [AMT Reference](amt.md) and [Asset Straddle Tickers Reference](asset_straddle_tickers.md) for detailed documentation.
 
 ---
 
