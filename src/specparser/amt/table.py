@@ -63,6 +63,11 @@ def _is_arrow(table: dict[str, Any]) -> bool:
     return table.get("orientation") == "arrow"
 
 
+def _is_u8m(table: dict[str, Any]) -> bool:
+    """Check if table is u8m-oriented (uint8 matrix columns)."""
+    return table.get("orientation") == "u8m"
+
+
 def _transpose_rows_to_cols(rows: list[list], n_cols: int) -> list[list]:
     """
     Transpose row-oriented data to column-oriented without zip(*rows) splat.
@@ -110,7 +115,7 @@ def _transpose_cols_to_rows(cols: list[list]) -> list[list]:
     return rows
 
 
-def table_orientation(table: dict[str, Any]) -> Literal["row", "column", "arrow"]:
+def table_orientation(table: dict[str, Any]) -> Literal["row", "column", "arrow", "u8m"]:
     """
     Get the orientation of a table.
 
@@ -118,10 +123,10 @@ def table_orientation(table: dict[str, Any]) -> Literal["row", "column", "arrow"
         table: Table dict
 
     Returns:
-        One of "row", "column", or "arrow"
+        One of "row", "column", "arrow", or "u8m"
     """
     orientation = table.get("orientation", "row")
-    if orientation not in ("row", "column", "arrow"):
+    if orientation not in ("row", "column", "arrow", "u8m"):
         raise ValueError(f"Unsupported orientation: {orientation}")
     return orientation
 
@@ -139,6 +144,11 @@ def table_nrows(table: dict[str, Any]) -> int:
     orientation = table_orientation(table)
     if orientation == "row":
         return len(table["rows"])
+    elif orientation == "u8m":
+        # u8m: rows contains uint8 matrices, nrows is shape[0] of first
+        if not table["rows"]:
+            return 0
+        return table["rows"][0].shape[0]
     else:
         # column or arrow: rows contains columns, length is in first column
         if not table["rows"]:
@@ -155,10 +165,11 @@ def table_validate(table: dict[str, Any], strict: bool = False) -> None:
 
     Checks:
     - Required keys: orientation, columns, rows
-    - Orientation is valid: row, column, arrow
-    - len(rows) == len(columns) for column/arrow orientations
+    - Orientation is valid: row, column, arrow, u8m
+    - len(rows) == len(columns) for column/arrow/u8m orientations
     - All columns have equal length
     - Arrow: each element in rows is pa.Array or pa.ChunkedArray
+    - u8m: each element in rows is uint8 ndarray
 
     Args:
         table: Table dict to validate
@@ -167,6 +178,8 @@ def table_validate(table: dict[str, Any], strict: bool = False) -> None:
     Raises:
         ValueError: If table structure is invalid
     """
+    import numpy as np
+
     # Check required keys
     for key in ("columns", "rows"):
         if key not in table:
@@ -186,6 +199,36 @@ def table_validate(table: dict[str, Any], strict: bool = False) -> None:
                 if len(row) != n_cols:
                     raise ValueError(
                         f"Row {i} has {len(row)} values, expected {n_cols} columns"
+                    )
+    elif orientation == "u8m":
+        # u8m: rows is list of uint8 matrices (one per column)
+        if len(rows) != len(columns):
+            raise ValueError(
+                f"Number of data columns ({len(rows)}) does not match "
+                f"column names ({len(columns)})"
+            )
+
+        if rows:
+            # Check all columns have same number of rows
+            first_nrows = rows[0].shape[0]
+            for i, col in enumerate(rows[1:], start=1):
+                if col.shape[0] != first_nrows:
+                    raise ValueError(
+                        f"Column {i} ({columns[i]}) has {col.shape[0]} rows, "
+                        f"expected {first_nrows}"
+                    )
+
+            # u8m-specific checks
+            for i, col in enumerate(rows):
+                if not isinstance(col, np.ndarray):
+                    raise ValueError(
+                        f"Column {i} ({columns[i]}) is not a numpy array, "
+                        f"got {type(col).__name__}"
+                    )
+                if col.dtype != np.uint8:
+                    raise ValueError(
+                        f"Column {i} ({columns[i]}) has dtype {col.dtype}, "
+                        f"expected uint8"
                     )
     else:
         # Column or Arrow: rows is list of columns
@@ -216,18 +259,90 @@ def table_validate(table: dict[str, Any], strict: bool = False) -> None:
                         )
 
 
+# -------------------------------------
+# u8m (uint8 matrix) table functions
+# -------------------------------------
+
+def u8m_from_matrix(mat, columns: list[str]) -> dict[str, Any]:
+    """
+    Split a pipe-delimited uint8 matrix into a u8m table.
+
+    Args:
+        mat: uint8 matrix where each row is "|field0|field1|field2|..."
+        columns: list of column names, one per field (in order)
+
+    Returns:
+        u8m-oriented table: {"orientation": "u8m", "columns": [...], "rows": [...]}
+        where rows[i] is a uint8 matrix slice for column i
+
+    Example:
+        mat = strs2u8mat(["|CL|2024-01|2024-03|", "|GC|2024-02|2024-04|"])
+        tbl = u8m_from_matrix(mat, ["asset", "entry", "expiry"])
+        # tbl["rows"][0] is uint8 matrix for "asset" column (shape (2, 2))
+        # tbl["rows"][1] is uint8 matrix for "entry" column (shape (2, 7))
+    """
+    from .strings import field
+
+    col_arrays = []
+    for i in range(len(columns)):
+        col_arrays.append(field(mat, i + 1))  # field() is 1-indexed
+
+    return {
+        "orientation": "u8m",
+        "columns": list(columns),
+        "rows": col_arrays,
+    }
+
+
+def u8m_column(table: dict[str, Any], colname: str):
+    """
+    Extract a single column from a u8m table as uint8 matrix.
+
+    Args:
+        table: u8m-oriented table
+        colname: column name
+
+    Returns:
+        uint8 matrix of shape (nrows, field_width)
+
+    Raises:
+        ValueError: If table is not u8m-oriented or column not found
+    """
+    if not _is_u8m(table):
+        raise ValueError("Table is not u8m-oriented")
+    try:
+        idx = table["columns"].index(colname)
+    except ValueError:
+        raise ValueError(f"Column '{colname}' not found in table columns: {table['columns']}")
+    return table["rows"][idx]
+
+
+# -------------------------------------
+# Orientation conversion functions
+# -------------------------------------
+
 def table_to_columns(table: dict[str, Any]) -> dict[str, Any]:
     """
     Convert any table to column-oriented (Python lists).
 
     Args:
-        table: Table in any orientation (row, column, or arrow)
+        table: Table in any orientation (row, column, arrow, or u8m)
 
     Returns:
         Column-oriented table with Python list columns
     """
     if _is_column_oriented(table):
         return table
+
+    if _is_u8m(table):
+        # u8m -> column: convert each uint8 matrix to string list (stripped)
+        from .strings import u8m2s
+        import numpy as np
+        return {
+            "orientation": "column",
+            "columns": table["columns"][:],
+            "rows": [np.strings.strip(u8m2s(col)).tolist() for col in table["rows"]],
+        }
 
     if _is_arrow(table):
         # Arrow -> column: convert each pa.Array to Python list
@@ -303,6 +418,36 @@ def table_to_arrow(table: dict[str, Any]) -> dict[str, Any]:
         "orientation": "arrow",
         "columns": table["columns"][:],
         "rows": [_pa.array(col) for col in cols],
+    }
+
+
+def table_u8m2arrow(table: dict[str, Any]) -> dict[str, Any]:
+    """
+    Convert a u8m table to arrow-oriented (PyArrow string arrays).
+
+    Converts uint8 matrices to stripped Python strings, then to PyArrow arrays.
+    This is useful for joins since arrow tables have optimized hash joins.
+
+    Args:
+        table: u8m-oriented table
+
+    Returns:
+        Arrow-oriented table with pa.Array columns (string type)
+
+    Raises:
+        ValueError: If table is not u8m-oriented
+    """
+    if not _is_u8m(table):
+        raise ValueError("table_u8m2arrow requires a u8m-oriented table")
+
+    _pa, _ = _import_pyarrow()
+    from .strings import u8m2s
+    import numpy as np
+
+    return {
+        "orientation": "arrow",
+        "columns": table["columns"][:],
+        "rows": [_pa.array(np.strings.strip(u8m2s(col)).tolist()) for col in table["rows"]],
     }
 
 
@@ -387,6 +532,7 @@ def table_column(table: dict[str, Any], colname: str) -> list[Any] | pa.Array:
 
     Returns:
         For arrow tables: pa.Array (zero-copy)
+        For u8m tables: uint8 matrix (zero-copy reference)
         For row/column tables: Python list of values
 
     Raises:
@@ -399,6 +545,8 @@ def table_column(table: dict[str, Any], colname: str) -> list[Any] | pa.Array:
 
     if _is_arrow(table):
         return table["rows"][idx]  # O(1) - return Arrow array reference (zero-copy)
+    if _is_u8m(table):
+        return table["rows"][idx]  # O(1) - return uint8 matrix reference (zero-copy)
     if _is_column_oriented(table):
         return table["rows"][idx][:]  # O(1) - direct index, copy list
     return [row[idx] for row in table["rows"]]  # O(n) - iterate rows
@@ -2946,7 +3094,10 @@ import pandas as pd
 def show_table(tbl):
     """Display a table as a pandas DataFrame for pretty rendering."""
     # Convert any non-row orientation to row first
-    if tbl.get("orientation") in ("column", "arrow"):
+    if _is_u8m(tbl):
+        # u8m -> column (with string conversion) -> row
+        t = table_to_rows(table_to_columns(tbl))
+    elif tbl.get("orientation") in ("column", "arrow"):
         t = table_to_rows(tbl)
     else:
         t = tbl

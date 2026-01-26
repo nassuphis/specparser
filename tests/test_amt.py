@@ -5311,3 +5311,256 @@ class TestTableLagArrow:
         lagged = result["rows"][price_lag_idx].to_pylist()
 
         assert lagged == [None, None]
+
+
+# -------------------------------------
+# u8m (uint8 matrix) Table Tests
+# -------------------------------------
+
+
+class TestU8mFromMatrix:
+    """Tests for u8m_from_matrix function."""
+
+    def test_basic_split(self):
+        """Test basic splitting of pipe-delimited matrix."""
+        import numpy as np
+        from specparser.amt import strs2u8mat, u8m_from_matrix, u8m2s
+
+        mat = strs2u8mat(["|AA|2024-01|", "|BB|2024-02|"])
+        tbl = u8m_from_matrix(mat, ["asset", "entry"])
+
+        assert tbl["orientation"] == "u8m"
+        assert tbl["columns"] == ["asset", "entry"]
+        assert len(tbl["rows"]) == 2
+
+        # Check asset column
+        asset_col = tbl["rows"][0]
+        assert asset_col.shape == (2, 2)
+        assert list(u8m2s(asset_col)) == ["AA", "BB"]
+
+        # Check entry column
+        entry_col = tbl["rows"][1]
+        assert entry_col.shape == (2, 7)
+        assert list(u8m2s(entry_col)) == ["2024-01", "2024-02"]
+
+    def test_variable_width_fields(self):
+        """Test fields with different widths."""
+        import numpy as np
+        from specparser.amt import strs2u8mat, u8m_from_matrix, u8m2s
+
+        mat = strs2u8mat([
+            "|CL Comdty      |2024-01|2024-03|N|",
+            "|GC Comdty      |2024-02|2024-04|F|",
+        ])
+        tbl = u8m_from_matrix(mat, ["asset", "entry", "expiry", "nf"])
+
+        assert len(tbl["rows"]) == 4
+
+        # Different widths
+        assert tbl["rows"][0].shape[1] == 15  # "CL Comdty      "
+        assert tbl["rows"][1].shape[1] == 7   # "2024-01"
+        assert tbl["rows"][2].shape[1] == 7   # "2024-03"
+        assert tbl["rows"][3].shape[1] == 1   # "N"
+
+    def test_single_row(self):
+        """Test with single row."""
+        from specparser.amt import strs2u8mat, u8m_from_matrix, u8m2s
+
+        mat = strs2u8mat(["|XX|YY|"])
+        tbl = u8m_from_matrix(mat, ["a", "b"])
+
+        assert tbl["rows"][0].shape[0] == 1
+        assert list(u8m2s(tbl["rows"][0])) == ["XX"]
+
+
+class TestU8mColumn:
+    """Tests for u8m_column function."""
+
+    def test_extract_column(self):
+        """Test extracting a column by name."""
+        from specparser.amt import strs2u8mat, u8m_from_matrix, u8m_column, u8m2s
+
+        mat = strs2u8mat(["|AA|XX|", "|BB|YY|"])
+        tbl = u8m_from_matrix(mat, ["a", "b"])
+
+        col_a = u8m_column(tbl, "a")
+        col_b = u8m_column(tbl, "b")
+
+        assert list(u8m2s(col_a)) == ["AA", "BB"]
+        assert list(u8m2s(col_b)) == ["XX", "YY"]
+
+    def test_column_not_found(self):
+        """Test error when column doesn't exist."""
+        from specparser.amt import strs2u8mat, u8m_from_matrix, u8m_column
+
+        mat = strs2u8mat(["|AA|BB|"])
+        tbl = u8m_from_matrix(mat, ["a", "b"])
+
+        with pytest.raises(ValueError, match="not found"):
+            u8m_column(tbl, "nonexistent")
+
+    def test_not_u8m_table(self):
+        """Test error when table is not u8m-oriented."""
+        from specparser.amt import u8m_column
+
+        row_table = {
+            "orientation": "row",
+            "columns": ["a"],
+            "rows": [[1], [2]],
+        }
+
+        with pytest.raises(ValueError, match="not u8m-oriented"):
+            u8m_column(row_table, "a")
+
+
+class TestU8mTableNrows:
+    """Tests for table_nrows with u8m tables."""
+
+    def test_nrows(self):
+        """Test getting row count from u8m table."""
+        from specparser.amt import strs2u8mat, u8m_from_matrix, table_nrows
+
+        mat = strs2u8mat(["|A|", "|B|", "|C|"])
+        tbl = u8m_from_matrix(mat, ["col"])
+
+        assert table_nrows(tbl) == 3
+
+    def test_empty_table(self):
+        """Test empty u8m table."""
+        from specparser.amt import table_nrows
+
+        tbl = {
+            "orientation": "u8m",
+            "columns": [],
+            "rows": [],
+        }
+        assert table_nrows(tbl) == 0
+
+
+class TestU8mValidate:
+    """Tests for table_validate with u8m tables."""
+
+    def test_valid_u8m(self):
+        """Test validation of valid u8m table."""
+        import numpy as np
+        from specparser.amt import table_validate
+
+        tbl = {
+            "orientation": "u8m",
+            "columns": ["a", "b"],
+            "rows": [
+                np.array([[65, 65], [66, 66]], dtype=np.uint8),
+                np.array([[88], [89]], dtype=np.uint8),
+            ],
+        }
+        table_validate(tbl)  # Should not raise
+
+    def test_wrong_dtype(self):
+        """Test validation fails for non-uint8 dtype."""
+        import numpy as np
+        from specparser.amt import table_validate
+
+        tbl = {
+            "orientation": "u8m",
+            "columns": ["a"],
+            "rows": [np.array([[1, 2], [3, 4]], dtype=np.int64)],
+        }
+
+        with pytest.raises(ValueError, match="uint8"):
+            table_validate(tbl)
+
+    def test_mismatched_rows(self):
+        """Test validation fails for mismatched row counts."""
+        import numpy as np
+        from specparser.amt import table_validate
+
+        tbl = {
+            "orientation": "u8m",
+            "columns": ["a", "b"],
+            "rows": [
+                np.array([[65], [66]], dtype=np.uint8),  # 2 rows
+                np.array([[88], [89], [90]], dtype=np.uint8),  # 3 rows
+            ],
+        }
+
+        with pytest.raises(ValueError, match="rows"):
+            table_validate(tbl)
+
+
+class TestU8mToColumns:
+    """Tests for table_to_columns with u8m tables."""
+
+    def test_convert_to_columns(self):
+        """Test converting u8m table to column-oriented."""
+        from specparser.amt import strs2u8mat, u8m_from_matrix, table_to_columns
+
+        mat = strs2u8mat(["|AA|XX|", "|BB|YY|"])
+        u8m_tbl = u8m_from_matrix(mat, ["a", "b"])
+
+        col_tbl = table_to_columns(u8m_tbl)
+
+        assert col_tbl["orientation"] == "column"
+        assert col_tbl["columns"] == ["a", "b"]
+        assert col_tbl["rows"][0] == ["AA", "BB"]
+        assert col_tbl["rows"][1] == ["XX", "YY"]
+
+
+class TestU8mTableColumn:
+    """Tests for table_column with u8m tables."""
+
+    def test_table_column_returns_u8m(self):
+        """Test that table_column returns uint8 matrix for u8m tables."""
+        import numpy as np
+        from specparser.amt import strs2u8mat, u8m_from_matrix, table_column
+
+        mat = strs2u8mat(["|AA|BB|"])
+        tbl = u8m_from_matrix(mat, ["a", "b"])
+
+        col = table_column(tbl, "a")
+
+        assert isinstance(col, np.ndarray)
+        assert col.dtype == np.uint8
+
+
+class TestTableU8m2Arrow:
+    """Tests for table_u8m2arrow function."""
+
+    def test_basic_conversion(self):
+        """Test basic u8m to arrow conversion."""
+        import pyarrow as pa
+        from specparser.amt import strs2u8mat, u8m_from_matrix, table_u8m2arrow
+
+        mat = strs2u8mat(["|AA|2024-01|", "|BB|2024-02|"])
+        tbl = u8m_from_matrix(mat, ["asset", "date"])
+
+        arrow_tbl = table_u8m2arrow(tbl)
+
+        assert arrow_tbl["orientation"] == "arrow"
+        assert arrow_tbl["columns"] == ["asset", "date"]
+        assert len(arrow_tbl["rows"]) == 2
+        assert isinstance(arrow_tbl["rows"][0], pa.Array)
+        assert arrow_tbl["rows"][0].to_pylist() == ["AA", "BB"]
+        assert arrow_tbl["rows"][1].to_pylist() == ["2024-01", "2024-02"]
+
+    def test_strips_whitespace(self):
+        """Test that whitespace is stripped during conversion."""
+        import pyarrow as pa
+        from specparser.amt import strs2u8mat, u8m_from_matrix, table_u8m2arrow
+
+        mat = strs2u8mat(["|CL Comdty      |2024-01|"])
+        tbl = u8m_from_matrix(mat, ["asset", "date"])
+
+        arrow_tbl = table_u8m2arrow(tbl)
+
+        # Should be stripped, not "CL Comdty      "
+        assert arrow_tbl["rows"][0].to_pylist() == ["CL Comdty"]
+
+    def test_error_on_non_u8m(self):
+        """Test that non-u8m tables raise ValueError."""
+        import pytest
+        from specparser.amt import table_u8m2arrow
+
+        row_table = {"orientation": "row", "columns": ["a"], "rows": [[1]]}
+
+        with pytest.raises(ValueError, match="requires a u8m-oriented table"):
+            table_u8m2arrow(row_table)

@@ -17,6 +17,7 @@ import duckdb
 from . import loader
 from . import schedules
 from . import chain
+from . import asset_straddle_tickers
 
 # -------------------------------------
 # Tschemas cache

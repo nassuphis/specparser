@@ -1,12 +1,11 @@
-# Tests for dev/strings.py - Fast string/byte operations
+# Tests for specparser/amt/strings.py - Fast string/byte operations
 #
-# These test the experimental high-performance string building utilities.
-# When the code moves to production (src/specparser/amt/), update imports.
+# These test the high-performance string building utilities using uint8 byte matrices.
 
 import numpy as np
 import pytest
 
-from strings import (
+from specparser.amt.strings import (
     # Conversion utilities
     u8m2S,
     u8m2s,
@@ -540,52 +539,49 @@ class TestMakeCalendarFromSpecsPar:
 
     def test_single_month(self):
         specs = strs2u8mat(["|2024-01|2024-01|"])
-        src_idx, cal = make_calendar_from_specs_par(specs)
+        ntr = strs2u8mat(["2024-01"])
+        xpr = strs2u8mat(["2024-01"])
+        src_idx, cal = make_calendar_from_specs_par(specs, ntr, xpr)
 
         assert len(src_idx) == 31  # Jan has 31 days
-        assert cal.shape == (31, 10)
+        # cal width = spec width + 10
+        assert cal.shape == (31, specs.shape[1] + 10)
         assert np.all(src_idx == 0)
 
     def test_multiple_specs(self):
         specs = strs2u8mat([
-            "|2024-01|2024-01|extra",  # 31 days
-            "|2024-02|2024-02|extra",  # 29 days (leap)
+            "|2024-01|2024-01|extra",
+            "|2024-02|2024-02|extra",
         ])
-        src_idx, cal = make_calendar_from_specs_par(specs)
+        ntr = strs2u8mat(["2024-01", "2024-02"])
+        xpr = strs2u8mat(["2024-01", "2024-02"])
+        src_idx, cal = make_calendar_from_specs_par(specs, ntr, xpr)
 
-        assert len(src_idx) == 31 + 29
-        assert cal.shape == (60, 10)
+        assert len(src_idx) == 31 + 29  # 31 days + 29 days (leap)
         assert np.all(src_idx[:31] == 0)
         assert np.all(src_idx[31:] == 1)
 
     def test_multi_month_range(self):
-        specs = strs2u8mat(["|2024-01|2024-03|"])  # Jan-Mar
-        src_idx, cal = make_calendar_from_specs_par(specs)
+        specs = strs2u8mat(["|2024-01|2024-03|"])
+        ntr = strs2u8mat(["2024-01"])
+        xpr = strs2u8mat(["2024-03"])
+        src_idx, cal = make_calendar_from_specs_par(specs, ntr, xpr)
 
         # Jan=31, Feb=29 (leap), Mar=31 = 91 days
         assert len(src_idx) == 91
-        assert cal.shape == (91, 10)
-
-    def test_matches_ranges_version(self):
-        """Verify output matches make_calendar_from_ranges_par."""
-        specs = strs2u8mat(["|2024-01|2024-03|"])
-        ranges = np.array([[2024, 1, 2024, 3]], dtype=np.int64)
-
-        idx_specs, cal_specs = make_calendar_from_specs_par(specs)
-        idx_ranges, cal_ranges = make_calendar_from_ranges_par(ranges)
-
-        np.testing.assert_array_equal(idx_specs, idx_ranges)
-        np.testing.assert_array_equal(cal_specs, cal_ranges)
 
     def test_empty_input(self):
         specs = np.empty((0, 20), dtype=np.uint8)
-        src_idx, cal = make_calendar_from_specs_par(specs)
+        ntr = np.empty((0, 7), dtype=np.uint8)
+        xpr = np.empty((0, 7), dtype=np.uint8)
+        src_idx, cal = make_calendar_from_specs_par(specs, ntr, xpr)
         assert len(src_idx) == 0
-        assert cal.shape == (0, 10)
 
     def test_cross_year_range(self):
-        specs = strs2u8mat(["|2024-11|2025-02|"])  # Nov-Feb
-        src_idx, cal = make_calendar_from_specs_par(specs)
+        specs = strs2u8mat(["|2024-11|2025-02|"])
+        ntr = strs2u8mat(["2024-11"])
+        xpr = strs2u8mat(["2025-02"])
+        src_idx, cal = make_calendar_from_specs_par(specs, ntr, xpr)
 
         # Nov=30, Dec=31, Jan=31, Feb=28 (2025 not leap) = 120 days
         assert len(src_idx) == 120

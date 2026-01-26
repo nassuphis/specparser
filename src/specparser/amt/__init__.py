@@ -63,6 +63,10 @@ __all__ = [
     "format_table",
     "print_table",
     "show_table",
+    # u8m (uint8 matrix) table functions
+    "u8m_from_matrix",
+    "u8m_column",
+    "table_u8m2arrow",
     # arrow compute functions
     # arithmetic
     "table_add_arrow",
@@ -211,6 +215,61 @@ __all__ = [
     "xprc",
     "xprv",
     "wgt",
+    # strings (fast byte matrix operations)
+    "strs2u8mat",
+    "u8m2S",
+    "u8m2s",
+    "u82S",
+    "u82s",
+    "s2u8",
+    "sep",
+    "make_u8mat",
+    "ASCII_MAP",
+    "ASCII_0",
+    "ASCII_1",
+    "ASCII_DASH",
+    "ASCII_SPACE",
+    "ASCII_N",
+    "ASCII_F",
+    "ASCII_A",
+    "ASCII_PIPE",
+    # strings - date parsing
+    "read_1digit",
+    "read_2digits",
+    "read_4digits",
+    "get_uint8_ym",
+    "get_uint8_ymd",
+    # strings - date writing
+    "make_ym",
+    "add_months_ym",
+    "add_months_ym_inplace",
+    "add_months2specs_inplace",
+    "add_months2specs_inplace_NF",
+    # strings - calendar functions
+    "is_leap_year",
+    "days_per_month",
+    "last_day_of_month",
+    "days_between",
+    "add_months",
+    "make_ym_matrix",
+    "make_ymd_matrix",
+    "make_calendar_from_ranges",
+    "make_calendar_from_ranges_par",
+    "make_calendar_from_specs_par",
+    # strings - cartesian product
+    "cartesian_product",
+    "cartesian_product_np",
+    "cartesian_product_par",
+    # strings - unfurl
+    "unfurl",
+    "unfurl_by_spec",
+    "unfurl_by_spec_sep",
+    "unfurl_concat",
+    "unfurl_concat_sep",
+    # strings - field extraction
+    "nth_occurrence_char",
+    "nth_occurrence",
+    "field",
 ]
 
 # Lazy import mapping: attribute -> (module, name)
@@ -261,6 +320,10 @@ _LAZY_IMPORTS = {
     "format_table": (".table", "format_table"),
     "print_table": (".table", "print_table"),
     "show_table": (".table", "show_table"),
+    # u8m (uint8 matrix) table functions
+    "u8m_from_matrix": (".table", "u8m_from_matrix"),
+    "u8m_column": (".table", "u8m_column"),
+    "table_u8m2arrow": (".table", "table_u8m2arrow"),
     # arrow compute functions
     # arithmetic
     "table_add_arrow": (".table", "table_add_arrow"),
@@ -409,6 +472,61 @@ _LAZY_IMPORTS = {
     "xprc": (".schedules", "xprc"),
     "xprv": (".schedules", "xprv"),
     "wgt": (".schedules", "wgt"),
+    # strings (fast byte matrix operations)
+    "strs2u8mat": (".strings", "strs2u8mat"),
+    "u8m2S": (".strings", "u8m2S"),
+    "u8m2s": (".strings", "u8m2s"),
+    "u82S": (".strings", "u82S"),
+    "u82s": (".strings", "u82s"),
+    "s2u8": (".strings", "s2u8"),
+    "sep": (".strings", "sep"),
+    "make_u8mat": (".strings", "make_u8mat"),
+    "ASCII_MAP": (".strings", "ASCII_MAP"),
+    "ASCII_0": (".strings", "ASCII_0"),
+    "ASCII_1": (".strings", "ASCII_1"),
+    "ASCII_DASH": (".strings", "ASCII_DASH"),
+    "ASCII_SPACE": (".strings", "ASCII_SPACE"),
+    "ASCII_N": (".strings", "ASCII_N"),
+    "ASCII_F": (".strings", "ASCII_F"),
+    "ASCII_A": (".strings", "ASCII_A"),
+    "ASCII_PIPE": (".strings", "ASCII_PIPE"),
+    # strings - date parsing
+    "read_1digit": (".strings", "read_1digit"),
+    "read_2digits": (".strings", "read_2digits"),
+    "read_4digits": (".strings", "read_4digits"),
+    "get_uint8_ym": (".strings", "get_uint8_ym"),
+    "get_uint8_ymd": (".strings", "get_uint8_ymd"),
+    # strings - date writing
+    "make_ym": (".strings", "make_ym"),
+    "add_months_ym": (".strings", "add_months_ym"),
+    "add_months_ym_inplace": (".strings", "add_months_ym_inplace"),
+    "add_months2specs_inplace": (".strings", "add_months2specs_inplace"),
+    "add_months2specs_inplace_NF": (".strings", "add_months2specs_inplace_NF"),
+    # strings - calendar functions
+    "is_leap_year": (".strings", "is_leap_year"),
+    "days_per_month": (".strings", "days_per_month"),
+    "last_day_of_month": (".strings", "last_day_of_month"),
+    "days_between": (".strings", "days_between"),
+    "add_months": (".strings", "add_months"),
+    "make_ym_matrix": (".strings", "make_ym_matrix"),
+    "make_ymd_matrix": (".strings", "make_ymd_matrix"),
+    "make_calendar_from_ranges": (".strings", "make_calendar_from_ranges"),
+    "make_calendar_from_ranges_par": (".strings", "make_calendar_from_ranges_par"),
+    "make_calendar_from_specs_par": (".strings", "make_calendar_from_specs_par"),
+    # strings - cartesian product
+    "cartesian_product": (".strings", "cartesian_product"),
+    "cartesian_product_np": (".strings", "cartesian_product_np"),
+    "cartesian_product_par": (".strings", "cartesian_product_par"),
+    # strings - unfurl
+    "unfurl": (".strings", "unfurl"),
+    "unfurl_by_spec": (".strings", "unfurl_by_spec"),
+    "unfurl_by_spec_sep": (".strings", "unfurl_by_spec_sep"),
+    "unfurl_concat": (".strings", "unfurl_concat"),
+    "unfurl_concat_sep": (".strings", "unfurl_concat_sep"),
+    # strings - field extraction
+    "nth_occurrence_char": (".strings", "nth_occurrence_char"),
+    "nth_occurrence": (".strings", "nth_occurrence"),
+    "field": (".strings", "field"),
 }
 
 

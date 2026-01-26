@@ -9,7 +9,7 @@ The output is a matrix of ASCII characters that can be zero-copy converted to
 NumPy/Arrow string arrays using view().
 
 See docs/strings_comments.md for detailed documentation.
-See dev/strings.ipynb for examples and benchmarks.
+See notebooks/strings.ipynb for examples and benchmarks.
 """
 
 import numpy as np
@@ -165,16 +165,16 @@ def last_day_of_month(year,month):
    if (month == 2) and (is_leap_year(year)): return 29
    return days_per_month[month - 1]
 
-@njit 
+@njit
 def days_between(starty, startm, endy, endm):
     start = starty * 12 + (startm - 1)
     end   = endy   * 12 + (endm   - 1)
     n = 0
-    for k in range(start,end+1): 
+    for k in range(start,end+1):
         n=n+last_day_of_month(k//12,k % 12 + 1)
     return n
 
-@njit 
+@njit
 def add_months(starty, startm, n):
     start = starty * 12 + (startm - 1)
     end   = start + n
@@ -185,17 +185,17 @@ def make_ym(year,month):
     out = np.empty(7,dtype=np.uint8)
     _write_yyyymm(out,0,year,month)
     return out
- 
+
 @njit
 def add_months_ym(spec,n):
         starty, startm = get_uint8_ym(spec)
         endy, endm = add_months(starty, startm, n)
         return make_ym(*add_months(starty, startm, n))
 
-@njit   
+@njit
 def add_months_ym_inplace(row,spec,n):
         _write_yyyymm(row,0,*add_months(*get_uint8_ym(spec), n))
-        return 
+        return
 
 @njit
 def add_months2specs_inplace(targets,sources,months):
@@ -210,9 +210,9 @@ def add_months2specs_inplace_NF(targets,sources,months):
     for i in range(targets.shape[0]):
         target=targets[i]
         source=sources[i]
-        if months[i]==b'N'[0]: 
+        if months[i]==b'N'[0]:
             add_months_ym_inplace(target,source,1)
-        elif months[i]==b'F'[0]: 
+        elif months[i]==b'F'[0]:
             add_months_ym_inplace(target,source,2)
 
 @njit
@@ -228,7 +228,7 @@ def make_ym_matrix(vals):
     # YYYY-MM
     if n <= 0: return np.empty((0, 7), dtype=np.uint8)
     out = np.empty((n, 7), dtype=np.uint8)
-    
+
     for i in range(n):
         ym = i + start
         y, m =  ym// 12, (ym % 12) + 1
@@ -811,5 +811,4 @@ def field(m,s):
     ei = nth_occurrence(m[0,:],ord("|"),s+1)
     ss = slice(si+1,ei)
     return m[:,ss]
-
 

@@ -1,6 +1,6 @@
-# dev/strings.py - Fast String/Matrix Operations
+# specparser.amt.strings - Fast String/Matrix Operations
 
-This document describes the experimental code in `dev/strings.py` for high-performance string generation using uint8 byte matrices.
+This document describes the `specparser.amt.strings` module for high-performance string generation using uint8 byte matrices.
 
 ## Key Insight
 
@@ -317,5 +317,6 @@ All unfurl functions have `_sep` variants that insert a separator byte:
 
 ## Related Code
 
-- `dev/test_strings.py`: Tests for all functions
+- `tests/test_strings.py`: Tests for all functions
+- `notebooks/strings.ipynb`: Examples and benchmarks
 - `docs/matrix_unfurl.md`: Detailed unfurl design document

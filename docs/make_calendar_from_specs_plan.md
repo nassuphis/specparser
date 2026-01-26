@@ -145,9 +145,9 @@ def test_matches_ranges_version():
 
 ## Files to Modify
 
-1. **`dev/strings.py`** - Add `make_calendar_from_specs_par()` after `make_calendar_from_ranges_par()`
-2. **`dev/test_strings.py`** - Add tests
-3. **`dev/strings.ipynb`** - Add benchmarks
+1. **`src/specparser/amt/strings.py`** - Add `make_calendar_from_specs_par()` after `make_calendar_from_ranges_par()`
+2. **`tests/test_strings.py`** - Add tests
+3. **`notebooks/strings.ipynb`** - Add benchmarks
 
 ## Alternative: Non-parallel version?
 
