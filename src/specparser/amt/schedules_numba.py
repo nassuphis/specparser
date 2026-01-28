@@ -1,4 +1,4 @@
-"""Numba-accelerated kernels for date expansion.
+"""Numba-accelerated kernels for straddle schedule date expansion.
 
 This module provides high-performance date expansion functions using Numba JIT compilation.
 The main function `expand_months_to_date32` takes arrays of (year, month, month_count) and

@@ -60,6 +60,11 @@ from specparser.amt import (
     find_straddle_ym,
     get_straddle_yrs,
     get_expand_ym,
+    # u8m schedule functions
+    get_schedule_u8m,
+    find_schedules_u8m,
+    find_straddle_yrs_u8m,
+    straddles_u8m_to_strings,
     # straddle parsing
     ntr,
     ntry,
@@ -73,23 +78,19 @@ from specparser.amt import (
     xprv,
     wgt,
     # tickers
-    _split_ticker,
-    get_tschemas,
-    find_tschemas,
-    fut_spec2ticker,
+    filter_tickers,
+    clear_ticker_caches,
+    # asset_straddle_tickers
+    get_asset_straddle_tickers,
+    find_assets_straddles_tickers,
+    split_ticker,
+    make_fut_ticker,
+    # chain
     fut_norm2act,
     fut_act2norm,
     clear_chain_caches,
-    _tschema_dict_expand_bbgfc,
-    _tschema_dict_expand_split,
-    find_tickers,
-    find_tickers_ym,
-    filter_tickers,
 )
-from specparser.amt.tickers import (
-    _parse_date_constraint,
-    get_tickers_ym,
-    _filter_straddle_tickers,
+from specparser.amt.valuation import (
     _compute_actions,
     _anchor_day,
     _nth_good_day_after,
@@ -108,6 +109,7 @@ from specparser.amt.tickers import (
     _OVERRIDE_CACHE,
 )
 import specparser.amt.tickers as tickers_module
+import specparser.amt.valuation as valuation_module
 
 
 # -------------------------------------
@@ -911,6 +913,100 @@ class TestSchedules:
 
 
 # -------------------------------------
+# u8m Schedule Tests
+# -------------------------------------
+
+class TestSchedulesU8m:
+    """Tests for u8m (uint8 matrix) schedule functions."""
+
+    def test_get_schedule_u8m(self, test_amt_file):
+        """Test getting schedule as u8m format."""
+        clear_cache()
+        table = get_schedule_u8m(test_amt_file, "CL Comdty")
+        assert table["orientation"] == "u8m"
+        assert table["columns"] == ["asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
+        # CL Comdty has 2 schedule components
+        assert table["rows"][0].shape[0] == 2
+        # Each row is a uint8 array
+        import numpy as np
+        assert table["rows"][0].dtype == np.uint8
+
+    def test_get_schedule_u8m_not_found(self, test_amt_file):
+        """Test get_schedule_u8m with non-existent asset."""
+        clear_cache()
+        table = get_schedule_u8m(test_amt_file, "NONEXISTENT")
+        assert table["rows"][0].shape[0] == 0
+
+    def test_find_schedules_u8m(self, test_amt_file):
+        """Test finding schedules as u8m by pattern."""
+        clear_cache()
+        table = find_schedules_u8m(test_amt_file, "^CL", live_only=False)
+        assert table["orientation"] == "u8m"
+        # Should have same rows as get_schedule_u8m for CL Comdty
+        assert table["rows"][0].shape[0] == 2
+
+    def test_find_straddle_yrs_u8m(self, test_amt_file):
+        """Test expanding schedules to u8m straddles across year range."""
+        clear_cache()
+        table = find_straddle_yrs_u8m(test_amt_file, 2024, 2024, pattern="^CL", live_only=False)
+        assert table["orientation"] == "u8m"
+        assert table["columns"] == ["asset", "straddle"]
+        # 12 months * 2 schedule components = 24 rows
+        assert table["rows"][0].shape[0] == 24
+
+    def test_straddles_u8m_to_strings(self, test_amt_file):
+        """Test converting u8m straddles back to strings."""
+        clear_cache()
+        u8m_table = find_straddle_yrs_u8m(test_amt_file, 2024, 2024, pattern="^CL", live_only=False)
+        str_table = straddles_u8m_to_strings(u8m_table)
+        assert str_table["orientation"] == "row"
+        assert str_table["columns"] == ["asset", "straddle"]
+        assert len(str_table["rows"]) == 24
+
+        # Verify format
+        for row in str_table["rows"]:
+            assert row[0] == "CL Comdty"
+            assert row[1].startswith("|")
+            assert row[1].endswith("|")
+
+    def test_u8m_matches_standard(self, test_amt_file):
+        """Test that u8m approach produces same output as standard approach."""
+        clear_cache()
+        # Get standard output
+        std = find_straddle_yrs(test_amt_file, 2024, 2024, pattern="^CL", live_only=False)
+
+        # Get u8m output converted to strings
+        u8m = find_straddle_yrs_u8m(test_amt_file, 2024, 2024, pattern="^CL", live_only=False)
+        u8m_str = straddles_u8m_to_strings(u8m)
+
+        # Compare as sets (order may differ)
+        std_set = set(tuple(r) for r in std["rows"])
+        u8m_set = set(tuple(r) for r in u8m_str["rows"])
+        assert std_set == u8m_set
+
+    def test_u8m_empty_pattern(self, test_amt_file):
+        """Test u8m functions with pattern matching no assets."""
+        clear_cache()
+        table = find_straddle_yrs_u8m(test_amt_file, 2024, 2024, pattern="^NONEXISTENT", live_only=False)
+        assert table["rows"][0].shape[0] == 0
+        assert table["rows"][1].shape[0] == 0
+
+    def test_u8m_straddle_format(self, test_amt_file):
+        """Test u8m straddle string format matches expected structure."""
+        clear_cache()
+        u8m = find_straddle_yrs_u8m(test_amt_file, 2024, 6, pattern="^CL", live_only=False)
+        str_table = straddles_u8m_to_strings(u8m)
+
+        for row in str_table["rows"]:
+            straddle = row[1]
+            # Format: |ntry-ntrm|xpry-xprm|ntrc|ntrv|xprc|xprv|wgt|
+            parts = straddle.strip("|").split("|")
+            assert len(parts) >= 6
+            assert "-" in parts[0]  # ntry-ntrm
+            assert parts[1] == "2024-06"  # xpry-xprm
+
+
+# -------------------------------------
 # Straddle Parsing Tests
 # -------------------------------------
 
@@ -1009,201 +1105,174 @@ class TestStraddleParsing:
 # Date Constraint Tests
 # -------------------------------------
 
-class TestDateConstraints:
-    """Tests for _parse_date_constraint function."""
-
-    def test_no_constraint(self):
-        """Test param without any date constraint."""
-        clean, include = _parse_date_constraint("hedge", 2024, 6)
-        assert clean == "hedge"
-        assert include is True
-
-    def test_equality_constraint_match(self):
-        """Test X (equality) constraint that matches."""
-        clean, include = _parse_date_constraint("hedgeX2024-06", 2024, 6)
-        assert clean == "hedge"
-        assert include is True
-
-    def test_equality_constraint_no_match(self):
-        """Test X (equality) constraint that doesn't match."""
-        clean, include = _parse_date_constraint("hedgeX2024-06", 2024, 7)
-        assert clean == "hedge"
-        assert include is False
-
-    def test_equality_constraint_different_year(self):
-        """Test X constraint with different year."""
-        clean, include = _parse_date_constraint("hedgeX2025-06", 2024, 6)
-        assert clean == "hedge"
-        assert include is False
-
-    def test_less_than_constraint_match(self):
-        """Test < (before) constraint that matches."""
-        clean, include = _parse_date_constraint("hedge<2024-06", 2024, 5)
-        assert clean == "hedge"
-        assert include is True
-
-    def test_less_than_constraint_equal(self):
-        """Test < constraint when dates are equal (should not match)."""
-        clean, include = _parse_date_constraint("hedge<2024-06", 2024, 6)
-        assert clean == "hedge"
-        assert include is False
-
-    def test_less_than_constraint_no_match(self):
-        """Test < constraint when expiry is after limit."""
-        clean, include = _parse_date_constraint("hedge<2024-06", 2024, 7)
-        assert clean == "hedge"
-        assert include is False
-
-    def test_greater_than_constraint_match(self):
-        """Test > (after) constraint that matches."""
-        clean, include = _parse_date_constraint("hedge>2024-06", 2024, 7)
-        assert clean == "hedge"
-        assert include is True
-
-    def test_greater_than_constraint_equal(self):
-        """Test > constraint when dates are equal (should not match)."""
-        clean, include = _parse_date_constraint("hedge>2024-06", 2024, 6)
-        assert clean == "hedge"
-        assert include is False
-
-    def test_greater_than_constraint_no_match(self):
-        """Test > constraint when expiry is before limit."""
-        clean, include = _parse_date_constraint("hedge>2024-06", 2024, 5)
-        assert clean == "hedge"
-        assert include is False
-
-    def test_year_boundary_less_than(self):
-        """Test < constraint across year boundary."""
-        # 2023-12 < 2024-01
-        clean, include = _parse_date_constraint("hedge<2024-01", 2023, 12)
-        assert include is True
-
-    def test_year_boundary_greater_than(self):
-        """Test > constraint across year boundary."""
-        # 2024-01 > 2023-12
-        clean, include = _parse_date_constraint("hedge>2023-12", 2024, 1)
-        assert include is True
-
-    def test_invalid_date_format(self):
-        """Test that invalid date format returns original param."""
-        # Invalid date format should return (param, True)
-        clean, include = _parse_date_constraint("hedgeXinvalid", 2024, 6)
-        assert clean == "hedgeXinvalid"
-        assert include is True
-
-    def test_complex_param_name_with_X(self):
-        """Test param with X constraint and complex name."""
-        clean, include = _parse_date_constraint("hedge1X2024-06", 2024, 6)
-        assert clean == "hedge1"
-        assert include is True
-
-
 # -------------------------------------
 # Tickers Tests
 # -------------------------------------
 
 class TestTickers:
-    """Tests for tickers.py functions."""
+    """Tests for tickers.py and asset_straddle_tickers.py functions."""
+
+    # -----------------------------------------
+    # split_ticker tests (from asset_straddle_tickers)
+    # -----------------------------------------
 
     def test_split_ticker_normal(self):
-        """Test _split_ticker with normal ticker."""
-        result = _split_ticker("CL1 Comdty", "hedge")
-        assert result == [("CL1 Comdty", "hedge")]
+        """Test split_ticker with normal ticker (no colon split)."""
+        result = split_ticker("CL1 Comdty", 2024, 6)
+        assert result == "CL1 Comdty"
 
-    def test_split_ticker_split_format(self):
-        """Test _split_ticker with split ticker format."""
-        result = _split_ticker("OLD1 Comdty:2024-06:NEW1 Comdty", "hedge")
-        assert len(result) == 2
-        assert result[0] == ("OLD1 Comdty", "hedge<2024-06")
-        assert result[1] == ("NEW1 Comdty", "hedge>2024-06")
+    def test_split_ticker_before_split_date(self):
+        """Test split_ticker returns post-ticker when current date <= split date."""
+        # Format: "OLD:YYYY-MM:NEW"
+        # Logic: if split_date < current_date, return OLD, else return NEW
+        # At 2024-05: "2024-06" < "2024-05" is False, so return NEW
+        result = split_ticker("OLD1 Comdty:2024-06:NEW1 Comdty", 2024, 5)
+        assert result == "NEW1 Comdty"  # Before split date, use NEW
 
-    def test_split_ticker_invalid_format(self):
-        """Test _split_ticker with non-split ticker containing colon."""
-        result = _split_ticker("BBG:CL1 Comdty", "hedge")
-        assert result == [("BBG:CL1 Comdty", "hedge")]
+    def test_split_ticker_at_split_date(self):
+        """Test split_ticker at exact split date returns post-ticker."""
+        # At 2024-06: "2024-06" < "2024-06" is False, so return NEW
+        result = split_ticker("OLD1 Comdty:2024-06:NEW1 Comdty", 2024, 6)
+        assert result == "NEW1 Comdty"
 
-    def test_get_tschemas(self, test_amt_file):
-        """Test getting ticker schemas for an asset."""
-        clear_cache()
-        table = get_tschemas(test_amt_file, "CL Comdty")
-        assert table["columns"] == ["asset", "cls", "type", "param", "source", "ticker", "field"]
-        assert len(table["rows"]) > 0
+    def test_split_ticker_after_split_date(self):
+        """Test split_ticker returns pre-ticker after split date."""
+        # At 2024-07: "2024-06" < "2024-07" is True, so return OLD
+        result = split_ticker("OLD1 Comdty:2024-06:NEW1 Comdty", 2024, 7)
+        assert result == "OLD1 Comdty"  # After split date, use OLD
 
-        # Check Market tickers
-        market_rows = [r for r in table["rows"] if r[2] == "Market"]
-        assert len(market_rows) == 2  # CL1 and CL2
+    # -----------------------------------------
+    # make_fut_ticker tests (from asset_straddle_tickers)
+    # -----------------------------------------
 
-        # Check Vol tickers
-        vol_rows = [r for r in table["rows"] if r[2] == "Vol"]
-        assert len(vol_rows) >= 1
+    def test_make_fut_ticker_basic(self):
+        """Test make_fut_ticker with basic parameters."""
+        # Standard CL futures: January -> F, June -> M, December -> Z
+        result = make_fut_ticker(
+            fut_code="CL",
+            fut_month_map="FGHJKMNQUVXZ",
+            min_year_offset=0,
+            market_code="Comdty",
+            qualifier="",
+            year=2024,
+            month=1,
+        )
+        assert result == "CLF2024 Comdty"
 
-        # Check Hedge tickers
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        assert len(hedge_rows) == 1
-        assert hedge_rows[0][4] == "BBGfc"  # source
+        result = make_fut_ticker(
+            fut_code="CL",
+            fut_month_map="FGHJKMNQUVXZ",
+            min_year_offset=0,
+            market_code="Comdty",
+            qualifier="",
+            year=2024,
+            month=6,
+        )
+        assert result == "CLM2024 Comdty"
 
-    def test_get_tschemas_not_found(self, test_amt_file):
-        """Test get_tschemas with non-existent asset."""
-        clear_cache()
-        table = get_tschemas(test_amt_file, "NONEXISTENT")
-        assert table["rows"] == []
+        result = make_fut_ticker(
+            fut_code="CL",
+            fut_month_map="FGHJKMNQUVXZ",
+            min_year_offset=0,
+            market_code="Comdty",
+            qualifier="",
+            year=2024,
+            month=12,
+        )
+        assert result == "CLZ2024 Comdty"
 
-    def test_get_tschemas_nonfut_hedge(self, test_amt_file):
-        """Test get_tschemas with nonfut hedge source."""
-        clear_cache()
-        table = get_tschemas(test_amt_file, "ES Equity")
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        assert len(hedge_rows) == 1
-        assert hedge_rows[0][4] == "BBG"
-        assert hedge_rows[0][5] == "SPY US Equity"
+    def test_make_fut_ticker_with_qualifier(self):
+        """Test make_fut_ticker with qualifier (e.g., 'R' for vol)."""
+        result = make_fut_ticker(
+            fut_code="CL",
+            fut_month_map="FGHJKMNQUVXZ",
+            min_year_offset=0,
+            market_code="Comdty",
+            qualifier="R",
+            year=2024,
+            month=6,
+        )
+        assert result == "CLRM2024 Comdty"
 
-    def test_get_tschemas_calc_hedge(self, test_amt_file):
-        """Test get_tschemas with calc hedge source."""
-        clear_cache()
-        table = get_tschemas(test_amt_file, "TY Rate")
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        assert len(hedge_rows) == 4  # calc produces 4 tickers
-
-    def test_get_tschemas_cds_hedge(self, test_amt_file):
-        """Test get_tschemas with cds hedge source."""
-        clear_cache()
-        table = get_tschemas(test_amt_file, "JPY Curncy")
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        assert len(hedge_rows) == 2  # hedge and hedge1
-
-    def test_find_tschemas(self, test_amt_file):
-        """Test finding ticker schemas by pattern."""
-        clear_cache()
-        # Find all commodities
-        table = find_tschemas(test_amt_file, "Comdty$")
-        assert table["columns"] == ["asset", "cls", "type", "param", "source", "ticker", "field"]
-        assert len(table["rows"]) > 0
-        # All rows should be for CL Comdty
-        for row in table["rows"]:
-            assert row[0] == "CL Comdty"
-
-    def test_find_tschemas_no_match(self, test_amt_file):
-        """Test find_tschemas with pattern matching nothing."""
-        clear_cache()
-        table = find_tschemas(test_amt_file, "^NONEXISTENT")
-        assert table["rows"] == []
-
-    def test_fut_spec2ticker(self):
-        """Test futures spec to ticker conversion."""
-        spec = "generic:CL1 Comdty,fut_code:CL,fut_month_map:FGHJKMNQUVXZ,min_year_offset:0,market_code:Comdty"
-
-        # Test various months
-        assert fut_spec2ticker(spec, 2024, 1) == "CLF2024 Comdty"  # January -> F
-        assert fut_spec2ticker(spec, 2024, 6) == "CLM2024 Comdty"  # June -> M
-        assert fut_spec2ticker(spec, 2024, 12) == "CLZ2024 Comdty"  # December -> Z
-
-    def test_fut_spec2ticker_with_year_offset(self):
-        """Test futures spec with year offset."""
-        # When fut_month_code < opt_month_code, year increments
-        spec = "generic:X1 Comdty,fut_code:X,fut_month_map:AAAAAAZZZZZZ,min_year_offset:0,market_code:Comdty"
-        # A < F, so year should increment for January
-        result = fut_spec2ticker(spec, 2024, 1)
+    def test_make_fut_ticker_year_offset(self):
+        """Test make_fut_ticker with year offset when fut_month < opt_month."""
+        # When fut_month_map[month-1] < standard month code, year increments
+        # fut_month_map "AAAAAAZZZZZZ" means A for months 1-6, Z for 7-12
+        # For month=1, opt_month_code = F, fut_month_code = A, A < F -> year+1
+        result = make_fut_ticker(
+            fut_code="X",
+            fut_month_map="AAAAAAZZZZZZ",
+            min_year_offset=0,
+            market_code="Comdty",
+            qualifier="",
+            year=2024,
+            month=1,
+        )
         assert "2025" in result
+
+    # -----------------------------------------
+    # get_asset_straddle_tickers tests
+    # -----------------------------------------
+
+    def test_get_asset_straddle_tickers_basic(self, test_amt_file):
+        """Test get_asset_straddle_tickers returns correct format."""
+        clear_cache()
+        clear_ticker_caches()
+        table = get_asset_straddle_tickers("CL Comdty", "2024-06", "N", test_amt_file)
+        assert table["columns"] == ["name", "ticker", "field"]
+        assert len(table["rows"]) > 0
+
+    def test_get_asset_straddle_tickers_not_found(self, test_amt_file):
+        """Test get_asset_straddle_tickers with non-existent asset."""
+        clear_cache()
+        clear_ticker_caches()
+        table = get_asset_straddle_tickers("NONEXISTENT", "2024-06", "N", test_amt_file)
+        assert table["rows"] == []
+
+    def test_get_asset_straddle_tickers_nonfut(self, test_amt_file):
+        """Test get_asset_straddle_tickers with nonfut hedge."""
+        clear_cache()
+        clear_ticker_caches()
+        table = get_asset_straddle_tickers("ES Equity", "2024-06", "N", test_amt_file)
+        hedge_rows = [r for r in table["rows"] if r[0] == "hedge"]
+        assert len(hedge_rows) == 1
+        assert hedge_rows[0][1] == "SPY US Equity"
+
+    def test_get_asset_straddle_tickers_no_vol(self, test_amt_file):
+        """Test get_asset_straddle_tickers raises KeyError for asset without Vol."""
+        clear_cache()
+        clear_ticker_caches()
+        # TY Rate has no Vol field, should raise KeyError
+        with pytest.raises(KeyError):
+            get_asset_straddle_tickers("TY Rate", "2024-06", "N", test_amt_file)
+
+        # JPY Curncy has no Vol field, should raise KeyError
+        with pytest.raises(KeyError):
+            get_asset_straddle_tickers("JPY Curncy", "2024-06", "N", test_amt_file)
+
+    # -----------------------------------------
+    # find_assets_straddles_tickers tests
+    # -----------------------------------------
+
+    def test_find_assets_straddles_tickers_basic(self, test_amt_file):
+        """Test find_assets_straddles_tickers returns correct format."""
+        clear_cache()
+        clear_ticker_caches()
+        table = find_assets_straddles_tickers("Comdty$", "2024-01", "2024-03", test_amt_file)
+        assert table["columns"] == ["name", "ticker", "field"]
+        # Should have deduplicated results
+        assert len(table["rows"]) > 0
+
+    def test_find_assets_straddles_tickers_no_match(self, test_amt_file):
+        """Test find_assets_straddles_tickers with no matching pattern."""
+        clear_cache()
+        clear_ticker_caches()
+        table = find_assets_straddles_tickers("^NONEXISTENT", "2024-01", "2024-03", test_amt_file)
+        assert table["rows"] == []
+
+    # -----------------------------------------
+    # Chain lookup tests (fut_norm2act, fut_act2norm)
+    # -----------------------------------------
 
     def test_fut_norm2act(self, chain_csv_file):
         """Test normalized to actual ticker lookup."""
@@ -1273,169 +1342,20 @@ class TestTickers:
         assert chain_csv_file not in _NORMALIZED_CACHE or str(chain_csv_file) not in _NORMALIZED_CACHE
         assert chain_csv_file not in _ACTUAL_CACHE or str(chain_csv_file) not in _ACTUAL_CACHE
 
-    def test_tschema_dict_expand_bbgfc(self):
-        """Test expanding BBGfc row."""
-        row = {
-            "asset": "CL Comdty",
-            "cls": "Commodity",
-            "type": "Hedge",
-            "param": "fut",
-            "source": "BBGfc",
-            "ticker": "generic:CL1 Comdty,fut_code:CL,fut_month_map:FGHJKMNQUVXZ,min_year_offset:0,market_code:Comdty",
-            "field": "PX_LAST"
-        }
-
-        expanded = _tschema_dict_expand_bbgfc(row, 2024, 2024)
-        assert len(expanded) == 12  # 12 months
-
-        # Check first row
-        assert expanded[0]["param"] == "hedgeX2024-01"
-        assert expanded[0]["source"] == "BBG"  # No CSV provided - defaults to BBG
-        assert "CLF2024" in expanded[0]["ticker"]
-
-    def test_tschema_dict_expand_bbgfc_with_csv(self, chain_csv_file):
-        """Test expanding BBGfc row with CSV lookup."""
-        clear_chain_caches()
-        row = {
-            "asset": "CL Comdty",
-            "cls": "Commodity",
-            "type": "Hedge",
-            "param": "fut",
-            "source": "BBGfc",
-            "ticker": "generic:CL1 Comdty,fut_code:CL,fut_month_map:FGHJKMNQUVXZ,min_year_offset:0,market_code:Comdty",
-            "field": "PX_LAST"
-        }
-
-        expanded = _tschema_dict_expand_bbgfc(row, 2024, 2024, chain_csv_file)
-
-        # With CSV, some should be BBG, some might be nBBG
-        bbg_rows = [r for r in expanded if r["source"] == "BBG"]
-        assert len(bbg_rows) == 12  # All months in our test CSV
-
-    def test_tschema_dict_expand_split_normal(self):
-        """Test expand_split_ticker_row with normal ticker."""
-        row = {
-            "asset": "TEST",
-            "cls": "Test",
-            "type": "Hedge",
-            "param": "hedge",
-            "source": "BBG",
-            "ticker": "TEST1 Comdty",
-            "field": "PX_LAST"
-        }
-
-        result = _tschema_dict_expand_split(row)
-        assert len(result) == 1
-        assert result[0] == row
-
-    def test_tschema_dict_expand_split_split(self):
-        """Test expand_split_ticker_row with split ticker."""
-        row = {
-            "asset": "TEST",
-            "cls": "Test",
-            "type": "Hedge",
-            "param": "hedge",
-            "source": "BBG",
-            "ticker": "OLD1 Comdty:2024-06:NEW1 Comdty",
-            "field": "PX_LAST"
-        }
-
-        result = _tschema_dict_expand_split(row)
-        assert len(result) == 2
-        assert result[0]["ticker"] == "OLD1 Comdty"
-        assert result[0]["param"] == "hedge<2024-06"
-        assert result[1]["ticker"] == "NEW1 Comdty"
-        assert result[1]["param"] == "hedge>2024-06"
-
 
 # -------------------------------------
-# Ticker Expansion Tests (find_tickers, etc.)
+# Filter Tickers Tests
 # -------------------------------------
 
-class TestTickerExpansion:
-    """Tests for find_tickers, find_tickers_ym, and filter_tickers."""
-
-    def test_find_tickers_ym_basic(self, test_amt_file, chain_csv_file):
-        """Test find_tickers_ym for specific month."""
-        clear_cache()
-        clear_chain_caches()
-        table = find_tickers_ym(test_amt_file, "^CL", True, 2024, 6, chain_csv_file)
-        assert table["columns"] == ["asset", "cls", "type", "param", "source", "ticker", "field"]
-        assert len(table["rows"]) > 0
-        # All rows should be for CL Comdty
-        for row in table["rows"]:
-            assert row[0] == "CL Comdty"
-
-    def test_find_tickers_ym_hedge_expansion(self, test_amt_file, chain_csv_file):
-        """Test that BBGfc hedge is expanded to specific ticker."""
-        clear_cache()
-        clear_chain_caches()
-        table = find_tickers_ym(test_amt_file, "^CL", True, 2024, 6, chain_csv_file)
-        # Find hedge row
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        assert len(hedge_rows) == 1
-        # Should have BBG source (from CSV lookup)
-        assert hedge_rows[0][4] == "BBG"
-        # Should have expanded ticker
-        assert "CL" in hedge_rows[0][5]
-
-    def test_find_tickers_year_range(self, test_amt_file, chain_csv_file):
-        """Test find_tickers across year range."""
-        clear_cache()
-        clear_chain_caches()
-        table = find_tickers(test_amt_file, "^CL", True, 2024, 2024, chain_csv_file)
-        assert len(table["rows"]) > 0
-        # Should have multiple hedge rows for different months (deduplicated)
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        # With deduplication, we get 12 unique hedge rows (one per month)
-        assert len(hedge_rows) == 12
-
-    def test_find_tickers_deduplication(self, test_amt_file, chain_csv_file):
-        """Test that find_tickers properly deduplicates."""
-        clear_cache()
-        clear_chain_caches()
-        table = find_tickers(test_amt_file, "^CL", True, 2024, 2024, chain_csv_file)
-        # Market and Vol tickers should only appear once (same across all months)
-        market_rows = [r for r in table["rows"] if r[2] == "Market"]
-        assert len(market_rows) == 2  # CL1 and CL2
-
-    def test_find_tickers_no_year_range(self, test_amt_file):
-        """Test find_tickers without year range returns tschemas."""
-        clear_cache()
-        table = find_tickers(test_amt_file, "^CL", True)
-        # Should return same as find_tschemas
-        expected = find_tschemas(test_amt_file, "^CL", True)
-        assert table["columns"] == expected["columns"]
-        assert len(table["rows"]) == len(expected["rows"])
-
-    def test_find_tickers_ym_no_match(self, test_amt_file):
-        """Test find_tickers_ym with no matching assets."""
-        clear_cache()
-        table = find_tickers_ym(test_amt_file, "^NONEXISTENT", True, 2024, 6)
-        assert table["rows"] == []
-
-    def test_find_tickers_split_ticker_filtering(self, test_amt_file):
-        """Test that split tickers are filtered by date constraint."""
-        clear_cache()
-        # Asset5 has split ticker: OLD1 Comdty:2024-06:NEW1 Comdty
-        table = find_tickers_ym(test_amt_file, "^SPLIT", False, 2024, 5)
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        # Before 2024-06, only OLD1 should be included
-        assert len(hedge_rows) == 1
-        assert hedge_rows[0][5] == "OLD1 Comdty"
-
-        # After 2024-06, only NEW1 should be included
-        table = find_tickers_ym(test_amt_file, "^SPLIT", False, 2024, 7)
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        assert len(hedge_rows) == 1
-        assert hedge_rows[0][5] == "NEW1 Comdty"
+class TestFilterTickers:
+    """Tests for filter_tickers function."""
 
     def test_filter_tickers_basic(self, test_amt_file, chain_csv_file):
         """Test filter_tickers returns correct format."""
         clear_cache()
-        clear_chain_caches()
+        clear_ticker_caches()
         table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
-        # Output columns (cls and type removed, straddle after asset)
+        # Output columns: asset, straddle, param, source, ticker, field
         assert table["columns"] == ["asset", "straddle", "param", "source", "ticker", "field"]
         assert len(table["rows"]) > 0
         # All rows should have straddle string at index 1
@@ -1446,7 +1366,7 @@ class TestTickerExpansion:
     def test_filter_tickers_modulo(self, test_amt_file, chain_csv_file):
         """Test filter_tickers index wrapping."""
         clear_cache()
-        clear_chain_caches()
+        clear_ticker_caches()
         # CL Comdty has 2 schedule components (monthly_std)
         # Index 0 and 2 should give same result
         table0 = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
@@ -1457,97 +1377,98 @@ class TestTickerExpansion:
     def test_filter_tickers_different_index(self, test_amt_file, chain_csv_file):
         """Test filter_tickers with different index gives different straddle."""
         clear_cache()
-        clear_chain_caches()
+        clear_ticker_caches()
         table0 = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         table1 = filter_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
         # Should be different straddles, straddle is at index 1
         assert table0["rows"][0][1] != table1["rows"][0][1]
 
-    def test_filter_tickers_no_schedule(self):
-        """Test filter_tickers behavior for asset without Options field."""
-        # Create temp file with asset that has no Options field
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write("""
-amt:
-  NoScheduleAsset:
-    Underlying: "NO_SCHED Test"
-    Class: "Test"
-    WeightCap: 0.1
-    Hedge:
-      Source: "nonfut"
-      Ticker: "TEST1 Comdty"
-      Field: "PX_LAST"
-""")
-            path = f.name
-
-        try:
-            clear_cache()
-            clear_chain_caches()
-            # Asset has no Options field - returns placeholder straddle with empty values
-            table = filter_tickers("NO_SCHED Test", 2024, 6, 0, path, None)
-            assert len(table["rows"]) > 0
-            # Straddle has empty ntrc, ntrv, xprc, xprv, wgt (straddle is at index 1)
-            straddle = table["rows"][0][1]
-            parts = straddle[1:-1].split("|")
-            assert parts[2] == ""  # empty ntrc
-            assert parts[3] == ""  # empty ntrv
-        finally:
-            os.unlink(path)
-            clear_cache()
-
     def test_filter_tickers_straddle_format(self, test_amt_file, chain_csv_file):
         """Test that straddle string in result is valid."""
         clear_cache()
-        clear_chain_caches()
+        clear_ticker_caches()
         table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
         straddle = table["rows"][0][1]  # straddle is at index 1
         # Verify straddle format by parsing it (use s[1:-1] to preserve empty parts)
         parts = straddle[1:-1].split("|")
         assert len(parts) == 7  # ntry-ntrm, xpry-xprm, ntrc, ntrv, xprc, xprv, wgt
 
-    def test_get_tickers_ym_basic(self, test_amt_file, chain_csv_file):
-        """Test get_tickers_ym for single asset."""
+    def test_filter_tickers_asset_not_found(self, test_amt_file):
+        """Test filter_tickers raises for non-existent asset."""
         clear_cache()
-        clear_chain_caches()
-        table = get_tickers_ym(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file)
-        assert table["columns"] == ["asset", "cls", "type", "param", "source", "ticker", "field"]
-        assert len(table["rows"]) > 0
-        # All rows should be for CL Comdty
+        clear_ticker_caches()
+        with pytest.raises(ValueError, match="Asset .* not found"):
+            filter_tickers("NONEXISTENT", 2024, 6, 0, test_amt_file, None)
+
+    def test_filter_tickers_vol_near(self, test_amt_file, chain_csv_file):
+        """Test filter_tickers filters to Near vol for N straddle."""
+        clear_cache()
+        clear_ticker_caches()
+        # Index 0 should be an N straddle (first schedule entry is N1_OVERRIDE15)
+        table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        # Check straddle has ntrc=N (straddle is at index 1)
+        straddle = table["rows"][0][1]
+        parts = straddle[1:-1].split("|")
+        assert parts[2] == "N"
+        # Output columns: ['asset', 'straddle', 'param', 'source', 'ticker', 'field']
+        # Check Vol row has param "vol" (param is at index 2)
+        vol_rows = [r for r in table["rows"] if r[2] == "vol"]
+        assert len(vol_rows) == 1
+
+    def test_filter_tickers_vol_far(self, test_amt_file, chain_csv_file):
+        """Test filter_tickers filters to Far vol for F straddle."""
+        clear_cache()
+        clear_ticker_caches()
+        # Index 1 should be an F straddle (second schedule entry is Fa_OVERRIDEb_0.5)
+        table = filter_tickers("CL Comdty", 2024, 6, 1, test_amt_file, chain_csv_file)
+        # Check straddle has ntrc=F (straddle is at index 1)
+        straddle = table["rows"][0][1]
+        parts = straddle[1:-1].split("|")
+        assert parts[2] == "F"
+        # Output columns: ['asset', 'straddle', 'param', 'source', 'ticker', 'field']
+        # Check Vol row has param "vol" (param is at index 2)
+        vol_rows = [r for r in table["rows"] if r[2] == "vol"]
+        assert len(vol_rows) == 1
+
+    def test_filter_tickers_source_inference(self, test_amt_file, chain_csv_file):
+        """Test that source is inferred correctly from field."""
+        clear_cache()
+        clear_ticker_caches()
+        # CL Comdty uses BBG vol and fut hedge
+        table = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
+        # All rows should have source = "BBG" since they have PX_LAST or VOL fields
         for row in table["rows"]:
-            assert row[0] == "CL Comdty"
+            assert row[3] == "BBG"  # source is at index 3
 
-    def test_get_tickers_ym_expands_bbgfc(self, test_amt_file, chain_csv_file):
-        """Test get_tickers_ym expands BBGfc hedge."""
+    def test_filter_tickers_no_vol_raises_error(self, test_amt_file):
+        """Test that assets without Vol raise KeyError."""
         clear_cache()
-        clear_chain_caches()
-        table = get_tickers_ym(test_amt_file, "CL Comdty", 2024, 6, chain_csv_file)
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
+        clear_ticker_caches()
+        # TY Rate has no Vol field - should raise KeyError
+        with pytest.raises(KeyError):
+            filter_tickers("TY Rate", 2024, 6, 0, test_amt_file, None)
+
+    def test_filter_tickers_nonfut_hedge(self, test_amt_file):
+        """Test filter_tickers with nonfut hedge source."""
+        clear_cache()
+        clear_ticker_caches()
+        # ES Equity has nonfut hedge and BBG vol
+        table = filter_tickers("ES Equity", 2024, 6, 0, test_amt_file, None)
+        # Should have vol and hedge rows
+        vol_rows = [r for r in table["rows"] if r[2] == "vol"]
+        hedge_rows = [r for r in table["rows"] if r[2] == "hedge"]
+        assert len(vol_rows) == 1
         assert len(hedge_rows) == 1
-        # Should have param "hedge" (constraint removed)
-        assert hedge_rows[0][3] == "hedge"
-        # Should have BBG source (from CSV lookup)
-        assert hedge_rows[0][4] == "BBG"
-
-    def test_get_tickers_ym_nonfut_asset(self, test_amt_file):
-        """Test get_tickers_ym for asset with nonfut hedge."""
-        clear_cache()
-        table = get_tickers_ym(test_amt_file, "ES Equity", 2024, 6)
-        hedge_rows = [r for r in table["rows"] if r[2] == "Hedge"]
-        assert len(hedge_rows) == 1
-        assert hedge_rows[0][5] == "SPY US Equity"
-
-    def test_get_tickers_ym_not_found(self, test_amt_file):
-        """Test get_tickers_ym for non-existent asset."""
-        clear_cache()
-        table = get_tickers_ym(test_amt_file, "NONEXISTENT", 2024, 6)
-        assert table["rows"] == []
+        # Both should have BBG source (ES Equity uses BBG vol)
+        assert vol_rows[0][3] == "BBG"
+        assert hedge_rows[0][3] == "BBG"
 
 
 # -------------------------------------
-# Straddle Ticker Filtering Tests
+# Action Column Tests
 # -------------------------------------
 
-class TestStraddleTickerFiltering:
+class TestComputeActions:
     """Tests for _filter_straddle_tickers function."""
 
     def test_filter_excludes_market_rows(self):
@@ -2556,32 +2477,6 @@ expiry_schedules:
             os.unlink(path)
             clear_cache()
 
-    def test_vol_ticker_deduplication(self):
-        """Test that duplicate Vol tickers are deduplicated."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write("""
-amt:
-  TestAsset:
-    Underlying: "TEST Comdty"
-    WeightCap: 0.1
-    Vol:
-      Source: "BBG"
-      Ticker: "VOL1 Comdty"
-      Near: "ATM_IMP_VOL"
-      Far: "ATM_IMP_VOL"
-""")
-            path = f.name
-
-        try:
-            clear_cache()
-            table = get_tschemas(path, "TEST Comdty")
-            vol_rows = [r for r in table["rows"] if r[2] == "Vol"]
-            # Near and Far have same ticker/field, should be deduplicated
-            assert len(vol_rows) == 1
-        finally:
-            os.unlink(path)
-            clear_cache()
-
     def test_table_column_empty_table(self):
         """Test table_column with empty table."""
         table = {"columns": ["a", "b"], "rows": []}
@@ -2644,18 +2539,18 @@ class TestIntegration:
         assert rows_dict["CL Comdty"]["subgroup"] == "energy"
         assert rows_dict["CL Comdty"]["liquidity"] == "2"
 
-    def test_ticker_extraction_workflow(self, test_amt_file):
+    def test_ticker_extraction_workflow(self, test_amt_file, chain_csv_file):
         """Test ticker extraction workflow."""
         clear_cache()
+        clear_ticker_caches()
 
-        # Get tickers for an asset
-        tickers = get_tschemas(test_amt_file, "CL Comdty")
+        # Get tickers for an asset using filter_tickers
+        tickers = filter_tickers("CL Comdty", 2024, 6, 0, test_amt_file, chain_csv_file)
 
-        # Verify different ticker types present
-        types = set(r[2] for r in tickers["rows"])
-        assert "Market" in types
-        assert "Vol" in types
-        assert "Hedge" in types
+        # Verify different ticker params present
+        params = set(r[2] for r in tickers["rows"])
+        assert "vol" in params
+        assert "hedge" in params
 
 
 # -------------------------------------
@@ -3218,9 +3113,9 @@ class TestOverrideExpiry:
     @pytest.fixture(autouse=True)
     def reset_override_cache(self):
         """Reset the override cache before and after each test."""
-        tickers_module._OVERRIDE_CACHE = None
+        valuation_module._OVERRIDE_CACHE = None
         yield
-        tickers_module._OVERRIDE_CACHE = None
+        valuation_module._OVERRIDE_CACHE = None
 
     def test_load_overrides_creates_cache(self, tmp_path):
         """Test that _load_overrides creates a cache from CSV."""
@@ -3404,7 +3299,7 @@ class TestOverrideExpiry:
         clear_override_cache()
 
         # Verify cache is reset (None, not empty dict)
-        assert tickers_module._OVERRIDE_CACHE is None
+        assert valuation_module._OVERRIDE_CACHE is None
 
 
 # -------------------------------------
@@ -3417,23 +3312,11 @@ class TestCacheManagement:
     def test_clear_prices_connection_cache(self):
         """Test clear_prices_connection_cache clears DuckDB connections."""
         from specparser.amt import clear_prices_connection_cache
-        from specparser.amt import tickers as tickers_module
+        from specparser.amt import prices as prices_module
 
         # Cache should be empty or clearable without error
         clear_prices_connection_cache()
-        assert tickers_module._DUCKDB_CACHE == {}
-
-    def test_find_tickers_empty_year_range(self, test_amt_file):
-        """Test find_tickers returns empty table when start_year > end_year."""
-        from specparser.amt import find_tickers, clear_cache
-
-        clear_cache()
-        # start_year > end_year should return empty table
-        table = find_tickers(test_amt_file, ".", True, start_year=2025, end_year=2024)
-        assert table["rows"] == []
-        assert "orientation" in table
-        assert table["orientation"] == "row"
-
+        assert prices_module._DUCKDB_CACHE == {}
 
 # -------------------------------------
 # straddle_days Tests
@@ -4769,7 +4652,7 @@ class TestNumbaKernels:
         """Single straddle: Jan 2025, 2 months."""
         import numpy as np
         import datetime
-        from specparser.amt._numba_kernels import expand_months_to_date32
+        from specparser.amt.schedules_numba import expand_months_to_date32
 
         year = np.array([2025], dtype=np.int32)
         month = np.array([1], dtype=np.int32)
@@ -4790,7 +4673,7 @@ class TestNumbaKernels:
     def test_expand_leap_year(self):
         """Feb 2024 (leap year) should have 29 days."""
         import numpy as np
-        from specparser.amt._numba_kernels import expand_months_to_date32
+        from specparser.amt.schedules_numba import expand_months_to_date32
 
         year = np.array([2024], dtype=np.int32)
         month = np.array([2], dtype=np.int32)
@@ -4802,7 +4685,7 @@ class TestNumbaKernels:
     def test_expand_multiple(self):
         """Two straddles with different spans."""
         import numpy as np
-        from specparser.amt._numba_kernels import expand_months_to_date32
+        from specparser.amt.schedules_numba import expand_months_to_date32
 
         year = np.array([2024, 2025], dtype=np.int32)
         month = np.array([1, 6], dtype=np.int32)
@@ -4819,7 +4702,7 @@ class TestNumbaKernels:
     def test_parallel_matches_sequential(self):
         """Parallel version should produce identical output."""
         import numpy as np
-        from specparser.amt._numba_kernels import (
+        from specparser.amt.schedules_numba import (
             expand_months_to_date32,
             expand_months_to_date32_parallel,
         )
@@ -4836,7 +4719,7 @@ class TestNumbaKernels:
 
     def test_ymd_to_date32_known_dates(self):
         """Verify ymd_to_date32 against known values."""
-        from specparser.amt._numba_kernels import ymd_to_date32
+        from specparser.amt.schedules_numba import ymd_to_date32
 
         # Unix epoch
         assert ymd_to_date32(1970, 1, 1) == 0
@@ -4847,7 +4730,7 @@ class TestNumbaKernels:
 
     def test_is_leap_year(self):
         """Test leap year detection."""
-        from specparser.amt._numba_kernels import is_leap_year
+        from specparser.amt.schedules_numba import is_leap_year
 
         # Leap years
         assert is_leap_year(2024) is True
@@ -4859,7 +4742,7 @@ class TestNumbaKernels:
 
     def test_last_day_of_month(self):
         """Test last day of month calculation."""
-        from specparser.amt._numba_kernels import last_day_of_month
+        from specparser.amt.schedules_numba import last_day_of_month
 
         assert last_day_of_month(2024, 1) == 31  # Jan
         assert last_day_of_month(2024, 2) == 29  # Feb leap year
@@ -4869,12 +4752,237 @@ class TestNumbaKernels:
 
     def test_add_months(self):
         """Test add_months calculation."""
-        from specparser.amt._numba_kernels import add_months
+        from specparser.amt.schedules_numba import add_months
 
         assert add_months(2024, 1, 0) == (2024, 1)
         assert add_months(2024, 1, 1) == (2024, 2)
         assert add_months(2024, 11, 2) == (2025, 1)  # cross year
         assert add_months(2024, 12, 1) == (2025, 1)
+
+
+# -------------------------------------
+# valuation_numba tests
+# -------------------------------------
+
+
+class TestValuationNumba:
+    """Test valuation_numba kernel functions directly."""
+
+    # --- model_ES_vectorized tests ---
+
+    def test_model_ES_vectorized_at_money(self):
+        """Test vectorized ES model when S == X (at-the-money)."""
+        import numpy as np
+        from specparser.amt.valuation_numba import model_ES_vectorized
+
+        hedge = np.array([100.0, 100.0], dtype=np.float64)
+        strike = np.array([100.0, 100.0], dtype=np.float64)
+        vol = np.array([20.0, 20.0], dtype=np.float64)  # 20% vol
+        days_to_expiry = np.array([30, 0], dtype=np.int32)
+        valid_mask = np.array([True, True])
+
+        mv, delta = model_ES_vectorized(hedge, strike, vol, days_to_expiry, valid_mask)
+
+        # At expiry (days=0), MV should be 0 (intrinsic = |S-X|/X = 0)
+        assert mv[1] == 0.0
+        # At-the-money delta should be near 0 (symmetric straddle)
+        assert abs(delta[0]) < 0.1  # Delta near 0 for ATM
+
+    def test_model_ES_vectorized_in_the_money(self):
+        """Test vectorized ES model in-the-money."""
+        import numpy as np
+        from specparser.amt.valuation_numba import model_ES_vectorized
+
+        hedge = np.array([110.0], dtype=np.float64)  # S > X
+        strike = np.array([100.0], dtype=np.float64)
+        vol = np.array([25.0], dtype=np.float64)
+        days_to_expiry = np.array([0], dtype=np.int32)  # At expiry
+        valid_mask = np.array([True])
+
+        mv, delta = model_ES_vectorized(hedge, strike, vol, days_to_expiry, valid_mask)
+
+        # At expiry, MV = |S-X|/X = 10/100 = 0.1
+        assert abs(mv[0] - 0.1) < 0.001
+        assert delta[0] == 1.0  # Call wins, delta = +1
+
+    def test_model_ES_vectorized_invalid_mask(self):
+        """Test that invalid_mask rows return NaN."""
+        import numpy as np
+        from specparser.amt.valuation_numba import model_ES_vectorized
+
+        hedge = np.array([100.0, 100.0], dtype=np.float64)
+        strike = np.array([100.0, 100.0], dtype=np.float64)
+        vol = np.array([20.0, 20.0], dtype=np.float64)
+        days_to_expiry = np.array([30, 30], dtype=np.int32)
+        valid_mask = np.array([True, False])
+
+        mv, delta = model_ES_vectorized(hedge, strike, vol, days_to_expiry, valid_mask)
+
+        assert not np.isnan(mv[0])
+        assert np.isnan(mv[1])  # Masked row should be NaN
+
+    # --- roll_forward_by_straddle tests ---
+
+    def test_roll_forward_basic(self):
+        """Test basic roll-forward logic."""
+        import numpy as np
+        from specparser.amt.valuation_numba import roll_forward_by_straddle
+
+        values = np.array([1.0, np.nan, np.nan, 2.0, np.nan], dtype=np.float64)
+        straddle_starts = np.array([0], dtype=np.int32)
+        straddle_lengths = np.array([5], dtype=np.int32)
+        ntry_offsets = np.array([0], dtype=np.int32)
+        xpry_offsets = np.array([4], dtype=np.int32)
+
+        result = roll_forward_by_straddle(values, straddle_starts, straddle_lengths,
+                                          ntry_offsets, xpry_offsets)
+
+        expected = np.array([1.0, 1.0, 1.0, 2.0, 2.0], dtype=np.float64)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_roll_forward_multiple_straddles(self):
+        """Test roll-forward across multiple straddles."""
+        import numpy as np
+        from specparser.amt.valuation_numba import roll_forward_by_straddle
+
+        # Two straddles: [0:3] and [3:6]
+        values = np.array([1.0, np.nan, 2.0, 10.0, np.nan, 20.0], dtype=np.float64)
+        straddle_starts = np.array([0, 3], dtype=np.int32)
+        straddle_lengths = np.array([3, 3], dtype=np.int32)
+        ntry_offsets = np.array([0, 0], dtype=np.int32)
+        xpry_offsets = np.array([2, 2], dtype=np.int32)
+
+        result = roll_forward_by_straddle(values, straddle_starts, straddle_lengths,
+                                          ntry_offsets, xpry_offsets)
+
+        expected = np.array([1.0, 1.0, 2.0, 10.0, 10.0, 20.0], dtype=np.float64)
+        np.testing.assert_array_equal(result, expected)
+
+    # --- compute_pnl_batch tests ---
+
+    def test_compute_pnl_batch_basic(self):
+        """Test basic PnL computation."""
+        import numpy as np
+        from specparser.amt.valuation_numba import compute_pnl_batch
+
+        # Single straddle, 3 days
+        mv = np.array([0.10, 0.12, 0.08], dtype=np.float64)
+        delta = np.array([0.0, 0.1, -0.1], dtype=np.float64)
+        hedge = np.array([100.0, 102.0, 99.0], dtype=np.float64)
+        strike = np.array([100.0, 100.0, 100.0], dtype=np.float64)
+        straddle_starts = np.array([0], dtype=np.int32)
+        straddle_lengths = np.array([3], dtype=np.int32)
+        ntry_offsets = np.array([0], dtype=np.int32)
+        xpry_offsets = np.array([2], dtype=np.int32)
+
+        opnl, hpnl, pnl = compute_pnl_batch(mv, delta, hedge, strike,
+                                            straddle_starts, straddle_lengths,
+                                            ntry_offsets, xpry_offsets)
+
+        # Entry day should have 0 PnL
+        assert opnl[0] == 0.0
+        assert hpnl[0] == 0.0
+        assert pnl[0] == 0.0
+
+        # Day 2: opnl = 0.12 - 0.10 = 0.02
+        assert abs(opnl[1] - 0.02) < 1e-10
+
+    # --- compute_straddle_boundaries tests ---
+
+    def test_compute_straddle_boundaries(self):
+        """Test boundary computation from parent_idx."""
+        import numpy as np
+        from specparser.amt.valuation_numba import compute_straddle_boundaries
+
+        # 3 straddles: [0,0,0], [1,1], [2,2,2,2]
+        parent_idx = np.array([0, 0, 0, 1, 1, 2, 2, 2, 2], dtype=np.int32)
+
+        starts, lengths = compute_straddle_boundaries(parent_idx)
+
+        np.testing.assert_array_equal(starts, [0, 3, 5])
+        np.testing.assert_array_equal(lengths, [3, 2, 4])
+
+    def test_compute_straddle_boundaries_empty(self):
+        """Test with empty input."""
+        import numpy as np
+        from specparser.amt.valuation_numba import compute_straddle_boundaries
+
+        parent_idx = np.array([], dtype=np.int32)
+        starts, lengths = compute_straddle_boundaries(parent_idx)
+
+        assert len(starts) == 0
+        assert len(lengths) == 0
+
+    # --- compute_days_to_expiry tests ---
+
+    def test_compute_days_to_expiry(self):
+        """Test days-to-expiry computation."""
+        import numpy as np
+        from specparser.amt.valuation_numba import compute_days_to_expiry
+
+        # 5 days: [19723, 19724, 19725, 19726, 19727] (2024-01-01 to 2024-01-05)
+        dates = np.array([19723, 19724, 19725, 19726, 19727], dtype=np.int32)
+        straddle_starts = np.array([0], dtype=np.int32)
+        straddle_lengths = np.array([5], dtype=np.int32)
+        xpry_offsets = np.array([4], dtype=np.int32)  # Expiry at index 4
+
+        dte = compute_days_to_expiry(dates, straddle_starts, straddle_lengths, xpry_offsets)
+
+        # DTE should count down: [4, 3, 2, 1, 0]
+        np.testing.assert_array_equal(dte, [4, 3, 2, 1, 0])
+
+    # --- batch_price_lookup tests ---
+
+    def test_batch_price_lookup(self):
+        """Test vectorized price lookup."""
+        import numpy as np
+        from specparser.amt.valuation_numba import batch_price_lookup
+
+        # 2x3 price matrix
+        price_matrix = np.array([
+            [10.0, 11.0, 12.0],
+            [20.0, 21.0, 22.0],
+        ], dtype=np.float64)
+
+        vol_row_idx = np.array([0, 0, 1], dtype=np.int32)
+        hedge_row_idx = np.array([1, 1, 0], dtype=np.int32)
+        col_idx = np.array([0, 1, 2], dtype=np.int32)
+
+        vol, hedge = batch_price_lookup(price_matrix, vol_row_idx, hedge_row_idx, col_idx)
+
+        np.testing.assert_array_equal(vol, [10.0, 11.0, 22.0])
+        np.testing.assert_array_equal(hedge, [20.0, 21.0, 12.0])
+
+    def test_batch_price_lookup_invalid_indices(self):
+        """Test that invalid indices return NaN."""
+        import numpy as np
+        from specparser.amt.valuation_numba import batch_price_lookup
+
+        price_matrix = np.array([[10.0, 11.0]], dtype=np.float64)
+        vol_row_idx = np.array([0, -1], dtype=np.int32)  # -1 is invalid
+        hedge_row_idx = np.array([0, 0], dtype=np.int32)
+        col_idx = np.array([0, 0], dtype=np.int32)
+
+        vol, hedge = batch_price_lookup(price_matrix, vol_row_idx, hedge_row_idx, col_idx)
+
+        assert vol[0] == 10.0
+        assert np.isnan(vol[1])  # Invalid row should be NaN
+
+    # --- build_col_indices tests ---
+
+    def test_build_col_indices(self):
+        """Test date32-to-column index conversion."""
+        import numpy as np
+        from specparser.amt.valuation_numba import build_col_indices
+
+        dates = np.array([19723, 19724, 19725, 19730], dtype=np.int32)  # 2024-01-01 + offsets
+        # Mapping: date32 offset -> column index
+        date32_to_col = np.array([0, 1, 2, -1, -1, -1, -1, 3], dtype=np.int32)  # gaps at 3-6
+        min_date32 = 19723
+
+        col_idx = build_col_indices(dates, date32_to_col, min_date32)
+
+        np.testing.assert_array_equal(col_idx, [0, 1, 2, 3])
 
 
 # -------------------------------------

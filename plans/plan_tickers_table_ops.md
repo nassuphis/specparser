@@ -737,7 +737,7 @@ uv run python -m specparser.amt.tickers data/amt.yml --asset-days "CL Comdty" 20
    - Avoids Cartesian explosion risk
 
 4. ✅ **Implemented `schedules.find_straddle_days_numba()`**
-   - Numba kernels in `_numba_kernels.py`
+   - Numba kernels in `schedules_numba.py` and `valuation_numba.py`
    - Sequential and parallel versions
    - Note: This is in `schedules.py`, NOT `tickers.py`
 
@@ -1880,7 +1880,8 @@ The Numba kernels should live in a separate module to:
 ```
 src/specparser/amt/
 ├── schedules.py          # find_straddle_days(), find_straddle_days_arrow()
-├── _numba_kernels.py     # Numba date expansion kernels (optional import)
+├── schedules_numba.py    # Numba date expansion kernels
+├── valuation_numba.py    # Numba backtest/valuation kernels
 └── ...
 ```
 
@@ -1888,7 +1889,7 @@ src/specparser/amt/
 # In schedules.py
 def find_straddle_days_numba(...):
     try:
-        from ._numba_kernels import expand_months_to_date32, expand_months_to_date32_parallel
+        from .schedules_numba import expand_months_to_date32, expand_months_to_date32_parallel
     except ImportError:
         raise ImportError("Numba is required for find_straddle_days_numba. Install with: pip install numba")
     ...

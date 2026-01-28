@@ -449,29 +449,38 @@ hedge      BBG:CL F24 Comdty:PX_LAST
 
 ---
 
-### Price Functions
+### Price Functions (prices.py)
 
-#### `load_all_prices(prices_parquet)`
+The `prices.py` module provides all functions for fetching, caching, and querying price data.
+
+#### Loading and Caching
+
+##### `load_all_prices(prices_parquet, start_date=None, end_date=None)`
 
 Load all prices from a parquet file into memory for fast lookups.
 
 ```python
 from specparser.amt import load_all_prices
 
-# Load prices into memory (call once at startup)
-load_all_prices("data/prices.parquet")
+# Load all prices into memory (call once at startup)
+prices_dict = load_all_prices("data/prices.parquet")
+
+# Load prices for a specific date range
+prices_dict = load_all_prices("data/prices.parquet", "2024-01-01", "2024-12-31")
 
 # Now price lookups are O(1) dict lookups instead of DuckDB queries
 ```
 
 **Parameters:**
 - `prices_parquet`: Path to parquet file with columns `ticker`, `field`, `date`, `value`
+- `start_date`: Optional start date filter (YYYY-MM-DD)
+- `end_date`: Optional end date filter (YYYY-MM-DD)
 
-**Returns:** None (sets module-level `_PRICES_DICT`)
+**Returns:** Dict mapping `"ticker|field|date"` keys to values
 
-#### `set_prices_dict(prices_dict)`
+##### `set_prices_dict(prices_dict)`
 
-Set the prices dict directly (alternative to `load_all_prices`).
+Set the module-level prices dict directly (alternative to `load_all_prices`).
 
 ```python
 from specparser.amt import set_prices_dict
@@ -484,32 +493,39 @@ set_prices_dict(prices)
 **Parameters:**
 - `prices_dict`: Dict mapping `"ticker|field|date"` keys to values, or `None` to clear
 
-#### `get_price(prices_dict, ticker, field, date_str)`
+##### `get_price(prices_dict, ticker, field, date_str)`
 
 Get a single price from a prices dict.
 
 ```python
 from specparser.amt import get_price, load_all_prices
 
-# After loading prices
-load_all_prices("data/prices.parquet")
-from specparser.amt.tickers import _PRICES_DICT
-
-value = get_price(_PRICES_DICT, "CL1 Comdty", "PX_LAST", "2024-01-15")
+prices_dict = load_all_prices("data/prices.parquet")
+value = get_price(prices_dict, "CL1 Comdty", "PX_LAST", "2024-01-15")
 # Returns: "75.50" or "none" if not found
 ```
 
-#### `clear_prices_dict()`
+##### `clear_prices_dict()`
 
 Clear the module-level prices dict.
 
 ```python
 from specparser.amt import clear_prices_dict
-
 clear_prices_dict()
 ```
 
-#### `prices_last(prices_parquet, pattern)`
+##### `clear_prices_connection_cache()`
+
+Clear the DuckDB connection cache (for prices queries).
+
+```python
+from specparser.amt import clear_prices_connection_cache
+clear_prices_connection_cache()
+```
+
+#### Query-Based Access
+
+##### `prices_last(prices_parquet, pattern)`
 
 Get the last price for tickers matching a pattern.
 
@@ -526,7 +542,7 @@ table = prices_last("data/prices.parquet", "CL.*Comdty")
 
 **Returns:** Table with the most recent price for each matching ticker
 
-#### `prices_query(prices_parquet, sql)`
+##### `prices_query(prices_parquet, sql)`
 
 Run an arbitrary SQL query on the prices parquet file.
 
@@ -549,11 +565,9 @@ table = prices_query("data/prices.parquet", """
 
 **Returns:** Table with query results
 
----
+#### Straddle Price Fetching
 
-### Straddle Price Functions
-
-#### `get_prices(underlying, year, month, i, path, chain_csv=None, prices_parquet=None)`
+##### `get_prices(underlying, year, month, i, path, chain_csv=None, prices_parquet=None)`
 
 Get daily prices for a straddle from entry to expiry (price lookup only, no action/strike columns).
 
@@ -576,7 +590,29 @@ table = get_prices("CL Comdty", 2024, 6, 0, "data/amt.yml", "data/futs.csv")
 
 **Returns:** Table with one row per day, columns for each price parameter
 
-#### `actions(prices_table, path)`
+---
+
+### Valuation Functions (valuation.py)
+
+The `valuation.py` module provides functions for computing actions (entry/expiry triggers), pricing models, and PnL calculations.
+
+#### Pipeline Overview
+
+```
+tickers.py          prices.py              valuation.py
+     │                   │                      │
+filter_tickers() ──────► get_prices() ────────► actions()
+                              │                      │
+                              │                      ▼
+                              │              get_straddle_actions()
+                              │                      │
+                              │                      ▼
+                              │              get_straddle_valuation()
+```
+
+#### Action Functions
+
+##### `actions(prices_table, path, overrides_csv=None)`
 
 Add action, model, and strike columns to a prices table.
 
@@ -592,10 +628,11 @@ table = actions(prices, "data/amt.yml")
 **Parameters:**
 - `prices_table`: Output from `get_prices()` - must have 'asset' and 'straddle' columns
 - `path`: Path to AMT YAML file
+- `overrides_csv`: Optional CSV with expiry override dates
 
 **Returns:** Table with added columns: action, model, strike_vol, strike, expiry
 
-#### `get_straddle_actions(underlying, year, month, i, path, chain_csv=None, prices_parquet=None, overrides_csv=None)`
+##### `get_straddle_actions(underlying, year, month, i, path, chain_csv=None, prices_parquet=None, overrides_csv=None)`
 
 Get daily prices for a straddle with full action/strike columns (convenience function).
 
@@ -609,7 +646,9 @@ table = get_straddle_actions("CL Comdty", 2024, 6, 0, "data/amt.yml", "data/futs
 
 This is equivalent to calling `get_prices()` followed by `actions()`.
 
-#### `get_straddle_valuation(underlying, year, month, i, path, chain_csv=None, prices_parquet=None)`
+#### Valuation Functions
+
+##### `get_straddle_valuation(underlying, year, month, i, path, chain_csv=None, prices_parquet=None, overrides_csv=None)`
 
 Get daily valuation (PnL) for a straddle.
 
@@ -627,6 +666,42 @@ table = get_straddle_valuation("CL Comdty", 2024, 6, 0, "data/amt.yml", "data/fu
 - `opnl`: Option PnL (change in mv)
 - `hpnl`: Hedge PnL
 - `pnl`: Total PnL (opnl + hpnl)
+
+#### Pricing Models
+
+##### `model_ES(row)`
+
+Expected shortfall pricing model for CDS-based assets.
+
+##### `model_NS(row)`
+
+Normal spread pricing model.
+
+##### `model_BS(row)`
+
+Black-Scholes pricing model.
+
+##### `MODEL_DISPATCH`
+
+Dict mapping model names to model functions:
+```python
+MODEL_DISPATCH = {
+    "CDS_ES": model_ES,
+    "NS": model_NS,
+    "BS": model_BS,
+}
+```
+
+#### Cache Management
+
+##### `clear_override_cache()`
+
+Clear the expiry override cache.
+
+```python
+from specparser.amt import clear_override_cache
+clear_override_cache()
+```
 
 ---
 
@@ -721,6 +796,29 @@ Example: `|2023-12|2024-01|N|0|OVERRIDE||33.3|`
 **Entry date calculation:**
 - `ntrc = "N"` (Near): Entry is 1 month before expiry
 - `ntrc = "F"` (Far): Entry is 2 months before expiry
+
+#### `find_straddle_yrs_u8m(path, start_year, end_year, pattern=".", live_only=True)`
+
+High-performance u8m (uint8 matrix) version of `find_straddle_yrs()`.
+
+```python
+from specparser.amt import find_straddle_yrs_u8m, straddles_u8m_to_strings
+
+# Get straddles as u8m (fastest)
+u8m_table = find_straddle_yrs_u8m("data/amt.yml", 2024, 2025)
+# Returns: {"orientation": "u8m", "columns": ["asset", "straddle"], "rows": [asset_u8m, straddle_u8m]}
+
+# Convert to strings if needed
+str_table = straddles_u8m_to_strings(u8m_table)
+```
+
+**Performance (LA Comdty 2001-2024, 2,304 straddles):**
+
+| Approach | Time | Speedup |
+|----------|------|---------|
+| Standard (`find_straddle_yrs`) | 4.25ms | 1.0x |
+| **u8m** (`find_straddle_yrs_u8m`) | **0.29ms** | **14.8x** |
+| u8m + string conversion | 2.14ms | 2.0x |
 
 #### `find_straddle_ym(path, year, month, pattern, live_only)`
 
@@ -873,6 +971,51 @@ Uses Numba-compiled kernels for date expansion. Approximately 10-100x faster tha
 **Returns:** Arrow-oriented table dict with columns: asset, straddle, date
 
 **Note:** Requires Numba to be installed. First call has JIT compilation overhead.
+
+#### `find_straddle_days_u8m(path, start_year, end_year, pattern=".", live_only=True, parallel=False)`
+
+Fastest implementation using u8m (uint8 matrix) format throughout the pipeline.
+
+```python
+from specparser.amt import find_straddle_days_u8m
+
+# Sequential version
+table = find_straddle_days_u8m("data/amt.yml", 2024, 2024)
+
+# Parallel version
+table = find_straddle_days_u8m("data/amt.yml", 2020, 2025, parallel=True)
+```
+
+Stays in uint8 matrix format throughout, avoiding Python string conversions until output is needed. This is the fastest approach when working with u8m data pipelines.
+
+**Parameters:**
+- Same as `find_straddle_days()`, plus:
+- `parallel`: If True, use parallel Numba kernel
+
+**Returns:** u8m-oriented table dict with columns: asset (uint8 matrix), straddle (uint8 matrix), date (int32 array of days since 1970-01-01)
+
+**Performance comparison (LA Comdty 2001-2024, 175,320 rows):**
+
+| Approach | Time (ms) | Speedup |
+|----------|-----------|---------|
+| Loop     | 7.54      | 1.0x    |
+| Arrow    | 5.07      | 1.5x    |
+| Numba    | 4.14      | 1.8x    |
+| **u8m**  | **3.75**  | **2.0x**|
+
+#### `straddle_days_u8m_to_arrow(table_u8m)`
+
+Convert u8m straddle days table to Arrow format for compatibility with existing code.
+
+```python
+from specparser.amt import find_straddle_days_u8m, straddle_days_u8m_to_arrow
+
+# Get u8m result
+u8m_table = find_straddle_days_u8m("data/amt.yml", 2024, 2024)
+
+# Convert to Arrow format
+arrow_table = straddle_days_u8m_to_arrow(u8m_table)
+```
 
 ---
 

@@ -216,6 +216,77 @@ def add_months2specs_inplace_NF(targets,sources,months):
             add_months_ym_inplace(target,source,2)
 
 @njit
+def sub_months2specs_inplace_NF(targets, sources, months):
+    """Subtract months from specs based on N/F code.
+
+    N = subtract 1 month (near month entry)
+    F = subtract 2 months (far month entry)
+
+    Used to compute entry date from expiry date.
+    """
+    for i in range(targets.shape[0]):
+        target = targets[i]
+        source = sources[i]
+        if months[i] == b'N'[0]:
+            add_months_ym_inplace(target, source, -1)
+        elif months[i] == b'F'[0]:
+            add_months_ym_inplace(target, source, -2)
+
+
+@njit(cache=True)
+def sub_months_vec(years, months, offsets):
+    """Vectorized: subtract offsets from year-month pairs.
+
+    Uses existing add_months() logic but vectorized over arrays.
+
+    Args:
+        years: int32 array of years
+        months: int32 array of months (1-12)
+        offsets: int32 array of month offsets to subtract
+
+    Returns:
+        out_years: int32 array of result years
+        out_months: int32 array of result months (1-12)
+    """
+    n = len(years)
+    out_years = np.empty(n, dtype=np.int32)
+    out_months = np.empty(n, dtype=np.int32)
+
+    for i in range(n):
+        # Reuse add_months with negative offset
+        out_years[i], out_months[i] = add_months(years[i], months[i], -offsets[i])
+
+    return out_years, out_months
+
+
+@njit(cache=True)
+def ntrc_to_offset_span(ntrc):
+    """Convert NTRC codes (uint8) to offset and span arrays.
+
+    N (ord 78) → offset=1, span=2
+    F (ord 70) → offset=2, span=3
+
+    Args:
+        ntrc: uint8 array of N/F codes
+
+    Returns:
+        offset: int32 array - months before expiry for entry
+        span: int32 array - total months to expand
+    """
+    n = len(ntrc)
+    offset = np.empty(n, dtype=np.int32)
+    span = np.empty(n, dtype=np.int32)
+    for i in range(n):
+        if ntrc[i] == 78:  # ord('N')
+            offset[i] = 1
+            span[i] = 2
+        else:  # F
+            offset[i] = 2
+            span[i] = 3
+    return offset, span
+
+
+@njit
 def make_ym_matrix(vals):
     starty, startm, endy, endm = vals
     """

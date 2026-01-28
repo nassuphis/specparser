@@ -6,18 +6,43 @@ Schedule expansion and straddle building utilities.
 
 Handles reading schedules from AMT files, expanding across year/month ranges,
 and packing into straddle strings.
+
+String-based functions:
+    get_schedule() - Get schedule for an asset as row-oriented table
+    find_schedules() - Find schedules matching pattern
+    find_straddle_yrs() - Expand schedules to straddle strings
+
+u8m (uint8 matrix) functions - Fast vectorized operations:
+    get_schedule_u8m() - Get schedule as u8m table (14.8x faster)
+    find_schedules_u8m() - Find schedules as u8m
+    find_straddle_yrs_u8m() - Expand schedules to u8m straddles
+    straddles_u8m_to_strings() - Convert u8m back to strings (2x faster end-to-end)
 """
 import hashlib
 import re
 from pathlib import Path
 from typing import Any, List
 import calendar
-import datetime 
+import datetime
 import itertools
-from . import loader 
-from . import _numba_kernels
+from . import loader
+from . import schedules_numba
 import numpy as np
+from numba import njit
 from .table import table_to_arrow, table_nrows, _import_pyarrow
+from .strings import (
+    strs2u8mat,
+    u8m2s,
+    make_ym_matrix,
+    sub_months2specs_inplace_NF,
+    ASCII_PIPE,
+    cartesian_product_np,
+    sep,
+    ntrc_to_offset_span,
+    sub_months_vec,
+    read_4digits,
+    read_2digits,
+)
 pa, pc = _import_pyarrow()
 
 # memoization
@@ -26,6 +51,7 @@ _MEMOIZE_ENABLED: bool = True
 
 # Forward declare caches (initialized later, referenced by clear_schedule_caches)
 _SCHEDULE_CACHE: dict = {}
+_SCHEDULE_U8M_CACHE: dict = {}
 _EXPAND_YM_CACHE: dict = {}
 _DAYS_YM_CACHE: dict = {}
 _STRADDLE_DAYS_CACHE: dict = {}
@@ -38,6 +64,7 @@ def set_memoize_enabled(enabled: bool) -> None:
 def clear_schedule_caches() -> None:
     """Clear all schedule-related caches."""
     _SCHEDULE_CACHE.clear()
+    _SCHEDULE_U8M_CACHE.clear()
     _EXPAND_YM_CACHE.clear()
     _DAYS_YM_CACHE.clear()
     _STRADDLE_DAYS_CACHE.clear()
@@ -170,6 +197,520 @@ def find_schedules(path: str | Path, pattern: str,live_only: bool = True) -> dic
         shedule=get_schedule(path,asset)["rows"]
         rows.extend(shedule)
     return { "orientation": "row", "columns": _SCHEDULE_COLUMNS, "rows": rows, }
+
+
+# -------------------------------------
+# u8m (uint8 matrix) schedule functions
+# -------------------------------------
+# These functions work with uint8 matrices instead of Python strings,
+# avoiding expensive string object creation until output is needed.
+
+_SCHEDULE_U8M_COLUMNS = ["asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
+
+
+def _schedule_to_u8m(underlying: str, schedule: list[str] | None) -> dict[str, Any]:
+    """Convert a schedule list to u8m format.
+
+    Returns dict with u8m columns:
+        - asset: (N, asset_width) uint8 matrix
+        - ntrc: (N, 1) uint8 matrix (N or F)
+        - ntrv: (N, ntrv_width) uint8 matrix
+        - xprc: (N, xprc_width) uint8 matrix
+        - xprv: (N, xprv_width) uint8 matrix
+        - wgt: (N, wgt_width) uint8 matrix
+
+    Note: schcnt/schid are not stored - they are only needed during _fix_schedule
+    which is called before this function.
+    """
+    # First get the string rows (reuse existing logic for fixing a/b/c/d values)
+    rows = _schedule_to_rows(underlying, schedule)
+
+    if not rows:
+        # Return empty u8m table
+        return {
+            "orientation": "u8m",
+            "columns": _SCHEDULE_U8M_COLUMNS,
+            "rows": [np.empty((0, 1), dtype=np.uint8) for _ in _SCHEDULE_U8M_COLUMNS],
+        }
+
+    # Extract columns (skip schcnt, schid at indices 0, 1)
+    # _SCHEDULE_COLUMNS = ["schcnt", "schid", "asset", "ntrc", "ntrv", "xprc", "xprv", "wgt"]
+    assets = [row[2] for row in rows]
+    ntrcs = [row[3] for row in rows]
+    ntrvs = [row[4] for row in rows]
+    xprcs = [row[5] for row in rows]
+    xprvs = [row[6] for row in rows]
+    wgts = [row[7] for row in rows]
+
+    # Convert to u8m (strs2u8mat auto-pads to max width)
+    asset_u8m = strs2u8mat(assets)
+    ntrc_u8m = strs2u8mat(ntrcs)
+    ntrv_u8m = strs2u8mat(ntrvs)
+    xprc_u8m = strs2u8mat(xprcs)
+    xprv_u8m = strs2u8mat(xprvs)
+    wgt_u8m = strs2u8mat(wgts)
+
+    return {
+        "orientation": "u8m",
+        "columns": _SCHEDULE_U8M_COLUMNS,
+        "rows": [asset_u8m, ntrc_u8m, ntrv_u8m, xprc_u8m, xprv_u8m, wgt_u8m],
+    }
+
+
+def get_schedule_nocache_u8m(path: str | Path, underlying: str) -> dict[str, Any]:
+    """Get schedule as u8m format (no caching)."""
+    data = loader.load_amt(path)
+    asset_data = loader.get_asset(path, underlying)
+    if not asset_data:
+        return {
+            "orientation": "u8m",
+            "columns": _SCHEDULE_U8M_COLUMNS,
+            "rows": [np.empty((0, 1), dtype=np.uint8) for _ in _SCHEDULE_U8M_COLUMNS],
+        }
+    schedule_name = asset_data.get("Options")
+    scheds = data.get("expiry_schedules", {})
+    schedule = scheds.get(schedule_name) if schedule_name else None
+    return _schedule_to_u8m(underlying, schedule)
+
+
+def get_schedule_u8m(path: str | Path, underlying: str) -> dict[str, Any]:
+    """Get schedule as u8m format (cached)."""
+    path_str = str(Path(path).resolve())
+    cache_key = (path_str, underlying)
+    if _MEMOIZE_ENABLED and cache_key in _SCHEDULE_U8M_CACHE:
+        return _SCHEDULE_U8M_CACHE[cache_key]
+    result = get_schedule_nocache_u8m(path, underlying)
+    if _MEMOIZE_ENABLED:
+        _SCHEDULE_U8M_CACHE[cache_key] = result
+    return result
+
+
+def _concat_schedule_u8m_tables(tables: list[dict[str, Any]]) -> dict[str, Any]:
+    """Concatenate multiple u8m schedule tables vertically.
+
+    Handles varying column widths by padding to the max width of each column.
+    """
+    if not tables:
+        return {
+            "orientation": "u8m",
+            "columns": _SCHEDULE_U8M_COLUMNS,
+            "rows": [np.empty((0, 1), dtype=np.uint8) for _ in _SCHEDULE_U8M_COLUMNS],
+        }
+
+    # Filter out empty tables
+    non_empty = [t for t in tables if t["rows"][0].shape[0] > 0]
+    if not non_empty:
+        return {
+            "orientation": "u8m",
+            "columns": _SCHEDULE_U8M_COLUMNS,
+            "rows": [np.empty((0, 1), dtype=np.uint8) for _ in _SCHEDULE_U8M_COLUMNS],
+        }
+
+    n_cols = len(_SCHEDULE_U8M_COLUMNS)
+    result_cols = []
+
+    for col_idx in range(n_cols):
+        # Get all column arrays for this column index
+        col_arrays = [t["rows"][col_idx] for t in non_empty]
+
+        # Find max width
+        max_width = max(arr.shape[1] for arr in col_arrays)
+
+        # Pad arrays to max width and concatenate
+        padded = []
+        for arr in col_arrays:
+            if arr.shape[1] < max_width:
+                # Pad with spaces on the right
+                pad_width = max_width - arr.shape[1]
+                arr = np.pad(arr, ((0, 0), (0, pad_width)), constant_values=ord(' '))
+            padded.append(arr)
+
+        result_cols.append(np.vstack(padded))
+
+    return {
+        "orientation": "u8m",
+        "columns": _SCHEDULE_U8M_COLUMNS,
+        "rows": result_cols,
+    }
+
+
+def find_schedules_u8m(path: str | Path, pattern: str, live_only: bool = True) -> dict[str, Any]:
+    """Find assets matching pattern and return schedules as u8m.
+
+    Returns dict with u8m columns concatenated from all matching assets.
+    """
+    assets = [asset for _, asset in loader._iter_assets(path, live_only=live_only, pattern=pattern)]
+    tables = [get_schedule_u8m(path, asset) for asset in assets]
+    return _concat_schedule_u8m_tables(tables)
+
+
+def _schedules_u8m2straddles_u8m(table_u8m: dict[str, Any], xpry: int, xprm: int) -> dict[str, Any]:
+    """Pack u8m schedules for a specific year/month into u8m straddles.
+
+    Takes a u8m schedule table and produces a u8m straddle table for the given
+    expiry year/month. Entry dates are computed from expiry using N/F offset.
+
+    Returns:
+        u8m table with columns ["asset", "straddle"]
+        straddle format: |YYYY-MM|YYYY-MM|ntrc|ntrv|xprc|xprv|wgt|
+    """
+    cols = table_u8m["columns"]
+    rows = table_u8m["rows"]
+    n = rows[0].shape[0]
+
+    if n == 0:
+        return {
+            "orientation": "u8m",
+            "columns": ["asset", "straddle"],
+            "rows": [np.empty((0, 1), dtype=np.uint8), np.empty((0, 1), dtype=np.uint8)],
+        }
+
+    # Get column indices
+    asset_idx = cols.index("asset")
+    ntrc_idx = cols.index("ntrc")
+    ntrv_idx = cols.index("ntrv")
+    xprc_idx = cols.index("xprc")
+    xprv_idx = cols.index("xprv")
+    wgt_idx = cols.index("wgt")
+
+    asset_u8m = rows[asset_idx]
+    ntrc_u8m = rows[ntrc_idx]
+    ntrv_u8m = rows[ntrv_idx]
+    xprc_u8m = rows[xprc_idx]
+    xprv_u8m = rows[xprv_idx]
+    wgt_u8m = rows[wgt_idx]
+
+    # Create expiry year-month matrix (same for all rows)
+    xpr_ym = make_ym_matrix((xpry, xprm, xpry, xprm))  # shape (1, 7)
+    xpr_ym_expanded = np.tile(xpr_ym, (n, 1))  # shape (n, 7)
+
+    # Create entry year-month matrix (computed from expiry using N/F offset)
+    # Entry = expiry - offset (N=1 month before, F=2 months before)
+    ntr_ym = np.empty((n, 7), dtype=np.uint8)
+    # Use the first byte of ntrc_u8m for N/F check
+    ntrc_first_byte = ntrc_u8m[:, 0] if ntrc_u8m.shape[1] > 0 else np.zeros(n, dtype=np.uint8)
+    sub_months2specs_inplace_NF(ntr_ym, xpr_ym_expanded, ntrc_first_byte)
+
+    # Build straddle: |ntr_ym|xpr_ym|ntrc|ntrv|xprc|xprv|wgt|
+    pipe = sep(b"|", n)  # (n, 1)
+    straddle_u8m = np.hstack([
+        pipe,
+        ntr_ym,
+        pipe,
+        xpr_ym_expanded,
+        pipe,
+        ntrc_u8m,
+        pipe,
+        ntrv_u8m,
+        pipe,
+        xprc_u8m,
+        pipe,
+        xprv_u8m,
+        pipe,
+        wgt_u8m,
+        pipe,
+    ])
+
+    return {
+        "orientation": "u8m",
+        "columns": ["asset", "straddle"],
+        "rows": [asset_u8m, straddle_u8m],
+    }
+
+
+def _schedules_u8m2straddle_yrs_u8m(
+    table_u8m: dict[str, Any],
+    start_year: int,
+    end_year: int
+) -> dict[str, Any]:
+    """Expand u8m schedules across year range into u8m straddles.
+
+    Uses cartesian product of schedule templates × year-months, then computes
+    entry dates from expiry dates using N/F offset.
+    """
+    cols = table_u8m["columns"]
+    rows = table_u8m["rows"]
+    n_templates = rows[0].shape[0]
+
+    if n_templates == 0:
+        return {
+            "orientation": "u8m",
+            "columns": ["asset", "straddle"],
+            "rows": [np.empty((0, 1), dtype=np.uint8), np.empty((0, 1), dtype=np.uint8)],
+        }
+
+    # Get column arrays
+    asset_idx = cols.index("asset")
+    ntrc_idx = cols.index("ntrc")
+    ntrv_idx = cols.index("ntrv")
+    xprc_idx = cols.index("xprc")
+    xprv_idx = cols.index("xprv")
+    wgt_idx = cols.index("wgt")
+
+    asset_u8m = rows[asset_idx]
+    ntrc_u8m = rows[ntrc_idx]
+    ntrv_u8m = rows[ntrv_idx]
+    xprc_u8m = rows[xprc_idx]
+    xprv_u8m = rows[xprv_idx]
+    wgt_u8m = rows[wgt_idx]
+
+    # Generate all year-months in range
+    xpr_ym = make_ym_matrix((start_year, 1, end_year, 12))  # shape (n_months, 7)
+    n_months = xpr_ym.shape[0]
+
+    # Cartesian product: expand templates × year-months
+    # Each template row is repeated n_months times
+    # Each year-month is tiled n_templates times
+    n_total = n_templates * n_months
+
+    # Expand template indices
+    template_indices = np.repeat(np.arange(n_templates), n_months)
+
+    # Expand all template columns using indices
+    asset_expanded = asset_u8m[template_indices]
+    ntrc_expanded = ntrc_u8m[template_indices]
+    ntrv_expanded = ntrv_u8m[template_indices]
+    xprc_expanded = xprc_u8m[template_indices]
+    xprv_expanded = xprv_u8m[template_indices]
+    wgt_expanded = wgt_u8m[template_indices]
+
+    # Tile year-months
+    xpr_ym_expanded = np.tile(xpr_ym, (n_templates, 1))
+
+    # Compute entry year-months from expiry using N/F offset
+    # Entry = expiry - offset (N=1 month before, F=2 months before)
+    ntr_ym = np.empty((n_total, 7), dtype=np.uint8)
+    ntrc_first_byte = ntrc_expanded[:, 0] if ntrc_expanded.shape[1] > 0 else np.zeros(n_total, dtype=np.uint8)
+    sub_months2specs_inplace_NF(ntr_ym, xpr_ym_expanded, ntrc_first_byte)
+
+    # Build straddle: |ntr_ym|xpr_ym|ntrc|ntrv|xprc|xprv|wgt|
+    pipe = sep(b"|", n_total)
+    straddle_u8m = np.hstack([
+        pipe,
+        ntr_ym,
+        pipe,
+        xpr_ym_expanded,
+        pipe,
+        ntrc_expanded,
+        pipe,
+        ntrv_expanded,
+        pipe,
+        xprc_expanded,
+        pipe,
+        xprv_expanded,
+        pipe,
+        wgt_expanded,
+        pipe,
+    ])
+
+    return {
+        "orientation": "u8m",
+        "columns": ["asset", "straddle"],
+        "rows": [asset_expanded, straddle_u8m],
+    }
+
+
+def find_straddle_yrs_u8m(
+    path: str | Path,
+    start_year: int,
+    end_year: int,
+    pattern: str = ".",
+    live_only: bool = True,
+) -> dict[str, Any]:
+    """Find all straddles as u8m matrices.
+
+    Returns:
+        u8m table with columns ["asset", "straddle"]
+    """
+    schedules = find_schedules_u8m(path, pattern=pattern, live_only=live_only)
+    return _schedules_u8m2straddle_yrs_u8m(schedules, start_year, end_year)
+
+
+def straddles_u8m_to_strings(table_u8m: dict[str, Any]) -> dict[str, Any]:
+    """Convert u8m straddle table to string table.
+
+    Uses u8m2s() from strings.py for efficient conversion.
+    """
+    asset_u8m = table_u8m["rows"][0]
+    straddle_u8m = table_u8m["rows"][1]
+
+    n = asset_u8m.shape[0]
+    if n == 0:
+        return {"orientation": "row", "columns": ["asset", "straddle"], "rows": []}
+
+    # Convert u8m to numpy string arrays, then to Python strings
+    assets = u8m2s(asset_u8m)
+    straddles = u8m2s(straddle_u8m)
+
+    # Build rows with stripped strings
+    # For straddles, also strip spaces around pipes (from fixed-width padding)
+    def clean_straddle(s):
+        # Split on pipes, strip each part, rejoin
+        parts = s.split('|')
+        return '|'.join(p.strip() for p in parts)
+
+    rows = [[a.strip(), clean_straddle(s)] for a, s in zip(assets.tolist(), straddles.tolist())]
+    return {"orientation": "row", "columns": ["asset", "straddle"], "rows": rows}
+
+
+# -------------------------------------
+# u8m straddle days expansion
+# -------------------------------------
+# Expand straddles to daily rows using u8m format throughout.
+
+@njit(cache=True)
+def _parse_straddle_u8m_xpr(straddle_u8m):
+    """Extract expiry year, month, and ntrc from straddle u8m matrix.
+
+    Straddle format: |YYYY-MM|YYYY-MM|N|...|
+                      ^      ^       ^
+                      1      9       17
+    Positions:
+        - Entry year: 1-4 (derived, not parsed here)
+        - Entry month: 6-7 (derived, not parsed here)
+        - Expiry year: 9-12 ← **parsed**
+        - Expiry month: 14-15 ← **parsed**
+        - NTRC: 17 ← **parsed**
+
+    Returns:
+        xpry: int32 array of expiry years
+        xprm: int32 array of expiry months (1-12)
+        ntrc: uint8 array of ntrc codes (ord('N')=78 or ord('F')=70)
+
+    Note: Entry is derived from expiry - ntrc_offset, not parsed directly.
+    """
+    n = straddle_u8m.shape[0]
+    xpry = np.empty(n, dtype=np.int32)
+    xprm = np.empty(n, dtype=np.int32)
+    ntrc = np.empty(n, dtype=np.uint8)
+
+    for i in range(n):
+        row = straddle_u8m[i]
+        # Expiry year at position 9-12
+        xpry[i] = read_4digits(row, 9)
+        # Expiry month at position 14-15
+        xprm[i] = read_2digits(row, 14)
+        # NTRC code at position 17
+        ntrc[i] = row[17]
+
+    return xpry, xprm, ntrc
+
+
+def find_straddle_days_u8m(
+    path: str | Path,
+    start_year: int,
+    end_year: int,
+    pattern: str = ".",
+    live_only: bool = True,
+    parallel: bool = False,
+) -> dict[str, Any]:
+    """Expand straddles to daily rows using u8m format.
+
+    This is the fastest implementation for large datasets when working
+    with u8m data throughout the pipeline.
+
+    Uses expiry + ntrc as source of truth, derives entry for expansion.
+
+    Args:
+        path: Path to AMT YAML file
+        start_year: Start year for straddles
+        end_year: End year for straddles
+        pattern: Regex pattern to filter assets
+        live_only: Only include live straddles
+        parallel: If True, use parallel kernel (best for millions+ output rows)
+
+    Returns:
+        Table with columns ["asset", "straddle", "date"]
+        - asset: u8m matrix (n_days, asset_width) uint8
+        - straddle: u8m matrix (n_days, straddle_width) uint8
+        - date: int32 array (n_days,) - days since 1970-01-01
+    """
+    # Step 1: Get u8m straddles
+    straddles = find_straddle_yrs_u8m(path, start_year, end_year, pattern, live_only)
+
+    asset_u8m = straddles["rows"][0]
+    straddle_u8m = straddles["rows"][1]
+    n = asset_u8m.shape[0]
+
+    if n == 0:
+        return {
+            "orientation": "u8m",
+            "columns": ["asset", "straddle", "date"],
+            "rows": [
+                np.empty((0, 1), dtype=np.uint8),
+                np.empty((0, 1), dtype=np.uint8),
+                np.empty(0, dtype=np.int32),
+            ],
+        }
+
+    # Step 2: Parse EXPIRY year/month + ntrc from straddle u8m (expiry is the anchor)
+    xpry, xprm, ntrc_codes = _parse_straddle_u8m_xpr(straddle_u8m)
+
+    # Step 3: Compute offset and span from ntrc using strings.py helper
+    offset, month_span = ntrc_to_offset_span(ntrc_codes)
+
+    # Step 4: Derive ENTRY from expiry - offset using strings.py helper
+    ntry, ntrm = sub_months_vec(xpry, xprm, offset)
+
+    # Step 5: Run numba date expansion kernel (starts from entry, expands span months)
+    if parallel:
+        date32, parent_idx = schedules_numba.expand_months_to_date32_parallel(
+            ntry, ntrm, month_span
+        )
+    else:
+        date32, parent_idx = schedules_numba.expand_months_to_date32(
+            ntry, ntrm, month_span
+        )
+
+    # Step 6: Expand asset and straddle columns using numpy fancy indexing
+    expanded_asset = asset_u8m[parent_idx]
+    expanded_straddle = straddle_u8m[parent_idx]
+
+    return {
+        "orientation": "u8m",
+        "columns": ["asset", "straddle", "date"],
+        "rows": [expanded_asset, expanded_straddle, date32],
+        "parent_idx": parent_idx,  # Maps each day back to source straddle index
+    }
+
+
+def straddle_days_u8m_to_arrow(table_u8m: dict[str, Any]) -> dict[str, Any]:
+    """Convert u8m straddle days table to Arrow format.
+
+    Use this when you need Arrow-format output for downstream Arrow operations
+    or for compatibility with existing code expecting Arrow tables.
+    """
+    asset_u8m = table_u8m["rows"][0]
+    straddle_u8m = table_u8m["rows"][1]
+    date32 = table_u8m["rows"][2]
+
+    n = asset_u8m.shape[0]
+    if n == 0:
+        return {
+            "orientation": "arrow",
+            "columns": ["asset", "straddle", "date"],
+            "rows": [pa.array([]), pa.array([]), pa.array([], type=pa.date32())],
+        }
+
+    # Convert u8m to string arrays
+    assets = u8m2s(asset_u8m)
+    straddles = u8m2s(straddle_u8m)
+
+    # Clean straddle strings (strip spaces around pipes)
+    def clean_straddle(s):
+        parts = s.split('|')
+        return '|'.join(p.strip() for p in parts)
+
+    return {
+        "orientation": "arrow",
+        "columns": ["asset", "straddle", "date"],
+        "rows": [
+            pa.array([a.strip() for a in assets.tolist()]),
+            pa.array([clean_straddle(s) for s in straddles.tolist()]),
+            pa.array(date32, type=pa.date32()),
+        ],
+    }
+
 
 # -------------------------------------
 # Straddle string parsing
@@ -856,11 +1397,11 @@ def find_straddle_days_numba(
 
     # Step 3: Run Numba kernel
     if parallel:
-        date32, parent_idx = _numba_kernels.expand_months_to_date32_parallel(
+        date32, parent_idx = schedules_numba.expand_months_to_date32_parallel(
             year_np, month_np, month_count_np
         )
     else:
-        date32, parent_idx = _numba_kernels.expand_months_to_date32(
+        date32, parent_idx = schedules_numba.expand_months_to_date32(
             year_np, month_np, month_count_np
         )
 

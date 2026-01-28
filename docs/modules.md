@@ -21,8 +21,11 @@ src/specparser/
 │   ├── __init__.py      # Re-exports all public functions
 │   ├── __main__.py      # CLI entry point
 │   ├── loader.py        # Loading, caching, asset queries
-│   ├── tickers.py       # Ticker extraction and expansion
-│   ├── schedules.py     # Schedule expansion and straddle building
+│   ├── schedules.py     # Schedule expansion and straddle building (uses loader)
+│   ├── tickers.py       # Ticker extraction and transformation (pure)
+│   ├── prices.py        # Price fetching, caching, DB access
+│   ├── valuation.py     # Actions, models, PnL calculations
+│   ├── table.py         # Table manipulation utilities
 │   └── chain.py         # Futures ticker normalization
 └── storage.py           # DuckDB/Parquet storage utilities
 ```
@@ -273,71 +276,98 @@ The `chain` module has its own state (`chain_state.py`) separate from the expand
 
 Process AMT (Asset Management Table) YAML files for expiry schedules.
 
-The AMT module is structured as a subpackage:
-- `loader.py` - Loading, caching, and asset queries
-- `tickers.py` - Ticker extraction, price lookup, and straddle processing
-- `asset_straddle_tickers.py` - Straddle-specific ticker extraction (vol/hedge)
-- `schedules.py` - Schedule expansion and straddle building
-- `chain.py` - Futures ticker normalization (normalized ↔ actual BBG tickers)
-- `table.py` - Table manipulation utilities (row/column/arrow orientations)
-- `_numba_kernels.py` - Numba JIT-compiled date expansion kernels
+The AMT module is structured as a subpackage with clear dependency layers:
 
-**Key exports:**
+**Base modules:**
+- `loader.py` - Loading, caching, and asset queries
+- `table.py` - Table manipulation utilities (row/column/arrow orientations)
+- `chain.py` - Futures ticker normalization (normalized ↔ actual BBG tickers)
+
+**Schedule module (depends on loader):**
+- `schedules.py` - Schedule expansion and straddle building
+
+**Ticker module (depends on loader, schedules, chain):**
+- `tickers.py` - Pure ticker extraction and transformation
+
+**Price module (depends on tickers, schedules, chain):**
+- `prices.py` - Price fetching, caching, DuckDB access
+
+**Valuation module (depends on prices, schedules, loader):**
+- `valuation.py` - Actions, pricing models, PnL calculations
+
+**Other modules:**
+- `asset_straddle_tickers.py` - Straddle-specific ticker extraction (vol/hedge)
+- `schedules_numba.py` - Numba JIT-compiled date expansion kernels (calendar helpers, date expansion)
+- `valuation_numba.py` - Numba JIT-compiled backtest/valuation kernels (pricing models, PnL computation)
+
+**Dependency graph:**
+```
+                  loader
+                    │
+      ┌─────────────┼─────────────┐
+      ▼             ▼             ▼
+ schedules ────► tickers      table.py
+      │             │
+      └──────┬──────┘
+             │
+             ▼
+         prices.py
+             │
+             ▼
+       valuation.py
+```
+
+**Key exports (organized by module):**
+
 ```python
 from specparser.amt import (
-    # Loading and caching
-    load_amt, clear_cache, clear_ticker_caches, clear_schedule_caches,
-    clear_days_cache, clear_calendar_cache,
-
-    # Value extraction
+    # === loader.py: Loading and caching ===
+    load_amt, clear_cache,
     get_value, get_aum, get_leverage,
-
-    # Asset queries
     get_asset, find_assets, cached_assets,
+    get_table, format_table, print_table,
+    # Asset tables
+    assets, asset_class, asset_table, asset_group,
 
-    # Table utilities
-    get_table, table_column, table_to_columns, table_to_rows, table_to_arrow,
+    # === table.py: Table utilities ===
+    table_column, table_to_columns, table_to_rows, table_to_arrow,
     table_orientation, table_nrows, table_validate, table_select_columns,
     table_add_column, table_drop_columns, table_bind_rows, table_unique_rows,
     table_head, table_sample, table_replace_value, table_stack_cols,
     table_left_join, table_inner_join, table_unchop, table_chop,
-    table_explode_arrow, table_pivot_wider, table_lag, table_lead,
-    format_table, print_table,
-
-    # Asset tables
-    assets, asset_class, asset_table, asset_group,
-
-    # Ticker extraction
-    get_tschemas, find_tschemas, get_tickers_ym, find_tickers, find_tickers_ym,
-    fut_spec2ticker, filter_tickers,
-
-    # Futures chain (normalized ↔ actual ticker mapping)
-    fut_norm2act, fut_act2norm, clear_chain_caches,
-
-    # Price functions
-    load_all_prices, set_prices_dict, get_price, clear_prices_dict,
-    prices_last, prices_query,
-
-    # Straddle price/action functions
-    get_prices, actions, get_straddle_actions,
-    get_straddle_valuation,
-
-    # Schedule processing
-    get_schedule, get_schedule_count, find_schedules,
-
-    # Schedule expansion (returns straddle strings)
-    find_straddle_yrs, find_straddle_ym, get_straddle_yrs, get_expand_ym,
-
-    # Straddle day functions
-    straddle_days, count_straddle_days, count_straddles_days,
-    find_straddle_days, find_straddle_days_arrow, find_straddle_days_numba,
-
-    # Straddle parsing helpers
-    ntr, ntry, ntrm, xpr, xpry, xprm, ntrc, ntrv, xprc, xprv, wgt,
-
+    table_explode_arrow, table_pivot_wider, table_lag, table_lead, show_table,
     # Arrow compute functions (60+ functions for vectorized operations)
     table_add_arrow, table_subtract_arrow, table_multiply_arrow,
     table_cumsum_arrow, table_filter_arrow, table_summarize_arrow, # etc.
+
+    # === chain.py: Futures ticker normalization ===
+    fut_norm2act, fut_act2norm, clear_chain_caches,
+
+    # === schedules.py: Schedule processing ===
+    get_schedule, get_schedule_count, find_schedules, clear_schedule_caches,
+    clear_days_cache, clear_calendar_cache,
+    # Schedule expansion (returns straddle strings)
+    find_straddle_yrs, find_straddle_ym, get_straddle_yrs, get_expand_ym,
+    # Straddle day functions
+    straddle_days, count_straddle_days, count_straddles_days,
+    find_straddle_days, find_straddle_days_arrow, find_straddle_days_numba,
+    # Straddle parsing helpers
+    ntr, ntry, ntrm, xpr, xpry, xprm, ntrc, ntrv, xprc, xprv, wgt,
+
+    # === tickers.py: Ticker extraction (pure) ===
+    get_tschemas, find_tschemas, get_tickers_ym, find_tickers, find_tickers_ym,
+    fut_spec2ticker, filter_tickers, clear_ticker_caches,
+
+    # === prices.py: Price data access ===
+    load_all_prices, set_prices_dict, get_price, clear_prices_dict,
+    clear_prices_connection_cache,
+    prices_last, prices_query,
+    get_prices,  # High-level price fetching for straddles
+
+    # === valuation.py: Actions and valuation ===
+    actions, get_straddle_actions, get_straddle_valuation,
+    clear_override_cache,
+    model_ES, model_NS, model_BS, MODEL_DISPATCH,
 )
 ```
 

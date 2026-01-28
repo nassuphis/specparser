@@ -22,6 +22,20 @@ _MEMOIZE_ENABLED: bool = True
 _NORMALIZED_CACHE: dict[str, dict[str, str]] = {}
 # Cache for actual to normalized futures mapping (reverse)
 _ACTUAL_CACHE: dict[str, dict[str, str]] = {}
+# Cache for resolved paths (Path.resolve() is expensive - ~14μs per call)
+_PATH_RESOLVE_CACHE: dict[str, str] = {}
+
+
+def _resolve_path(csv_path: str | Path) -> str:
+    """Resolve path with caching to avoid expensive Path.resolve() calls.
+
+    Path.resolve() costs ~14μs per call. With 462K calls in a backtest,
+    this adds ~7 seconds. Caching reduces this to ~0.03s.
+    """
+    key = str(csv_path)
+    if key not in _PATH_RESOLVE_CACHE:
+        _PATH_RESOLVE_CACHE[key] = str(Path(csv_path).resolve())
+    return _PATH_RESOLVE_CACHE[key]
 
 
 def set_memoize_enabled(enabled: bool) -> None:
@@ -34,6 +48,7 @@ def clear_chain_caches() -> None:
     """Clear all chain-related caches."""
     _NORMALIZED_CACHE.clear()
     _ACTUAL_CACHE.clear()
+    _PATH_RESOLVE_CACHE.clear()
 
 
 def fut_norm2act(csv_path: str | Path, ticker: str) -> str | None:
@@ -56,7 +71,7 @@ def fut_norm2act(csv_path: str | Path, ticker: str) -> str | None:
         >>> actual = normalized2actual("data/current_bbg_chain_data.csv", "LAF2025 Comdty")
         >>> actual  # Returns actual ticker or None
     """
-    csv_path = str(Path(csv_path).resolve())
+    csv_path = _resolve_path(csv_path)
 
     # Load and cache the CSV if not already cached
     if csv_path not in _NORMALIZED_CACHE:
@@ -89,7 +104,7 @@ def fut_act2norm(csv_path: str | Path, ticker: str) -> str | None:
     Returns:
         The normalized ticker if found, or None if not found
     """
-    csv_path = str(Path(csv_path).resolve())
+    csv_path = _resolve_path(csv_path)
 
     # Load and cache the reverse mapping if not already cached
     if csv_path not in _ACTUAL_CACHE:

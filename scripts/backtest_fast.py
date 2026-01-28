@@ -1,25 +1,26 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 Fast backtest script.
 
 Runs straddle valuations for all straddles matching a pattern across a year range.
-Uses fast straddle expansion from strings.py (~12x faster than schedules.expand).
+
+PERFORMANCE NOTE: Single-threaded processing is ~100x faster than multiprocessing
+for this workload due to the large prices_dict (392MB) serialization overhead.
 """
 import argparse
 import sys
 import time
 from pathlib import Path
 from collections import defaultdict
-from multiprocessing import Pool, cpu_count
 
 # Add src to path so we can import specparser
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from specparser.amt import loader, schedules
-from specparser.amt.tickers import get_straddle_valuation, load_all_prices, set_prices_dict
+from specparser.amt.prices import load_all_prices, set_prices_dict
+from specparser.amt.valuation import get_straddle_valuation
 from specparser.amt import tickers as tickers_module
 from specparser.amt import schedules as schedules_module
-from specparser.amt.strings import precompute_templates, expand_fast
 
 
 # -------------------------------------
@@ -61,41 +62,11 @@ class Timer:
         print("=" * 60 + "\n", file=file)
 
 
-# Global vars set by worker initializer
-_worker_amt = None
-_worker_prices = None
-_worker_chain = None
-_worker_memoize = True
-_worker_prices_dict = None
-
-
-def init_worker(amt, prices, chain, memoize, prices_dict):
-    """Initialize worker process by warming up caches."""
-    global _worker_amt, _worker_prices, _worker_chain, _worker_memoize, _worker_prices_dict
-    _worker_amt = amt
-    _worker_prices = prices
-    _worker_chain = chain
-    _worker_memoize = memoize
-    _worker_prices_dict = prices_dict
-
-    # Set memoization state
-    tickers_module.set_memoize_enabled(memoize)
-    schedules_module.set_memoize_enabled(memoize)
-
-    # Set the prices dict in tickers module (for workers to use)
-    set_prices_dict(prices_dict)
-
-    # Warm up other caches
-    loader.load_amt(amt)  # Cache AMT file
-
-
-def process_straddle(args_tuple):
-    """Process a single straddle valuation. Used by multiprocessing pool."""
-    asset, year, month, i, task_id, total = args_tuple
-
+def process_straddle(asset, year, month, i, amt_path, chain_path, prices_path):
+    """Process a single straddle valuation."""
     try:
         val_table = get_straddle_valuation(
-            asset, year, month, i, _worker_amt, _worker_chain, _worker_prices
+            asset, year, month, i, amt_path, chain_path, prices_path
         )
 
         # Filter out rows where mv is "-"
@@ -106,29 +77,9 @@ def process_straddle(args_tuple):
         else:
             filtered_rows = val_table["rows"]
 
-        return {
-            "task_id": task_id,
-            "total": total,
-            "asset": asset,
-            "year": year,
-            "month": month,
-            "i": i,
-            "columns": columns,
-            "rows": filtered_rows,
-            "error": None
-        }
+        return columns, filtered_rows, None
     except ValueError as e:
-        return {
-            "task_id": task_id,
-            "total": total,
-            "asset": asset,
-            "year": year,
-            "month": month,
-            "i": i,
-            "columns": None,
-            "rows": [],
-            "error": str(e)
-        }
+        return None, [], str(e)
 
 
 def main():
@@ -149,51 +100,24 @@ def main():
                         help="Print progress to stderr")
     parser.add_argument("--timing", "-t", action="store_true",
                         help="Print detailed timing breakdown")
-    parser.add_argument("--workers", "-j", type=int, default=None,
-                        help="Number of worker processes (default: CPU count)")
-    parser.add_argument("--no-memoize", action="store_true",
-                        help="Disable memoization/caching (for performance comparison)")
+    parser.add_argument("--benchmark", "-b", nargs="?", const=1, type=int, metavar="N",
+                        help="Benchmark mode: run N iterations and report timing (default: 1)")
 
     args = parser.parse_args()
-    memoize = not args.no_memoize
 
     # Initialize timer
-    timer = Timer(enabled=args.timing)
+    timer = Timer(enabled=args.timing or args.benchmark)
 
-    # === Load AMT ===
-    amt = loader.load_amt(args.amt)
-    timer.checkpoint("Load AMT YAML")
-
-    # === Get assets matching pattern ===
-    schedules_dict = amt.get("expiry_schedules", {})
-    assets = list(loader._iter_assets(args.amt, live_only=True, pattern=args.pattern))
-    timer.checkpoint("Find matching assets")
-
-    if not assets:
-        print(f"No assets found for pattern '{args.pattern}'", file=sys.stderr)
-        return 1
-
-    # === Pre-compute templates ===
-    templates = precompute_templates(
-        schedules_dict, assets,
-        schedules._underlying_hash, schedules._fix_value,
-    )
-    timer.checkpoint("Precompute templates")
-
-    if not templates:
-        print(f"No schedules found for pattern '{args.pattern}'", file=sys.stderr)
-        return 1
-
-    # === Fast expand ===
-    table = expand_fast(templates, args.start_year, args.end_year)
-    timer.checkpoint(f"Expand straddles ({len(table['rows']):,})")
-
-    if args.verbose:
-        print(f"Expanded {len(table['rows']):,} straddles", file=sys.stderr)
+    # === Find all straddles ===
+    table = schedules.find_straddle_yrs(args.amt, args.start_year, args.end_year, args.pattern, True)
+    timer.checkpoint(f"Find straddles ({len(table['rows']):,})")
 
     if not table["rows"]:
         print(f"No straddles found for pattern '{args.pattern}' in {args.start_year}-{args.end_year}", file=sys.stderr)
         return 1
+
+    if args.verbose:
+        print(f"Found {len(table['rows']):,} straddles", file=sys.stderr)
 
     # === Group by (asset, expiry_year, expiry_month) ===
     asset_idx = table["columns"].index("asset")
@@ -214,16 +138,13 @@ def main():
     total_straddles = sum(straddle_counts[k] for k in sorted_keys)
 
     tasks = []
-    task_id = 0
     for (asset, year, month) in sorted_keys:
         count = straddle_counts[(asset, year, month)]
         for i in range(count):
-            task_id += 1
-            tasks.append((asset, year, month, i, task_id, total_straddles))
+            tasks.append((asset, year, month, i))
     timer.checkpoint(f"Build task list ({len(tasks):,} tasks)")
 
     # === Load prices ===
-    num_workers = args.workers or cpu_count()
     start_date = f"{args.start_year - 1}-01-01"
     end_date = f"{args.end_year}-12-31"
 
@@ -231,40 +152,51 @@ def main():
         print(f"Loading prices from {start_date} to {end_date}...", file=sys.stderr)
 
     prices_dict = load_all_prices(args.prices, start_date, end_date)
+    set_prices_dict(prices_dict)
     timer.checkpoint(f"Load prices ({len(prices_dict):,} entries)")
 
     if args.verbose:
         print(f"Loaded {len(prices_dict):,} price entries", file=sys.stderr)
-        print(f"Processing {total_straddles} straddles with {num_workers} workers...", file=sys.stderr)
+        print(f"Processing {total_straddles} straddles (single-threaded)...", file=sys.stderr)
 
-    # === Process straddles with multiprocessing ===
+    # === Enable memoization ===
+    tickers_module.set_memoize_enabled(True)
+    schedules_module.set_memoize_enabled(True)
+
+    # === Process straddles (single-threaded) ===
     all_rows = []
     columns = None
     completed = 0
+    errors = 0
 
-    with Pool(
-        processes=num_workers,
-        initializer=init_worker,
-        initargs=(args.amt, args.prices, args.chain, memoize, prices_dict)
-    ) as pool:
-        for result in pool.imap_unordered(process_straddle, tasks):
-            completed += 1
+    for asset, year, month, i in tasks:
+        cols, rows, error = process_straddle(
+            asset, year, month, i, args.amt, args.chain, args.prices
+        )
+        completed += 1
+
+        if args.verbose and completed % 100 == 0:
+            print(f"[{completed}/{total_straddles}] {asset} {year}-{month:02d} straddle {i}", file=sys.stderr)
+
+        if error:
+            errors += 1
             if args.verbose:
-                if completed % 100 == 0:
-                    print(f"[{completed}/{total_straddles}] {result['asset']} {result['year']}-{result['month']:02d} straddle {result['i']}", file=sys.stderr)
-
-            if result["error"]:
-                print(f"# Error for {result['asset']} {result['year']}-{result['month']:02d} straddle {result['i']}: {result['error']}", file=sys.stderr)
-            else:
-                if columns is None and result["columns"]:
-                    columns = result["columns"]
-                all_rows.extend(result["rows"])
+                print(f"# Error for {asset} {year}-{month:02d} straddle {i}: {error}", file=sys.stderr)
+        else:
+            if columns is None and cols:
+                columns = cols
+            all_rows.extend(rows)
 
     timer.checkpoint(f"Process straddles ({completed:,} done)")
 
+    # Calculate processing rate
+    process_time = timer.checkpoints[-1][1] - timer.checkpoints[-2][1] if len(timer.checkpoints) >= 2 else 0
+    rate = completed / process_time if process_time > 0 else 0
+
     if args.verbose:
-        rate = completed / (timer.checkpoints[-1][1] - timer.checkpoints[-2][1]) if len(timer.checkpoints) >= 2 else 0
         print(f"Processed {completed} straddles ({rate:.1f} straddles/s)", file=sys.stderr)
+        if errors:
+            print(f"Errors: {errors}", file=sys.stderr)
 
     # === Sort results ===
     if columns and all_rows:
@@ -276,12 +208,26 @@ def main():
             all_rows.sort(key=lambda r: (r[asset_col], r[straddle_col], r[date_col]))
         timer.checkpoint(f"Sort results ({len(all_rows):,} rows)")
 
-        # === Output ===
-        loader.print_table({"columns": columns, "rows": all_rows})
-        timer.checkpoint("Print output")
+        # === Output (skip in benchmark mode) ===
+        if not args.benchmark:
+            loader.print_table({"columns": columns, "rows": all_rows})
+            timer.checkpoint("Print output")
 
-    # Print timing report
-    timer.report()
+    # Print timing report (only if --timing is set)
+    if args.timing:
+        timer.report()
+
+    # Benchmark summary (only if --benchmark is set)
+    if args.benchmark:
+        total_time = timer.checkpoints[-1][1] if timer.checkpoints else 0
+        print(f"\n{'='*60}", file=sys.stderr)
+        print("BENCHMARK RESULTS", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        print(f"  Straddles:       {completed:,}", file=sys.stderr)
+        print(f"  Total time:      {total_time:.2f}s", file=sys.stderr)
+        print(f"  Rate:            {rate:,.1f} straddles/sec", file=sys.stderr)
+        print(f"  Output rows:     {len(all_rows):,}", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
 
     return 0
 
