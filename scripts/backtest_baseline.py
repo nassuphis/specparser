@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 """
-Fast backtest script.
+Baseline backtest script.
 
 Runs straddle valuations for all straddles matching a pattern across a year range.
+Uses the per-straddle get_straddle_valuation() approach with dict lookups.
 
-PERFORMANCE NOTE: Single-threaded processing is ~100x faster than multiprocessing
-for this workload due to the large prices_dict (392MB) serialization overhead.
+THIS IS THE BASELINE - DO NOT OPTIMIZE.
+Use backtest.py or backtest_new.py for optimized batch processing.
 """
 import argparse
 import sys
