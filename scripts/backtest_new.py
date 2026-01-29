@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from specparser.amt.prices import load_prices_numba, clear_prices_numba
-from specparser.amt.valuation import get_straddle_backtests
+from specparser.amt.valuation_numba import get_straddle_backtests_numba
 
 
 # -------------------------------------
@@ -71,8 +71,6 @@ def main():
 
     parser.add_argument("--amt", default="data/amt.yml",
                         help="Path to AMT YAML file (default: data/amt.yml)")
-    parser.add_argument("--chain", default="data/futs.csv",
-                        help="Path to futures chain CSV (default: data/futs.csv)")
     parser.add_argument("--prices", default="data/prices.parquet",
                         help="Path to prices parquet file (default: data/prices.parquet)")
     parser.add_argument("--overrides", default="data/overrides.csv",
@@ -111,23 +109,21 @@ def main():
         print("Warming up Numba JIT...", file=sys.stderr)
 
     # Small warmup run to compile the kernel
-    _ = get_straddle_backtests(
+    _ = get_straddle_backtests_numba(
         args.pattern, args.start_year, args.start_year,
-        args.amt, args.chain, args.prices,
-        price_lookup='numba_sorted_kernel', valid_only=True,
-        overrides_path=args.overrides,
+        args.amt, args.prices,
+        valid_only=True, overrides_path=args.overrides,
     )
     timer.checkpoint("JIT warmup")
 
-    # === Run backtest with numba_sorted_kernel (full unified kernel) ===
+    # === Run backtest with Numba (full unified kernel) ===
     if args.verbose:
         print(f"Running backtest for pattern '{args.pattern}' {args.start_year}-{args.end_year}...", file=sys.stderr)
 
-    result = get_straddle_backtests(
+    result = get_straddle_backtests_numba(
         args.pattern, args.start_year, args.end_year,
-        args.amt, args.chain, args.prices,
-        price_lookup='numba_sorted_kernel', valid_only=True,
-        overrides_path=args.overrides,
+        args.amt, args.prices,
+        valid_only=True, overrides_path=args.overrides,
     )
     # Get row count for checkpoint message
     if hasattr(result, 'num_rows'):

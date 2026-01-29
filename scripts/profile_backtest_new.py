@@ -98,7 +98,6 @@ def main():
     parser.add_argument("start_year", type=int, help="Start year")
     parser.add_argument("end_year", type=int, help="End year")
     parser.add_argument("--amt", default="data/amt.yml")
-    parser.add_argument("--chain", default="data/futs.csv")
     parser.add_argument("--prices", default="data/prices.parquet")
     parser.add_argument("--overrides", default="data/overrides.csv")
     args = parser.parse_args()
@@ -132,14 +131,13 @@ def main():
     # =========================================================================
     timer.start_phase("Phase 2: JIT Warmup")
 
-    from specparser.amt.valuation import get_straddle_backtests
+    from specparser.amt.valuation_numba import get_straddle_backtests_numba
 
     # Small warmup run
-    _ = get_straddle_backtests(
+    _ = get_straddle_backtests_numba(
         args.pattern, args.start_year, args.start_year,
-        args.amt, args.chain, args.prices,
-        price_lookup='numba_sorted_kernel', valid_only=True,
-        overrides_path=args.overrides,
+        args.amt, args.prices,
+        valid_only=True, overrides_path=args.overrides,
     )
 
     timer.end_phase()
@@ -162,7 +160,7 @@ def main():
     asset_u8m = straddle_days_table["rows"][0]
     straddle_u8m = straddle_days_table["rows"][1]
     dates = straddle_days_table["rows"][2]
-    parent_idx = straddle_days_table["parent_idx"]
+    straddle_id = straddle_days_table["rows"][3]  # maps each day to source straddle
 
     n_days = len(dates)
     print(f"Expanded: {n_days:,} days", file=sys.stderr)
@@ -170,8 +168,8 @@ def main():
     timer.sub_phase("Extract arrays")
 
     # Compute straddle_starts and straddle_lengths
-    from specparser.amt.valuation import _compute_starts_lengths_from_parent_idx
-    straddle_starts, straddle_lengths = _compute_starts_lengths_from_parent_idx(parent_idx)
+    from specparser.amt.valuation_numba import _compute_starts_lengths_from_parent_idx
+    straddle_starts, straddle_lengths = _compute_starts_lengths_from_parent_idx(straddle_id)
     n_straddles = len(straddle_starts)
 
     timer.sub_phase("Compute starts/lengths")
@@ -293,26 +291,7 @@ def main():
 
     from specparser.amt.valuation import _anchor_day
     from specparser.amt import valuation_numba
-    from specparser.amt import chain as chain_module
     import calendar
-
-    # Pre-resolve chain CSV path once
-    chain_csv_resolved = str(Path(args.chain).resolve()) if args.chain else None
-
-    timer.sub_phase("6a: Resolve chain path")
-
-    # Pre-cache ticker normalizations
-    ticker_norm_cache: dict[str, str | None] = {}
-
-    def _normalize_ticker(ticker: str) -> str:
-        if ticker not in ticker_norm_cache:
-            if chain_csv_resolved is not None:
-                if chain_csv_resolved not in chain_module._ACTUAL_CACHE:
-                    chain_module.fut_act2norm(chain_csv_resolved, ticker)
-                ticker_norm_cache[ticker] = chain_module._ACTUAL_CACHE[chain_csv_resolved].get(ticker)
-            else:
-                ticker_norm_cache[ticker] = None
-        return ticker_norm_cache[ticker] if ticker_norm_cache[ticker] else ticker
 
     # Initialize arrays
     vol_ticker_idx = np.full(n_straddles, -1, dtype=np.int32)
@@ -325,7 +304,7 @@ def main():
     ntry_month_end = np.zeros(n_straddles, dtype=np.int32)
     xpry_month_end = np.zeros(n_straddles, dtype=np.int32)
 
-    timer.sub_phase("6b: Initialize arrays")
+    timer.sub_phase("6a: Initialize arrays")
 
     # Track sub-phase timings
     t_parse = 0.0
@@ -361,14 +340,12 @@ def main():
                     param_map = ticker_map[cache_key]
                     if "vol" in param_map:
                         vol_ticker, vol_field = param_map["vol"]
-                        vol_ticker = _normalize_ticker(vol_ticker)
                         if vol_ticker in prices_numba.ticker_to_idx:
                             vol_ticker_idx[s] = prices_numba.ticker_to_idx[vol_ticker]
                         if vol_field in prices_numba.field_to_idx:
                             vol_field_idx[s] = prices_numba.field_to_idx[vol_field]
                     if "hedge" in param_map:
                         hedge_ticker, hedge_field = param_map["hedge"]
-                        hedge_ticker = _normalize_ticker(hedge_ticker)
                         if hedge_ticker in prices_numba.ticker_to_idx:
                             hedge_ticker_idx[s] = prices_numba.ticker_to_idx[hedge_ticker]
                         if hedge_field in prices_numba.field_to_idx:
@@ -403,10 +380,10 @@ def main():
             xpry_anchor_date32[s] = np.iinfo(np.int32).max
         t_anchor += time.perf_counter() - t0
 
-    timer.sub_phase(f"6c: Loop over straddles (parse={t_parse:.2f}s, ticker={t_ticker_lookup:.2f}s, anchor={t_anchor:.2f}s)")
+    timer.sub_phase(f"6b: Loop over straddles (parse={t_parse:.2f}s, ticker={t_ticker_lookup:.2f}s, anchor={t_anchor:.2f}s)")
 
     # Also run the actual function for comparison
-    from specparser.amt.valuation import _prepare_backtest_arrays_sorted as actual_prepare
+    from specparser.amt.valuation_numba import _prepare_backtest_arrays_sorted as actual_prepare
 
     t0 = time.perf_counter()
     backtest_arrays = actual_prepare(
@@ -416,12 +393,11 @@ def main():
         stryms,
         ntrcs,
         args.amt,
-        args.chain,
         args.overrides,
     )
     t_actual = time.perf_counter() - t0
 
-    timer.sub_phase(f"6d: Actual _prepare_backtest_arrays_sorted() = {t_actual:.2f}s")
+    timer.sub_phase(f"6c: Actual _prepare_backtest_arrays_sorted() = {t_actual:.2f}s")
 
     timer.end_phase()
 
@@ -478,7 +454,7 @@ def main():
     # =========================================================================
     timer.start_phase("Phase 8: Build Arrow output")
 
-    from specparser.amt.valuation import _build_arrow_output_sorted
+    from specparser.amt.valuation_numba import _build_arrow_output_sorted
 
     # Build parent_idx for output
     out_parent_idx = np.zeros(n_days, dtype=np.int32)

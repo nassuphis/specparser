@@ -34,16 +34,19 @@ def load_amt(path: str | Path) -> dict[str, Any]:
         FileNotFoundError: If the file doesn't exist
         yaml.YAMLError: If the file is not valid YAML
     """
-    path = Path(path)
-    path_str = str(path.resolve())
+    # Use original path string as cache key (fast - no syscall)
+    # Only resolve when actually loading the file
+    path_key = str(path)
 
-    if path_str in _AMT_CACHE:
-        return _AMT_CACHE[path_str]
+    if path_key in _AMT_CACHE:
+        return _AMT_CACHE[path_key]
 
-    with open(path, "r") as f:
+    # Resolve path only when actually loading
+    resolved = Path(path).resolve()
+    with open(resolved, "r") as f:
         data = yaml.safe_load(f)
 
-    _AMT_CACHE[path_str] = data
+    _AMT_CACHE[path_key] = data
 
     # Build underlying -> asset_data lookup
     amt = data.get("amt", {})
@@ -53,7 +56,7 @@ def load_amt(path: str | Path) -> dict[str, Any]:
             underlying = asset_data.get("Underlying")
             if underlying:
                 underlying_map[underlying] = asset_data
-    _ASSET_BY_UNDERLYING[path_str] = underlying_map
+    _ASSET_BY_UNDERLYING[path_key] = underlying_map
 
     return data
 
@@ -122,11 +125,11 @@ def get_leverage(path: str | Path) -> float | None:
 #
 def get_asset(path: str | Path, underlying: str) -> dict[str, Any] | None:
     """Get asset data by its Underlying value."""
-    path = Path(path)
-    path_str = str(path.resolve())
-    if path_str not in _ASSET_BY_UNDERLYING:
+    # Use original path string as cache key (fast - no syscall)
+    path_key = str(path)
+    if path_key not in _ASSET_BY_UNDERLYING:
         load_amt(path)
-    return _ASSET_BY_UNDERLYING.get(path_str, {}).get(underlying)
+    return _ASSET_BY_UNDERLYING.get(path_key, {}).get(underlying)
 
 def find_assets(path: str | Path, pattern: str, live_only: bool = False) -> dict[str, Any]:
     """Find all Underlying values matching a regex pattern."""
@@ -140,10 +143,10 @@ def assets(path: str | Path, live_only: bool = False, pattern: str = ".") -> dic
 
 def cached_assets(path: str | Path) -> dict[str, Any]:
     """List all asset Underlying values from the cache."""
-    path = Path(path)
-    path_str = str(path.resolve())
-    if path_str not in _ASSET_BY_UNDERLYING: load_amt(path)
-    assets = _ASSET_BY_UNDERLYING.get(path_str, {})
+    # Use original path string as cache key (fast - no syscall)
+    path_key = str(path)
+    if path_key not in _ASSET_BY_UNDERLYING: load_amt(path)
+    assets = _ASSET_BY_UNDERLYING.get(path_key, {})
     rows = [[u] for u in assets.keys()]
     return {"orientation": "row", "columns": ["asset"], "rows": rows}
 

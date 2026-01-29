@@ -278,8 +278,7 @@ def _anchor_day(
     if xprc == "OVERRIDE":
         if underlying is None:
             return None
-        return _override_expiry(underlying, year, month,
-                                overrides_path or "data/overrides.csv")
+        return _override_expiry(underlying, year, month,overrides_path or "data/overrides.csv")
 
     WEEKDAY_MAP = {"F": 4, "R": 3, "W": 2}  # Friday, Thursday, Wednesday
 
@@ -956,6 +955,13 @@ def get_straddle_valuation(
 import numpy as np
 from numba import njit, prange
 from . import valuation_numba
+from .valuation_numba import (
+    BacktestArraysSorted,
+    _compute_starts_lengths_from_parent_idx,
+    _prepare_backtest_arrays_sorted,
+    _build_arrow_output_sorted,
+    get_straddle_backtests_numba,
+)
 from . import asset_straddle_tickers
 from . import chain
 
@@ -1319,344 +1325,6 @@ class BacktestArrays:
     unique_assets: list[str]
     unique_straddles: list[str]
     unique_models: list[str]
-
-
-@dataclass
-class BacktestArraysSorted:
-    """Container for pre-computed arrays needed by full_backtest_kernel_sorted.
-
-    Similar to BacktestArrays but uses ticker/field indices for sorted array lookup
-    instead of price matrix row indices.
-    """
-    # Per-straddle ticker/field indices (length S)
-    vol_ticker_idx: np.ndarray        # int32[S] - ticker index from PricesNumba.ticker_to_idx
-    vol_field_idx: np.ndarray         # int32[S] - field index from PricesNumba.field_to_idx
-    hedge_ticker_idx: np.ndarray      # int32[S] - ticker index from PricesNumba.ticker_to_idx
-    hedge_field_idx: np.ndarray       # int32[S] - field index from PricesNumba.field_to_idx
-
-    # Additional hedge ticker/field indices (for CDS and calc assets)
-    hedge1_ticker_idx: np.ndarray     # int32[S] - ticker index for hedge1 (-1 if not used)
-    hedge1_field_idx: np.ndarray      # int32[S] - field index for hedge1
-    hedge2_ticker_idx: np.ndarray     # int32[S] - ticker index for hedge2 (-1 if not used)
-    hedge2_field_idx: np.ndarray      # int32[S] - field index for hedge2
-    hedge3_ticker_idx: np.ndarray     # int32[S] - ticker index for hedge3 (-1 if not used)
-    hedge3_field_idx: np.ndarray      # int32[S] - field index for hedge3
-    n_hedges: np.ndarray              # int8[S] - number of hedge columns required (1-4)
-
-    # Entry/expiry anchor dates (length S)
-    ntry_anchor_date32: np.ndarray    # int32[S] - date32 of entry anchor (from override/code)
-    xpry_anchor_date32: np.ndarray    # int32[S] - date32 of expiry anchor (from override/code)
-    ntrv_offsets: np.ndarray          # int32[S] - calendar days to add to entry anchor
-    ntry_month_end: np.ndarray        # int32[S] - date32 of entry month end (for fallback)
-    xpry_month_end: np.ndarray        # int32[S] - date32 of expiry month end (for fallback)
-
-    # For output formatting
-    asset_idx: np.ndarray             # int32[S] - index into unique_assets
-    straddle_idx: np.ndarray          # int32[S] - index into unique_straddles
-    model_idx: np.ndarray             # int32[S] - index into unique_models
-
-    # For Arrow dictionary encoding
-    unique_assets: list[str]
-    unique_straddles: list[str]
-    unique_models: list[str]
-
-
-def _prepare_backtest_arrays_sorted(
-    straddle_list: list[tuple[str, str]],
-    ticker_map: dict[str, dict[str, tuple[str, str]]],
-    prices_numba: "prices_module.PricesNumba",
-    stryms: list[str],
-    ntrcs: list[str],
-    amt_path: str,
-    chain_csv: str | None = None,
-    overrides_path: str | None = None,
-) -> BacktestArraysSorted:
-    """Prepare arrays for full_backtest_kernel_sorted.
-
-    Similar to _prepare_backtest_arrays but builds ticker/field indices
-    for sorted array lookup instead of price matrix row indices.
-
-    Args:
-        straddle_list: List of (asset, straddle) tuples
-        ticker_map: Dict from _batch_resolve_tickers()
-        prices_numba: PricesNumba object with sorted arrays and index mappings
-        stryms: List of strym strings per straddle
-        ntrcs: List of ntrc codes per straddle
-        amt_path: Path to AMT YAML file
-        chain_csv: Optional CSV for futures ticker normalization
-        overrides_path: Path to overrides CSV (for OVERRIDE code)
-
-    Returns:
-        BacktestArraysSorted containing all pre-computed arrays
-    """
-    n_straddles = len(straddle_list)
-
-    # === OPTIMIZATION: Pre-compute asset properties for unique assets ===
-    # Instead of calling loader.get_asset() 231K times, call it once per unique asset (189 assets)
-    unique_asset_names = set(asset for asset, _ in straddle_list)
-    asset_to_data: dict[str, dict | None] = {}
-    for asset_name in unique_asset_names:
-        asset_to_data[asset_name] = loader.get_asset(amt_path, asset_name)
-
-    # Pre-resolve chain CSV path once (avoids 462K Path.resolve() calls)
-    chain_csv_resolved = str(Path(chain_csv).resolve()) if chain_csv else None
-
-    # Pre-cache ticker normalizations to avoid repeated lookups
-    ticker_norm_cache: dict[str, str | None] = {}
-
-    def _normalize_ticker(ticker: str) -> str:
-        """Normalize ticker with caching."""
-        if ticker not in ticker_norm_cache:
-            if chain_csv_resolved is not None:
-                # Use the pre-resolved path and access the cache directly
-                if chain_csv_resolved not in chain._ACTUAL_CACHE:
-                    # Force cache population
-                    chain.fut_act2norm(chain_csv_resolved, ticker)
-                ticker_norm_cache[ticker] = chain._ACTUAL_CACHE[chain_csv_resolved].get(ticker)
-            else:
-                ticker_norm_cache[ticker] = None
-        return ticker_norm_cache[ticker] if ticker_norm_cache[ticker] else ticker
-
-    # Per-straddle ticker/field index arrays
-    vol_ticker_idx = np.full(n_straddles, -1, dtype=np.int32)
-    vol_field_idx = np.full(n_straddles, -1, dtype=np.int32)
-    hedge_ticker_idx = np.full(n_straddles, -1, dtype=np.int32)
-    hedge_field_idx = np.full(n_straddles, -1, dtype=np.int32)
-
-    # Additional hedge ticker/field indices (for CDS and calc assets)
-    hedge1_ticker_idx = np.full(n_straddles, -1, dtype=np.int32)
-    hedge1_field_idx = np.full(n_straddles, -1, dtype=np.int32)
-    hedge2_ticker_idx = np.full(n_straddles, -1, dtype=np.int32)
-    hedge2_field_idx = np.full(n_straddles, -1, dtype=np.int32)
-    hedge3_ticker_idx = np.full(n_straddles, -1, dtype=np.int32)
-    hedge3_field_idx = np.full(n_straddles, -1, dtype=np.int32)
-    n_hedges = np.ones(n_straddles, dtype=np.int8)  # Default to 1 (just primary hedge)
-
-    # Entry/expiry anchor dates
-    ntry_anchor_date32 = np.zeros(n_straddles, dtype=np.int32)
-    xpry_anchor_date32 = np.zeros(n_straddles, dtype=np.int32)
-    ntrv_offsets = np.zeros(n_straddles, dtype=np.int32)
-    ntry_month_end = np.zeros(n_straddles, dtype=np.int32)
-    xpry_month_end = np.zeros(n_straddles, dtype=np.int32)
-
-    # For Arrow dictionary encoding (string -> index)
-    unique_assets: dict[str, int] = {}
-    unique_straddles: dict[str, int] = {}
-    unique_models: dict[str, int] = {}
-    asset_idx = np.empty(n_straddles, dtype=np.int32)
-    straddle_idx = np.empty(n_straddles, dtype=np.int32)
-    model_idx = np.empty(n_straddles, dtype=np.int32)
-
-    for s, (asset, straddle) in enumerate(straddle_list):
-        strym = stryms[s]
-        ntrc = ntrcs[s]
-
-        # Build unique asset/straddle lists for Arrow output
-        if asset not in unique_assets:
-            unique_assets[asset] = len(unique_assets)
-        if straddle not in unique_straddles:
-            unique_straddles[straddle] = len(unique_straddles)
-        asset_idx[s] = unique_assets[asset]
-        straddle_idx[s] = unique_straddles[straddle]
-
-        # Get asset data from pre-computed cache (O(1) dict lookup)
-        asset_data = asset_to_data[asset]
-        if asset_data is None:
-            if "" not in unique_models:
-                unique_models[""] = len(unique_models)
-            model_idx[s] = unique_models[""]
-            continue
-
-        # Get model name
-        valuation = asset_data.get("Valuation", {})
-        model_name = valuation.get("Model", "") if isinstance(valuation, dict) else ""
-        if model_name not in unique_models:
-            unique_models[model_name] = len(unique_models)
-        model_idx[s] = unique_models[model_name]
-
-        vol_cfg = asset_data.get("Vol")
-        hedge_cfg = asset_data.get("Hedge")
-        if vol_cfg is None or hedge_cfg is None:
-            continue
-
-        # Compute cache key
-        cache_key = asset_straddle_tickers.asset_straddle_ticker_key(
-            asset, strym, ntrc, vol_cfg, hedge_cfg
-        )
-
-        if cache_key in ticker_map:
-            param_map = ticker_map[cache_key]
-
-            # Get vol ticker/field indices
-            # Use -2 for "required but ticker missing from prices" vs -1 for "not required"
-            if "vol" in param_map:
-                vol_ticker, vol_field = param_map["vol"]
-                vol_ticker = _normalize_ticker(vol_ticker)
-                # Look up indices in PricesNumba
-                if vol_ticker in prices_numba.ticker_to_idx:
-                    vol_ticker_idx[s] = prices_numba.ticker_to_idx[vol_ticker]
-                else:
-                    vol_ticker_idx[s] = -2  # Required but ticker not in loaded prices
-                if vol_field in prices_numba.field_to_idx:
-                    vol_field_idx[s] = prices_numba.field_to_idx[vol_field]
-
-            # Get hedge ticker/field indices
-            if "hedge" in param_map:
-                hedge_ticker, hedge_field = param_map["hedge"]
-                hedge_ticker = _normalize_ticker(hedge_ticker)
-                # Look up indices in PricesNumba
-                if hedge_ticker in prices_numba.ticker_to_idx:
-                    hedge_ticker_idx[s] = prices_numba.ticker_to_idx[hedge_ticker]
-                else:
-                    hedge_ticker_idx[s] = -2  # Required but ticker not in loaded prices
-                if hedge_field in prices_numba.field_to_idx:
-                    hedge_field_idx[s] = prices_numba.field_to_idx[hedge_field]
-
-            # Get hedge1 ticker/field indices (for CDS assets)
-            if "hedge1" in param_map:
-                h1_ticker, h1_field = param_map["hedge1"]
-                h1_ticker = _normalize_ticker(h1_ticker)
-                if h1_ticker in prices_numba.ticker_to_idx:
-                    hedge1_ticker_idx[s] = prices_numba.ticker_to_idx[h1_ticker]
-                else:
-                    hedge1_ticker_idx[s] = -2  # Required but ticker not in loaded prices
-                if h1_field in prices_numba.field_to_idx:
-                    hedge1_field_idx[s] = prices_numba.field_to_idx[h1_field]
-                n_hedges[s] = max(n_hedges[s], 2)
-
-            # Get hedge2 ticker/field indices (for calc assets)
-            if "hedge2" in param_map:
-                h2_ticker, h2_field = param_map["hedge2"]
-                h2_ticker = _normalize_ticker(h2_ticker)
-                if h2_ticker in prices_numba.ticker_to_idx:
-                    hedge2_ticker_idx[s] = prices_numba.ticker_to_idx[h2_ticker]
-                else:
-                    hedge2_ticker_idx[s] = -2  # Required but ticker not in loaded prices
-                if h2_field in prices_numba.field_to_idx:
-                    hedge2_field_idx[s] = prices_numba.field_to_idx[h2_field]
-                n_hedges[s] = max(n_hedges[s], 3)
-
-            # Get hedge3 ticker/field indices (for calc assets)
-            if "hedge3" in param_map:
-                h3_ticker, h3_field = param_map["hedge3"]
-                h3_ticker = _normalize_ticker(h3_ticker)
-                if h3_ticker in prices_numba.ticker_to_idx:
-                    hedge3_ticker_idx[s] = prices_numba.ticker_to_idx[h3_ticker]
-                else:
-                    hedge3_ticker_idx[s] = -2  # Required but ticker not in loaded prices
-                if h3_field in prices_numba.field_to_idx:
-                    hedge3_field_idx[s] = prices_numba.field_to_idx[h3_field]
-                n_hedges[s] = max(n_hedges[s], 4)
-
-            # Handle hedge4 -> hedge3 mapping for calc assets
-            if "hedge4" in param_map and hedge3_ticker_idx[s] == -1:
-                h4_ticker, h4_field = param_map["hedge4"]
-                h4_ticker = _normalize_ticker(h4_ticker)
-                if h4_ticker in prices_numba.ticker_to_idx:
-                    hedge3_ticker_idx[s] = prices_numba.ticker_to_idx[h4_ticker]
-                else:
-                    hedge3_ticker_idx[s] = -2  # Required but ticker not in loaded prices
-                if h4_field in prices_numba.field_to_idx:
-                    hedge3_field_idx[s] = prices_numba.field_to_idx[h4_field]
-                n_hedges[s] = max(n_hedges[s], 4)
-
-        # Parse straddle string for entry/expiry dates
-        ntry_y = schedules.ntry(straddle)
-        ntry_m = schedules.ntrm(straddle)
-        xpry_y = schedules.xpry(straddle)
-        xpry_m = schedules.xprm(straddle)
-
-        # Get codes from straddle
-        # Note: u8m format produces padded strings, so strip to get clean values
-        xprc = schedules.xprc(straddle).strip()
-        xprv = schedules.xprv(straddle).strip()
-        ntrv_str = schedules.ntrv(straddle).strip()
-
-        # Compute entry month end date
-        _, ntry_num_days = calendar.monthrange(ntry_y, ntry_m)
-        ntry_month_end[s] = valuation_numba.ymd_to_date32(ntry_y, ntry_m, ntry_num_days)
-
-        # Compute expiry month end date
-        _, xpry_num_days = calendar.monthrange(xpry_y, xpry_m)
-        xpry_month_end[s] = valuation_numba.ymd_to_date32(xpry_y, xpry_m, xpry_num_days)
-
-        # Parse ntrv as calendar day offset
-        try:
-            ntrv_offsets[s] = int(ntrv_str) if ntrv_str else 0
-        except (ValueError, TypeError):
-            ntrv_offsets[s] = 0
-
-        # Compute entry anchor using _anchor_day
-        entry_anchor = _anchor_day(xprc, xprv, ntry_y, ntry_m, asset, overrides_path)
-        if entry_anchor is not None:
-            y, m, d = map(int, entry_anchor.split("-"))
-            ntry_anchor_date32[s] = valuation_numba.ymd_to_date32(y, m, d)
-        else:
-            ntry_anchor_date32[s] = np.iinfo(np.int32).max
-
-        # Compute expiry anchor using _anchor_day
-        expiry_anchor = _anchor_day(xprc, xprv, xpry_y, xpry_m, asset, overrides_path)
-        if expiry_anchor is not None:
-            y, m, d = map(int, expiry_anchor.split("-"))
-            xpry_anchor_date32[s] = valuation_numba.ymd_to_date32(y, m, d)
-        else:
-            xpry_anchor_date32[s] = np.iinfo(np.int32).max
-
-    return BacktestArraysSorted(
-        vol_ticker_idx=vol_ticker_idx,
-        vol_field_idx=vol_field_idx,
-        hedge_ticker_idx=hedge_ticker_idx,
-        hedge_field_idx=hedge_field_idx,
-        hedge1_ticker_idx=hedge1_ticker_idx,
-        hedge1_field_idx=hedge1_field_idx,
-        hedge2_ticker_idx=hedge2_ticker_idx,
-        hedge2_field_idx=hedge2_field_idx,
-        hedge3_ticker_idx=hedge3_ticker_idx,
-        hedge3_field_idx=hedge3_field_idx,
-        n_hedges=n_hedges,
-        ntry_anchor_date32=ntry_anchor_date32,
-        xpry_anchor_date32=xpry_anchor_date32,
-        ntrv_offsets=ntrv_offsets,
-        ntry_month_end=ntry_month_end,
-        xpry_month_end=xpry_month_end,
-        asset_idx=asset_idx,
-        straddle_idx=straddle_idx,
-        model_idx=model_idx,
-        unique_assets=list(unique_assets.keys()),
-        unique_straddles=list(unique_straddles.keys()),
-        unique_models=list(unique_models.keys()),
-    )
-
-
-def _compute_starts_lengths_from_parent_idx(parent_idx: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
-    """Compute straddle_starts and straddle_lengths from parent_idx array.
-
-    Args:
-        parent_idx: int32 array mapping each day to its source straddle index
-
-    Returns:
-        straddle_starts: int32 array of start positions for each straddle
-        straddle_lengths: int32 array of lengths for each straddle
-    """
-    import numpy as np
-
-    if len(parent_idx) == 0:
-        return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-
-    # Find where parent_idx changes (boundaries between straddles)
-    # Note: parent_idx is contiguous - all days for straddle 0 come first, then straddle 1, etc.
-    n_straddles = int(parent_idx[-1]) + 1
-    straddle_starts = np.zeros(n_straddles, dtype=np.int32)
-    straddle_lengths = np.zeros(n_straddles, dtype=np.int32)
-
-    # Count occurrences of each straddle index
-    counts = np.bincount(parent_idx, minlength=n_straddles)
-    straddle_lengths[:] = counts[:n_straddles].astype(np.int32)
-
-    # Compute starts as cumsum of lengths (shifted by 1)
-    straddle_starts[1:] = np.cumsum(straddle_lengths[:-1])
-
-    return straddle_starts, straddle_lengths
 
 
 def _prepare_backtest_arrays(
@@ -2082,142 +1750,6 @@ def _build_arrow_output(
     })
 
 
-def _build_arrow_output_sorted(
-    # Numeric arrays from kernel
-    dates: np.ndarray,                 # int32[N] - date32 values
-    vol: np.ndarray,                   # float64[N] - raw vol prices
-    hedge: np.ndarray,                 # float64[N] - raw hedge prices
-    hedge1: np.ndarray,                # float64[N] - raw hedge1 prices
-    hedge2: np.ndarray,                # float64[N] - raw hedge2 prices
-    hedge3: np.ndarray,                # float64[N] - raw hedge3 prices
-    strike: np.ndarray,                # float64[N] - strike price
-    strike1: np.ndarray,               # float64[N] - strike1 price
-    strike2: np.ndarray,               # float64[N] - strike2 price
-    strike3: np.ndarray,               # float64[N] - strike3 price
-    mv: np.ndarray,                    # float64[N] - mark-to-market
-    delta: np.ndarray,                 # float64[N] - delta
-    opnl: np.ndarray,                  # float64[N] - option PnL
-    hpnl: np.ndarray,                  # float64[N] - hedge PnL
-    pnl: np.ndarray,                   # float64[N] - total PnL
-    action: np.ndarray,                # int8[N] - action code
-
-    # For string columns
-    parent_idx: np.ndarray,            # int32[N] - which straddle each day belongs to
-    backtest_arrays: BacktestArraysSorted,  # Pre-computed array mappings
-
-    # Straddle structure
-    straddle_starts: np.ndarray,       # int32[S] - start index per straddle
-    straddle_lengths: np.ndarray,      # int32[S] - length per straddle
-    ntry_offsets: np.ndarray,          # int32[S] - entry offset per straddle
-    xpry_offsets: np.ndarray,          # int32[S] - expiry offset per straddle
-
-    # Options
-    valid_only: bool = False,
-) -> pa.Table:
-    """Build Arrow table from numeric arrays for sorted kernel output.
-
-    Full version matching _build_arrow_output with hedge1/2/3 and strike1/2/3.
-    """
-    n_straddles = len(straddle_starts)
-
-    # Pre-compute strike_vol per straddle
-    strike_vol = np.full(n_straddles, np.nan, dtype=np.float64)
-    for s in range(n_straddles):
-        ntry = ntry_offsets[s]
-        if ntry >= 0:
-            start = straddle_starts[s]
-            strike_vol[s] = vol[start + ntry]
-
-    # Pre-compute expiry date32 per straddle
-    expiry_date32 = np.full(n_straddles, -1, dtype=np.int32)
-    for s in range(n_straddles):
-        xpry = xpry_offsets[s]
-        if xpry >= 0:
-            start = straddle_starts[s]
-            expiry_date32[s] = dates[start + xpry]
-
-    # Build valid_mask for filtering (rows with valid mv)
-    if valid_only:
-        filter_mask = ~np.isnan(mv)
-        indices = np.where(filter_mask)[0]
-
-        # Filter arrays
-        dates = dates[indices]
-        vol = vol[indices]
-        hedge = hedge[indices]
-        hedge1 = hedge1[indices]
-        hedge2 = hedge2[indices]
-        hedge3 = hedge3[indices]
-        strike = strike[indices]
-        strike1 = strike1[indices]
-        strike2 = strike2[indices]
-        strike3 = strike3[indices]
-        mv = mv[indices]
-        delta = delta[indices]
-        opnl = opnl[indices]
-        hpnl = hpnl[indices]
-        pnl = pnl[indices]
-        action = action[indices]
-        parent_idx = parent_idx[indices]
-
-    # Build per-row arrays from per-straddle data
-    asset_indices = backtest_arrays.asset_idx[parent_idx]
-    straddle_indices = backtest_arrays.straddle_idx[parent_idx]
-    model_indices = backtest_arrays.model_idx[parent_idx]
-    strike_vol_values = strike_vol[parent_idx]
-    expiry_values = expiry_date32[parent_idx]
-
-    # Build dictionary-encoded string columns
-    asset_dict = pa.DictionaryArray.from_arrays(
-        pa.array(asset_indices, type=pa.int32()),
-        pa.array(backtest_arrays.unique_assets, type=pa.string())
-    )
-
-    straddle_dict = pa.DictionaryArray.from_arrays(
-        pa.array(straddle_indices, type=pa.int32()),
-        pa.array(backtest_arrays.unique_straddles, type=pa.string())
-    )
-
-    model_dict = pa.DictionaryArray.from_arrays(
-        pa.array(model_indices, type=pa.int32()),
-        pa.array(backtest_arrays.unique_models, type=pa.string())
-    )
-
-    action_strs = ["", "ntry", "xpry"]
-    action_dict = pa.DictionaryArray.from_arrays(
-        pa.array(action, type=pa.int8()),
-        pa.array(action_strs, type=pa.string())
-    )
-
-    date_array = pa.array(dates, type=pa.date32())
-    expiry_array = pa.array(expiry_values, type=pa.date32())
-
-    # Build table with all columns (matching _build_arrow_output)
-    return pa.table({
-        'asset': asset_dict,
-        'straddle': straddle_dict,
-        'date': date_array,
-        'vol': pa.array(vol),
-        'hedge': pa.array(hedge),
-        'hedge1': pa.array(hedge1),
-        'hedge2': pa.array(hedge2),
-        'hedge3': pa.array(hedge3),
-        'action': action_dict,
-        'model': model_dict,
-        'strike_vol': pa.array(strike_vol_values),
-        'strike': pa.array(strike),
-        'strike1': pa.array(strike1),
-        'strike2': pa.array(strike2),
-        'strike3': pa.array(strike3),
-        'expiry': expiry_array,
-        'mv': pa.array(mv),
-        'delta': pa.array(delta),
-        'opnl': pa.array(opnl),
-        'hpnl': pa.array(hpnl),
-        'pnl': pa.array(pnl),
-    })
-
-
 def _build_matrix_lookup_indices(
     straddle_list: list[tuple[str, str]],
     straddle_starts: np.ndarray,
@@ -2614,7 +2146,6 @@ def get_straddle_backtests(
     prices_parquet: str | None = None,
     valid_only: bool = False,
     price_lookup: str = "dict",
-    output_format: str = "dict",
     overrides_path: str | None = None,
 ) -> dict[str, Any] | pa.Table:
     """Batch valuation for all straddles matching pattern.
@@ -2637,18 +2168,14 @@ def get_straddle_backtests(
             - "matrix": Use Numba-accelerated matrix lookup (requires load_prices_matrix())
             - "numba": Full Numba pipeline - single kernel for price lookup, actions,
               roll-forward, model, and PnL. Returns Arrow table. (FASTEST)
-        output_format: Output format for the result:
-            - "dict": Return dict with columns and rows (default, compatible with existing code)
-            - "arrow": Return PyArrow Table (fastest, recommended for large results)
-            Note: price_lookup="numba" ignores this and always returns Arrow table.
         overrides_path: Path to overrides CSV file for OVERRIDE code anchor dates.
             Defaults to "data/overrides.csv" if not specified.
 
     Returns:
-        If output_format="dict": Table dict with columns matching get_straddle_valuation():
+        For price_lookup="dict"/"arrow"/"duckdb"/"matrix": Table dict with columns:
             asset, straddle, date, vol, hedge, ..., action, model,
             strike_vol, strike, expiry, mv, delta, opnl, hpnl, pnl
-        If output_format="arrow" or price_lookup="numba": PyArrow Table
+        For price_lookup="numba": PyArrow Table
 
     Example:
         >>> from specparser.amt import get_straddle_backtests, load_all_prices, set_prices_dict
@@ -2666,14 +2193,14 @@ def get_straddle_backtests(
     # Phase 1+2: Use fast u8m-based date expansion (Numba kernel)
     # This replaces both find_straddle_yrs() and the Python loop with straddle_days()
     straddle_days_table = schedules.find_straddle_days_u8m(
-        amt_path, start_year, end_year, pattern, live_only=True
+        amt_path, start_year, end_year, pattern, live_only=True, parallel= True,
     )
 
-    # Extract u8m arrays and date32
+    # Extract numpy arrays (orientation: "numpy")
     asset_u8m = straddle_days_table["rows"][0]  # (n_days, width) uint8
     straddle_u8m = straddle_days_table["rows"][1]  # (n_days, width) uint8
     dates = straddle_days_table["rows"][2]  # (n_days,) int32
-    parent_idx = straddle_days_table["parent_idx"]  # (n_days,) int32
+    straddle_id = straddle_days_table["rows"][3]  # (n_days,) int32 - maps each day to source straddle
 
     n_days = len(dates)
 
@@ -2686,12 +2213,12 @@ def get_straddle_backtests(
             "rows": [],
         }
 
-    # Compute straddle_starts and straddle_lengths from parent_idx
-    straddle_starts, straddle_lengths = _compute_starts_lengths_from_parent_idx(parent_idx)
+    # Compute straddle_starts and straddle_lengths from straddle_id
+    straddle_starts, straddle_lengths = _compute_starts_lengths_from_parent_idx(straddle_id)
     n_straddles_actual = len(straddle_starts)
 
     # Build straddle_list from unique u8m rows (one per straddle, not per day)
-    # Use parent_idx to get the first day of each straddle
+    # Use straddle_id to get the first day of each straddle
     unique_indices = straddle_starts  # First day of each straddle
     unique_asset_u8m = asset_u8m[unique_indices]
     unique_straddle_u8m = straddle_u8m[unique_indices]

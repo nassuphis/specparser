@@ -8,9 +8,16 @@ Tables are represented as dicts with 'columns', 'rows', and 'orientation' keys:
     Row-oriented: {"orientation": "row", "columns": ["col1", "col2"], "rows": [[val1, val2], ...]}
     Column-oriented: {"orientation": "column", "columns": ["col1", "col2"], "rows": [[col1_vals], [col2_vals]]}
     Arrow-oriented: {"orientation": "arrow", "columns": ["col1", "col2"], "rows": [pa.Array, pa.Array, ...]}
+    U8M-oriented: {"orientation": "u8m", "columns": ["col1", "col2"], "rows": [np.array(uint8), np.array(uint8), ...]}
+    Numpy-oriented: {"orientation": "numpy", "columns": ["col1", "col2"], "rows": [np.array, np.array, ...]}
 
 Arrow-oriented tables are backed by PyArrow arrays for fast, vectorized operations on large datasets.
 The "rows" field contains a list of PyArrow Arrays (one per column), mirroring column-oriented structure.
+
+U8M-oriented tables store columns as uint8 2D numpy matrices (for string data encoded as fixed-width bytes).
+
+Numpy-oriented tables store columns as numpy arrays with potentially mixed dtypes (int32, float64, uint8 matrices, etc.).
+This is a generalization of u8m that allows any numpy dtype per column.
 
 This module provides functions for:
 - Orientation conversion: to_columns, to_rows, to_arrow
@@ -66,6 +73,11 @@ def _is_arrow(table: dict[str, Any]) -> bool:
 def _is_u8m(table: dict[str, Any]) -> bool:
     """Check if table is u8m-oriented (uint8 matrix columns)."""
     return table.get("orientation") == "u8m"
+
+
+def _is_numpy(table: dict[str, Any]) -> bool:
+    """Check if table is numpy-oriented (mixed numpy dtype columns)."""
+    return table.get("orientation") == "numpy"
 
 
 def _transpose_rows_to_cols(rows: list[list], n_cols: int) -> list[list]:

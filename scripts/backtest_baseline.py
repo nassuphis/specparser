@@ -152,8 +152,10 @@ def main():
     if args.verbose:
         print(f"Loading prices from {start_date} to {end_date}...", file=sys.stderr)
 
+    load_start = time.perf_counter()
     prices_dict = load_all_prices(args.prices, start_date, end_date)
     set_prices_dict(prices_dict)
+    prices_load_time = time.perf_counter() - load_start
     timer.checkpoint(f"Load prices ({len(prices_dict):,} entries)")
 
     if args.verbose:
@@ -222,10 +224,11 @@ def main():
     if args.benchmark:
         total_time = timer.checkpoints[-1][1] if timer.checkpoints else 0
         print(f"\n{'='*60}", file=sys.stderr)
-        print("BENCHMARK RESULTS", file=sys.stderr)
+        print("BENCHMARK RESULTS (baseline - per-straddle loop)", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
+        print(f"  Prices load:     {prices_load_time:.2f}s", file=sys.stderr)
         print(f"  Straddles:       {completed:,}", file=sys.stderr)
-        print(f"  Total time:      {total_time:.2f}s", file=sys.stderr)
+        print(f"  Backtest time:   {process_time:.2f}s", file=sys.stderr)
         print(f"  Rate:            {rate:,.1f} straddles/sec", file=sys.stderr)
         print(f"  Output rows:     {len(all_rows):,}", file=sys.stderr)
         print("=" * 60, file=sys.stderr)

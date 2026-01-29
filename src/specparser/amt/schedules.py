@@ -634,11 +634,12 @@ def find_straddle_days_u8m(
 
     if n == 0:
         return {
-            "orientation": "u8m",
-            "columns": ["asset", "straddle", "date"],
+            "orientation": "numpy",
+            "columns": ["asset", "straddle", "date", "straddle_id"],
             "rows": [
                 np.empty((0, 1), dtype=np.uint8),
                 np.empty((0, 1), dtype=np.uint8),
+                np.empty(0, dtype=np.int32),
                 np.empty(0, dtype=np.int32),
             ],
         }
@@ -667,10 +668,9 @@ def find_straddle_days_u8m(
     expanded_straddle = straddle_u8m[parent_idx]
 
     return {
-        "orientation": "u8m",
-        "columns": ["asset", "straddle", "date"],
-        "rows": [expanded_asset, expanded_straddle, date32],
-        "parent_idx": parent_idx,  # Maps each day back to source straddle index
+        "orientation": "numpy",
+        "columns": ["asset", "straddle", "date", "straddle_id"],
+        "rows": [expanded_asset, expanded_straddle, date32, parent_idx],
     }
 
 
