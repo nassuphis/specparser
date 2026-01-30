@@ -127,7 +127,7 @@ def _transpose_cols_to_rows(cols: list[list]) -> list[list]:
     return rows
 
 
-def table_orientation(table: dict[str, Any]) -> Literal["row", "column", "arrow", "u8m"]:
+def table_orientation(table: dict[str, Any]) -> Literal["row", "column", "arrow", "u8m", "numpy"]:
     """
     Get the orientation of a table.
 
@@ -135,10 +135,10 @@ def table_orientation(table: dict[str, Any]) -> Literal["row", "column", "arrow"
         table: Table dict
 
     Returns:
-        One of "row", "column", "arrow", or "u8m"
+        One of "row", "column", "arrow", "u8m", or "numpy"
     """
     orientation = table.get("orientation", "row")
-    if orientation not in ("row", "column", "arrow", "u8m"):
+    if orientation not in ("row", "column", "arrow", "u8m", "numpy"):
         raise ValueError(f"Unsupported orientation: {orientation}")
     return orientation
 
@@ -161,6 +161,11 @@ def table_nrows(table: dict[str, Any]) -> int:
         if not table["rows"]:
             return 0
         return table["rows"][0].shape[0]
+    elif orientation == "numpy":
+        # numpy: rows contains numpy arrays (1D or 2D), use len()
+        if not table["rows"]:
+            return 0
+        return len(table["rows"][0])
     else:
         # column or arrow: rows contains columns, length is in first column
         if not table["rows"]:
@@ -338,7 +343,7 @@ def table_to_columns(table: dict[str, Any]) -> dict[str, Any]:
     Convert any table to column-oriented (Python lists).
 
     Args:
-        table: Table in any orientation (row, column, arrow, or u8m)
+        table: Table in any orientation (row, column, arrow, u8m, or numpy)
 
     Returns:
         Column-oriented table with Python list columns
@@ -354,6 +359,23 @@ def table_to_columns(table: dict[str, Any]) -> dict[str, Any]:
             "orientation": "column",
             "columns": table["columns"][:],
             "rows": [np.strings.strip(u8m2s(col)).tolist() for col in table["rows"]],
+        }
+
+    if _is_numpy(table):
+        # numpy -> column: convert each numpy array to Python list
+        from .strings import u8m2s
+        import numpy as np
+        cols = []
+        for col in table["rows"]:
+            if col.ndim == 2 and col.dtype == np.uint8:
+                # u8m column: convert to strings first (stripped)
+                cols.append(np.strings.strip(u8m2s(col)).tolist())
+            else:
+                cols.append(col.tolist())
+        return {
+            "orientation": "column",
+            "columns": table["columns"][:],
+            "rows": cols,
         }
 
     if _is_arrow(table):
@@ -376,7 +398,7 @@ def table_to_rows(table: dict[str, Any]) -> dict[str, Any]:
     Convert any table to row-oriented (Python lists).
 
     Args:
-        table: Table in any orientation (row, column, or arrow)
+        table: Table in any orientation (row, column, arrow, u8m, or numpy)
 
     Returns:
         Row-oriented table with Python list rows
@@ -389,6 +411,19 @@ def table_to_rows(table: dict[str, Any]) -> dict[str, Any]:
     if orientation == "arrow":
         # Arrow -> row: convert to Python lists, then transpose
         cols = [col.to_pylist() for col in table["rows"]]
+        rows = _transpose_cols_to_rows(cols)
+        return {"orientation": "row", "columns": table["columns"][:], "rows": rows}
+
+    if orientation == "numpy":
+        # Numpy -> row: convert numpy arrays to Python lists
+        from .strings import u8m2s
+        cols = []
+        for col in table["rows"]:
+            if col.ndim == 2 and col.dtype == np.uint8:
+                # u8m column: convert to strings first
+                cols.append(u8m2s(col).tolist())
+            else:
+                cols.append(col.tolist())
         rows = _transpose_cols_to_rows(cols)
         return {"orientation": "row", "columns": table["columns"][:], "rows": rows}
 
@@ -3109,6 +3144,9 @@ def show_table(tbl):
     if _is_u8m(tbl):
         # u8m -> column (with string conversion) -> row
         t = table_to_rows(table_to_columns(tbl))
+    elif _is_numpy(tbl):
+        # numpy -> row (handles mixed dtypes including u8m columns)
+        t = table_to_rows(tbl)
     elif tbl.get("orientation") in ("column", "arrow"):
         t = table_to_rows(tbl)
     else:
