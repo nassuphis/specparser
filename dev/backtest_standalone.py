@@ -51,11 +51,14 @@ hedge_source = np.array(list(map(lambda a:amap[a]["Hedge"].get("Source",""),anam
 hedge_ticker = np.array(list(map(lambda a:amap[a]["Hedge"].get("Ticker",""),anames)),dtype=nps)
 hedge_field = np.array(list(map(lambda a:amap[a]["Hedge"].get("Field",""),anames)),dtype=nps)
 hedge_hedge = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge",""),anames)),dtype=nps)
-hedge_hedge1 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge",""),anames)),dtype=nps)
+hedge_hedge1 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge1",""),anames)),dtype=nps)
+hedge_hedge2 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge2",""),anames)),dtype=nps)
+hedge_hedge3 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge3",""),anames)),dtype=nps)
+hedge_hedge4 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge4",""),anames)),dtype=nps)
 hedge_ccy = np.array(list(map(lambda a:amap[a]["Hedge"].get("ccy",""),anames)),dtype=nps)
 hedge_tenor = np.array(list(map(lambda a:amap[a]["Hedge"].get("tenor",""),anames)),dtype=nps)
-hedge_fut_month_map = np.array(list(map(lambda a:amap[a]["Hedge"].get("fut_month_map",""),anames)),dtype=nps)
-hedge_min_year_offset = np.array(list(map(lambda a:amap[a]["Hedge"].get("min_year_offset",""),anames)),dtype=nps)
+hedge_fut_month_map = np.array(list(map(lambda a:amap[a]["Hedge"].get("fut_month_map"," "*12),anames)),dtype=nps)
+hedge_min_year_offset = np.array(list(map(lambda a:amap[a]["Hedge"].get("min_year_offset","0"),anames)),dtype=nps)
 hedge_fut_code = np.array(list(map(lambda a:amap[a]["Hedge"].get("fut_code",""),anames)),dtype=nps)
 hedge_market_code = np.array(list(map(lambda a:amap[a]["Hedge"].get("market_code",""),anames)),dtype=nps)
 vol_source = np.array(list(map(lambda a:amap[a]["Vol"].get("Source",""),anames)),dtype=nps)
@@ -102,8 +105,6 @@ schedule_matrix[easchi,easchj,2]=np.select(conds,choices_xprc,default=np.strings
 schedule_matrix[easchi,easchj,3]=np.select(conds,choices_xprv,default=np.strings.slice(easxprcv,1,20))
 schedule_matrix[easchi,easchj,4], _, rest = np.strings.partition(rest,'_')
 
-
-
 # encode strings as integers for speed
 hedge_sources = list(set(hedge_source))
 hs2id_map = dict(zip(hedge_sources,range(len(hedge_sources))))
@@ -124,7 +125,6 @@ asset_sources = np.full((len(amap),2),0,dtype=np.uint32)
 
 asset_hedge_tickers = np.full((len(amap),8),"",dtype=np.dtypes.StringDType()) 
 asset_vol_tickers = np.full((len(amap),3),"",dtype=np.dtypes.StringDType()) 
-schedule_matrix = np.full((len(amap),4,5),"",dtype=np.dtypes.StringDType())
 asset_ids = np.array([np.sum(np.frombuffer(x.encode('ascii'),dtype=np.uint8)) for x in anames],dtype=np.uint64)
 
 for idx, asset in enumerate(amap.values()):
@@ -227,20 +227,74 @@ wgt_vec    = schedule_matrix[smidx,schid_vec,4]
 # total day-count
 day_count_vec = days0_vec + days1_vec + np.where(ntrc_vec=="F",days2_vec,0)
 
+cond_hedge = [
+    asset_sources[smidx,0]==HEDGE_NONFUT,
+    asset_sources[smidx,0]==HEDGE_FUT,
+    asset_sources[smidx,0]==HEDGE_CDS,
+    asset_sources[smidx,0]==HEDGE_CALC
+]
 
+fut_month_code = np.strings.slice(hedge_fut_month_map[smidx],month_vec - 1,month_vec)
+opt_month_code = np.strings.slice("FGHJKMNQUVXZ",month_vec - 1,month_vec)
+myo = (hedge_min_year_offset[smidx]).astype(np.int64)
+yo = np.maximum(np.where(fut_month_code < opt_month_code,1,0),myo)
 
+choices_hedge1t = [
+    hedge_ticker[smidx],
+    hedge_fut_code[smidx]+fut_month_code[smidx]+(year_vec+yo).astype("U")+" " + hedge_market_code[smidx],
+    hedge_hedge[smidx],
+    hedge_ccy[smidx]+"_fsw0m_"+hedge_tenor[smidx]
+]
+hedge1t_vec = np.select(cond_hedge,choices_hedge1t,default="")
 
-hedge1t_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-hedge2t_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-hedge3t_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-hedge4t_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-volt_vec      = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
+choices_hedge1f = [
+    hedge_field[smidx],
+    "PX_LAST",
+    "PX_LAST",
+    ""
+]
+hedge1f_vec = np.select(cond_hedge,choices_hedge1f,default="")
 
-hedge1f_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-hedge2f_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-hedge3f_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-hedge4f_vec   = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
-volf_vec      = np.full(len(smidx), "", dtype=np.dtypes.StringDType())
+choices_hedge2t = ["","",hedge_hedge1[smidx],hedge_ccy[smidx]+"_fsw6m_"+hedge_tenor[smidx]]
+hedge2t_vec = np.select(cond_hedge,choices_hedge1f,default="")
+
+choices_hedge2f = ["","","PX_LAST",""]
+hedge2f_vec = np.select(cond_hedge,choices_hedge2f,default="")
+
+choices_hedge3t = ["","","",hedge_ccy[smidx]+"_pva0m_"+hedge_tenor[smidx]]
+hedge3t_vec = np.select(cond_hedge,choices_hedge3t,default="")
+
+choices_hedge3f = ["","","",""]
+hedge3f_vec = np.select(cond_hedge,choices_hedge3f,default="")
+
+choices_hedge4t = ["","","",hedge_ccy[smidx]+"_pva6m_"+hedge_tenor[smidx]]
+hedge4t_vec = np.select(cond_hedge,choices_hedge4t,default="")
+
+choices_hedge4f = ["","","",""]
+hedge4f_vec = np.select(cond_hedge,choices_hedge4f,default="")
+
+cond_vol = [
+    ( asset_sources[smidx,1]==VOL_BBG ) & ( ntrc_vec=="N" ),
+    ( asset_sources[smidx,1]==VOL_BBG ) & ( ntrc_vec=="F" ),
+    ( asset_sources[smidx,1]==VOL_BBG_LMEVOL ),
+    ( asset_sources[smidx,1]==VOL_CV )
+]
+
+choices_volt = [
+    vol_ticker[smidx],
+    vol_ticker[smidx],
+    hedge_fut_code[smidx]+"R"+fut_month_code[smidx]+(year_vec+yo).astype("U")+" " + hedge_market_code[smidx],
+    vol_near[smidx]
+]
+choices_volf = [
+    vol_near[smidx],
+    vol_far[smidx],
+    "PX_LAST",
+    "none"
+]
+
+volt_vec      = np.select(cond_vol,choices_volt,default="")
+volf_vec      = np.select(cond_vol,choices_volf,default="")
 
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
@@ -250,85 +304,9 @@ print(f"{month_vec.shape[0]:,} years")
 print(f" monthly straddle_count: {np.sum(aschlen[inidx])}")
 print(f"   total straddle_count: {len(smidx):,}")
 
-exit(0)
 # ============================================================================
-# compute straddles
+# show results
 # ============================================================================
-print("compute straddles...", end="")
-start_time = time.perf_counter()
-
-j=-1
-for year, month in zip(year_vec,month_vec):
-
-    for idx in inidx:
-
-        assid = asset_ids[idx]
-        schcnt = aschlen[idx]
-        
-        for i in range(schcnt):
-            j=j+1
-           
-            hedge = asset_data["Hedge"]
-            if hedge is None: continue
-            vol = asset_data["Vol"]
-            if vol is None: continue
-
-            if ntrc_vec[i]=="F" and  asset_sources[idx,1]!=VOL_BBG_LMEVOL: 
-                if asset_vol_tickers[idx,2]=="": continue
-                if asset_vol_tickers[idx,1]==asset_vol_tickers[idx,2]: continue
-                if asset_vol_tickers[idx,2]=="NONE": continue
-
-            if asset_sources[idx,1]==VOL_BBG and ntrc_vec[j]=="N":
-                volt_vec[j] = asset_vol_tickers[idx,0] #vol["Ticker"]
-                volf_vec[j] = asset_vol_tickers[idx,1] #vol["Near"]
-
-            if asset_sources[idx,1]==VOL_BBG and ntrc_vec[j]=="F":
-                volt_vec[j] = asset_vol_tickers[idx,0] # vol["Ticker"]
-                volf_vec[j] = asset_vol_tickers[idx,2] #vol["Far"]
-
-            if asset_sources[idx,1]==VOL_CV :
-                volt_vec[j] = asset_vol_tickers[idx,1] #vol["Near"]
-                volf_vec[j] = "none"
-
-            if asset_sources[idx,1]==VOL_BBG_LMEVOL:
-                fut_month_code = hedge_fut_month_map[idx][month - 1]
-                opt_month_code = "FGHJKMNQUVXZ"[month - 1]
-                year_offset = max(1 if fut_month_code < opt_month_code else 0, hedge_min_year_offset[idx])
-                volt_vec[j] = hedge["fut_code"]+"R"+fut_month_code+str(year + year_offset)+" " + hedge["market_code"] 
-                volf_vec[j] = "PX_LAST"
-            
-            if asset_sources[idx,0]==HEDGE_NONFUT:
-                hedge1t_vec[j] = asset_hedge_tickers[idx,0]
-                hedge1f_vec[j] = asset_hedge_tickers[idx,1]
-
-            elif asset_sources[idx,0]==HEDGE_FUT:
-                fut_month_code = hedge["fut_month_map"][month - 1]
-                opt_month_code = "FGHJKMNQUVXZ"[month - 1]
-                year_offset = max(1 if fut_month_code < opt_month_code else 0, hedge["min_year_offset"])
-                hedge1t_vec[j] = hedge["fut_code"]+fut_month_code+str(year + year_offset)+" " + hedge["market_code"] 
-                hedge1f_vec[j] = "PX_LAST"
-    
-            elif asset_sources[idx,0]==HEDGE_CDS:
-                hedge1t_vec[j] =  asset_hedge_tickers[idx,2]
-                hedge2t_vec[j] =  asset_hedge_tickers[idx,3]
-                hedge1f_vec[j] = "PX_LAST"
-                hedge2f_vec[j] = "PX_LAST"
-
-            elif asset_sources[idx,0]==HEDGE_CALC:
-                hedge1t_vec[j] = asset_hedge_tickers[idx,4]
-                hedge2t_vec[j] = asset_hedge_tickers[idx,5]
-                hedge3t_vec[j] = asset_hedge_tickers[idx,6]
-                hedge4t_vec[j] = asset_hedge_tickers[idx,7]
-                hedge1f_vec[j] = ""
-                hedge2f_vec[j] = ""
-                hedge3f_vec[j] = ""
-                hedge4f_vec[j] = ""
-
-
-            
-   
-print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({year_vec.shape[0]:,} straddles)")
-
 result = {
     "orientation": "numpy",
     "columns": [
