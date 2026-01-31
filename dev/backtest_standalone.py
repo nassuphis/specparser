@@ -1,25 +1,15 @@
 import numpy as np
 from numba import njit, types
-from numba.typed import Dict as ndict
 import time
 from pathlib import Path
 from typing import Any
 import yaml
-
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 
-# Import loader for real data experiments
-from specparser.amt import loader, table
 
-
-print("loading yaml........", end="")
+print("loading yaml".ljust(20, "."), end="")
 start_time = time.perf_counter()
-
-# Get asset data for a specific asset
-
-import yaml
-
 amt_resolved = str(Path("data/amt.yml").resolve())
 
 try: 
@@ -30,6 +20,10 @@ except ImportError:
 
 with open(amt_resolved, "r") as f:
     run_options = yaml.load(f, Loader=Loader)
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+print("processing amt".ljust(20, "."), end="")
+start_time = time.perf_counter()
 
 amt = run_options.get("amt", {})
 
@@ -153,21 +147,30 @@ for idx, asset in enumerate(amap.values()):
  
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({len(list(amap.keys()))} assets)")
-print(hedge_sources)
-print(vol_sources)
-print(schedule_matrix[idx_map["EURUSD Curncy"],:,:])
-print(hedge_ticker[idx_map["EURUSD Curncy"]])
-print(vol_ticker[idx_map["EURUSD Curncy"]])
-print("load prices.........", end="")
+#print(hedge_sources)
+#print(vol_sources)
+#print(schedule_matrix[idx_map["EURUSD Curncy"],:,:])
+#print(hedge_ticker[idx_map["EURUSD Curncy"]])
+#print(vol_ticker[idx_map["EURUSD Curncy"]])
+# ============================================================================
+# load price data
+# ============================================================================
+print("load prices".ljust(20, "."), end="")
 start_time = time.perf_counter()
-
 px = pq.read_table("data/prices_sorted.parquet")
-
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({px.num_rows:,} rows read)")
+# ============================================================================
+# convert date to epoch days for fast joining
+# ============================================================================
+print("extract epoch".ljust(20, "."), end="")
+start_time = time.perf_counter()
+px_epoch = px.column('date').to_numpy().astype('datetime64[D]').astype(np.int64)
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+
 # ============================================================================
 # allocate straddles
 # ============================================================================
-print("allocate straddles..", end="")
+print("compute straddles".ljust(20, "."), end="")
 start_time = time.perf_counter()
 
 # months
@@ -298,11 +301,52 @@ volf_vec      = np.select(cond_vol,choices_volf,default="")
 
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
-print(f"{asset_vec.shape[0]:,} assets")
-print(f"{year_vec.shape[0]:,} years")
-print(f"{month_vec.shape[0]:,} years")
-print(f" monthly straddle_count: {np.sum(aschlen[inidx])}")
-print(f"   total straddle_count: {len(smidx):,}")
+#print(f"{asset_vec.shape[0]:,} assets")
+#print(f"{year_vec.shape[0]:,} years")
+#print(f"{month_vec.shape[0]:,} years")
+#print(f" monthly straddle_count: {np.sum(aschlen[inidx])}")
+#print(f"   total straddle_count: {len(smidx):,}")
+
+# ============================================================================
+# expand to daily calendar
+# ============================================================================
+print("expand to days".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+# Precompute days-since-epoch lookup for all year-months (2000-01 to 2026-12)
+# This avoids slow datetime64 string parsing
+_ym_base = 2000 * 12  # base year-month
+_ym_range = np.arange(2000*12, 2027*12)  # year-months as integers
+_ym_dates = ((_ym_range // 12).astype('U') + '-' +
+             np.char.zfill((_ym_range % 12 + 1).astype('U'), 2) + '-01').astype('datetime64[D]')
+_ym_epoch = _ym_dates.astype(np.int64)  # days since 1970-01-01
+
+# Start year-month for each straddle (as integer year*12 + month-1)
+d_start_ym = np.where(ntrc_vec == "F", year2 * 12 + month2 - 1, year1 * 12 + month1 - 1)
+
+# Day index within each straddle (0, 1, 2, ..., day_count-1)
+total_days = np.sum(day_count_vec)
+di = np.arange(total_days) - np.repeat(np.cumsum(day_count_vec) - day_count_vec, day_count_vec)
+
+# Straddle index for each day (index into the 222K monthly straddle vectors)
+d_stridx = np.repeat(np.arange(len(day_count_vec)), day_count_vec)
+
+# Asset index for each day (index into asset-level arrays like anames, hedge_ticker, etc)
+d_smidx = np.repeat(smidx, day_count_vec)
+
+# Integer arrays - fast
+d_schid = np.repeat(schid_vec, day_count_vec)
+
+# String arrays: DON'T copy - use d_stridx to index into monthly vectors when needed
+# e.g., asset_vec[d_stridx], hedge1t_vec[d_stridx], volt_vec[d_stridx]
+
+# Compute days-since-epoch using lookup table (fast integer indexing)
+d_epoch = _ym_epoch[d_start_ym[d_stridx] - _ym_base] + di
+
+# Skip Y/M/D extraction - use d_epoch directly for joining with prices
+# The prices file has date as datetime64[D], convert to epoch days for O(1) lookup
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms (total day-straddles: {total_days:,})")
 
 # ============================================================================
 # show results
