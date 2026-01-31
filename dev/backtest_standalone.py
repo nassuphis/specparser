@@ -7,7 +7,7 @@ import yaml
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 
-
+script_start_time = time.perf_counter()
 print("loading yaml".ljust(20, "."), end="")
 start_time = time.perf_counter()
 amt_resolved = str(Path("data/amt.yml").resolve())
@@ -40,27 +40,59 @@ for asset_data in amt.values():
 
 anames = np.array(list(amap.keys()),dtype=np.dtypes.StringDType())
 idx_map = dict(zip(list(amap.keys()),range(len(anames))))
+
+# cache all straddle-related data into numpy arrays for vectorized access
 nps = np.dtypes.StringDType()
+
+# some info is converted into integers for speed
 hedge_source = np.array(list(map(lambda a:amap[a]["Hedge"].get("Source",""),anames)),dtype=nps)
+hedge_sources = list(set(hedge_source))
+hs2id_map = dict(zip(hedge_sources,range(len(hedge_sources)))) # integer codes for speed
+hedge_source_id = np.array([hs2id_map[x] for x in hedge_source],dtype=np.uint64)
+HEDGE_FUT      = hs2id_map["fut"]
+HEDGE_NONFUT   = hs2id_map["nonfut"]
+HEDGE_FUT      = hs2id_map["fut"]
+HEDGE_CDS      = hs2id_map["cds"]
+HEDGE_CALC     = hs2id_map["calc"]
+
 hedge_ticker = np.array(list(map(lambda a:amap[a]["Hedge"].get("Ticker",""),anames)),dtype=nps)
 hedge_field = np.array(list(map(lambda a:amap[a]["Hedge"].get("Field",""),anames)),dtype=nps)
 hedge_hedge = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge",""),anames)),dtype=nps)
 hedge_hedge1 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge1",""),anames)),dtype=nps)
-hedge_hedge2 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge2",""),anames)),dtype=nps)
-hedge_hedge3 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge3",""),anames)),dtype=nps)
-hedge_hedge4 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge4",""),anames)),dtype=nps)
+
+
 hedge_ccy = np.array(list(map(lambda a:amap[a]["Hedge"].get("ccy",""),anames)),dtype=nps)
 hedge_tenor = np.array(list(map(lambda a:amap[a]["Hedge"].get("tenor",""),anames)),dtype=nps)
+calc_hedge1 = hedge_ccy + "_fsw0m_"+ hedge_tenor
+calc_hedge2 = hedge_ccy + "_fsw6m_"+ hedge_tenor
+calc_hedge3 = hedge_ccy + "_pva0m_"+ hedge_tenor
+calc_hedge4 = hedge_ccy + "_pva6m_"+ hedge_tenor
+
 hedge_fut_month_map = np.array(list(map(lambda a:amap[a]["Hedge"].get("fut_month_map"," "*12),anames)),dtype=nps)
+hedge_fut_month_mtrx = hedge_fut_month_map.astype('S12').view('S1').reshape(-1,12).astype('U1')
+
+
 hedge_min_year_offset = np.array(list(map(lambda a:amap[a]["Hedge"].get("min_year_offset","0"),anames)),dtype=nps)
+hedge_min_year_offset_int = hedge_min_year_offset.astype(np.int64) # this is used as a number
 hedge_fut_code = np.array(list(map(lambda a:amap[a]["Hedge"].get("fut_code",""),anames)),dtype=nps)
 hedge_market_code = np.array(list(map(lambda a:amap[a]["Hedge"].get("market_code",""),anames)),dtype=nps)
+
 vol_source = np.array(list(map(lambda a:amap[a]["Vol"].get("Source",""),anames)),dtype=nps)
+vol_sources = list(set(vol_source))
+vs2id_map = dict(zip(vol_sources,range(len(vol_sources))))
+vol_source_id = np.array([vs2id_map[x] for x in vol_source],dtype=np.uint64)
+VOL_BBG_LMEVOL = vs2id_map["BBG_LMEVOL"]
+VOL_BBG        = vs2id_map["BBG"]
+VOL_CV         = vs2id_map["CV"]
 vol_ticker = np.array(list(map(lambda a:amap[a]["Vol"].get("Ticker",""),anames)),dtype=nps)
 vol_near = np.array(list(map(lambda a:amap[a]["Vol"].get("Near",""),anames)),dtype=nps)
 vol_far = np.array(list(map(lambda a:amap[a]["Vol"].get("Far",""),anames)),dtype=nps)
+
+# checksum of asset names
 achk = np.array([np.sum(np.frombuffer(x.encode('ascii'),dtype=np.uint8)) for x in anames],dtype=np.int64)
+# schedule names
 aschnam = np.array(list(map(lambda a:amap[a]["Options"],anames)),dtype=nps)
+# schedule count
 aschlen = np.array(list(map(
     lambda a:len(expiry_schedules[amap[a]["Options"]]),
     anames
@@ -99,76 +131,10 @@ schedule_matrix[easchi,easchj,2]=np.select(conds,choices_xprc,default=np.strings
 schedule_matrix[easchi,easchj,3]=np.select(conds,choices_xprv,default=np.strings.slice(easxprcv,1,20))
 schedule_matrix[easchi,easchj,4], _, rest = np.strings.partition(rest,'_')
 
-# encode strings as integers for speed
-hedge_sources = list(set(hedge_source))
-hs2id_map = dict(zip(hedge_sources,range(len(hedge_sources))))
-id2hs_map = dict(zip(range(len(hedge_sources)),hedge_sources))
-vol_sources = list(set(vol_source))
-vs2id_map = dict(zip(vol_sources,range(len(vol_sources))))
-id2vs_map = dict(zip(range(len(vol_sources)),vol_sources))
-VOL_BBG_LMEVOL = vs2id_map["BBG_LMEVOL"]
-VOL_BBG        = vs2id_map["BBG"]
-VOL_CV         = vs2id_map["CV"]
-HEDGE_FUT      = hs2id_map["fut"]
-HEDGE_NONFUT   = hs2id_map["nonfut"]
-HEDGE_FUT      = hs2id_map["fut"]
-HEDGE_CDS      = hs2id_map["cds"]
-HEDGE_CALC     = hs2id_map["calc"]
-# dim0: asset, dim1: 0=hedge,1=vol, values as above
-asset_sources = np.full((len(amap),2),0,dtype=np.uint32) 
 
-asset_hedge_tickers = np.full((len(amap),8),"",dtype=np.dtypes.StringDType()) 
-asset_vol_tickers = np.full((len(amap),3),"",dtype=np.dtypes.StringDType()) 
-asset_ids = np.array([np.sum(np.frombuffer(x.encode('ascii'),dtype=np.uint8)) for x in anames],dtype=np.uint64)
-
-for idx, asset in enumerate(amap.values()):
-    underlying = asset.get("Underlying")
-    # assets_ids
-    # asset_sources
-    asset_sources[idx,0] = hs2id_map[hedge_source[idx]] # hedge source
-    asset_sources[idx,1] = vs2id_map[vol_source[idx]] # vol source
-    # asset hedge tickers, fields
-    if hedge_source[idx]=="nonfut":
-        asset_hedge_tickers[idx,0] = hedge_ticker[idx]
-        asset_hedge_tickers[idx,1] = hedge_field[idx]
-    if hedge_source[idx]=="cds":
-        asset_hedge_tickers[idx,2] = hedge_hedge[idx]
-        asset_hedge_tickers[idx,3] = hedge_hedge1[idx]
-    if hedge_source[idx]=="calc":
-        asset_hedge_tickers[idx,4] = hedge_ccy[idx]+"_fsw0m_"+hedge_tenor[idx]
-        asset_hedge_tickers[idx,5] = hedge_ccy[idx]+"_fsw6m_"+hedge_tenor[idx]
-        asset_hedge_tickers[idx,6] = hedge_ccy[idx]+"_pva0m_"+hedge_tenor[idx]
-        asset_hedge_tickers[idx,7] = hedge_ccy[idx]+"_pva6m_"+hedge_tenor[idx]   
-    # asset vol tickers, fields
-    asset_vol_tickers[idx,0] = vol_ticker[idx]
-    asset_vol_tickers[idx,1] = vol_near[idx]
-    asset_vol_tickers[idx,2] = vol_far[idx]
-    # fill in schedule matrix, length
- 
-
-print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({len(list(amap.keys()))} assets)")
-#print(hedge_sources)
-#print(vol_sources)
-#print(schedule_matrix[idx_map["EURUSD Curncy"],:,:])
-#print(hedge_ticker[idx_map["EURUSD Curncy"]])
-#print(vol_ticker[idx_map["EURUSD Curncy"]])
-# ============================================================================
-# load price data
-# ============================================================================
-print("load prices".ljust(20, "."), end="")
-start_time = time.perf_counter()
-px = pq.read_table("data/prices_sorted.parquet")
-print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({px.num_rows:,} rows read)")
-# ============================================================================
-# convert date to epoch days for fast joining
-# ============================================================================
-print("extract epoch".ljust(20, "."), end="")
-start_time = time.perf_counter()
-px_epoch = px.column('date').to_numpy().astype('datetime64[D]').astype(np.int64)
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
-
 # ============================================================================
-# allocate straddles
+# compute straddles
 # ============================================================================
 print("compute straddles".ljust(20, "."), end="")
 start_time = time.perf_counter()
@@ -227,71 +193,97 @@ xprc_vec   = schedule_matrix[smidx,schid_vec,2]
 xprv_vec   = schedule_matrix[smidx,schid_vec,3]
 wgt_vec    = schedule_matrix[smidx,schid_vec,4]
 
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+# ============================================================================
+# straddle hedge tickers
+# ============================================================================
+print("hedge tickers".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
 # total day-count
 day_count_vec = days0_vec + days1_vec + np.where(ntrc_vec=="F",days2_vec,0)
 
+hedge_source_id_smidx = hedge_source_id[smidx]
+
 cond_hedge = [
-    asset_sources[smidx,0]==HEDGE_NONFUT,
-    asset_sources[smidx,0]==HEDGE_FUT,
-    asset_sources[smidx,0]==HEDGE_CDS,
-    asset_sources[smidx,0]==HEDGE_CALC
+    hedge_source_id_smidx == HEDGE_NONFUT,
+    hedge_source_id_smidx == HEDGE_FUT,
+    hedge_source_id_smidx == HEDGE_CDS,
+    hedge_source_id_smidx == HEDGE_CALC
 ]
 
-fut_month_code = np.strings.slice(hedge_fut_month_map[smidx],month_vec - 1,month_vec)
-opt_month_code = np.strings.slice("FGHJKMNQUVXZ",month_vec - 1,month_vec)
-myo = (hedge_min_year_offset[smidx]).astype(np.int64)
+fut_month_code = hedge_fut_month_mtrx[smidx,month_vec-1]
+month_code = np.frombuffer(b"FGHJKMNQUVXZ", dtype="S1").astype("U1")
+opt_month_code = month_code[month_vec-1]
+
+myo = hedge_min_year_offset_int[smidx]
 yo = np.maximum(np.where(fut_month_code < opt_month_code,1,0),myo)
 
+opt_yeartxt_vec = (year_vec+yo).astype("U")
+
+opt_tail = fut_month_code[smidx]+opt_yeartxt_vec+" " + hedge_market_code[smidx]
+
+hedge_ticker_smidx = hedge_ticker[smidx]
+
+hedge_fut_code_smidx = hedge_fut_code[smidx]
+
 choices_hedge1t = [
-    hedge_ticker[smidx],
-    hedge_fut_code[smidx]+fut_month_code[smidx]+(year_vec+yo).astype("U")+" " + hedge_market_code[smidx],
+    hedge_ticker_smidx,
+    hedge_fut_code_smidx+opt_tail,
     hedge_hedge[smidx],
-    hedge_ccy[smidx]+"_fsw0m_"+hedge_tenor[smidx]
+    calc_hedge1[smidx]
 ]
 hedge1t_vec = np.select(cond_hedge,choices_hedge1t,default="")
 
-choices_hedge1f = [
-    hedge_field[smidx],
-    "PX_LAST",
-    "PX_LAST",
-    ""
-]
+choices_hedge1f = [ hedge_field[smidx], "PX_LAST", "PX_LAST", "" ]
 hedge1f_vec = np.select(cond_hedge,choices_hedge1f,default="")
 
-choices_hedge2t = ["","",hedge_hedge1[smidx],hedge_ccy[smidx]+"_fsw6m_"+hedge_tenor[smidx]]
+choices_hedge2t = ["","",hedge_hedge1[smidx],calc_hedge2[smidx]]
 hedge2t_vec = np.select(cond_hedge,choices_hedge1f,default="")
 
 choices_hedge2f = ["","","PX_LAST",""]
 hedge2f_vec = np.select(cond_hedge,choices_hedge2f,default="")
 
-choices_hedge3t = ["","","",hedge_ccy[smidx]+"_pva0m_"+hedge_tenor[smidx]]
+choices_hedge3t = ["","","",calc_hedge3[smidx]]
 hedge3t_vec = np.select(cond_hedge,choices_hedge3t,default="")
 
-choices_hedge3f = ["","","",""]
-hedge3f_vec = np.select(cond_hedge,choices_hedge3f,default="")
+#choices_hedge3f = ["","","",""]
+hedge3f_vec = np.full(len(hedge3t_vec),"",dtype="U")
 
-choices_hedge4t = ["","","",hedge_ccy[smidx]+"_pva6m_"+hedge_tenor[smidx]]
-hedge4t_vec = np.select(cond_hedge,choices_hedge4t,default="")
+#choices_hedge4t = ["","","",calc_hedge4[smidx]]
+hedge4t_vec = np.where(cond_hedge[3],calc_hedge4[smidx],"")
 
-choices_hedge4f = ["","","",""]
-hedge4f_vec = np.select(cond_hedge,choices_hedge4f,default="")
+#choices_hedge4f = ["","","",""]
+hedge4f_vec = hedge3f_vec
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+# ============================================================================
+# straddle vol tickers
+# ============================================================================
+print("vol tickers".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+vol_source_id_smidx = vol_source_id[smidx]
 
 cond_vol = [
-    ( asset_sources[smidx,1]==VOL_BBG ) & ( ntrc_vec=="N" ),
-    ( asset_sources[smidx,1]==VOL_BBG ) & ( ntrc_vec=="F" ),
-    ( asset_sources[smidx,1]==VOL_BBG_LMEVOL ),
-    ( asset_sources[smidx,1]==VOL_CV )
+    ( vol_source_id_smidx==VOL_BBG ) & ( ntrc_vec=="N" ),
+    ( vol_source_id_smidx==VOL_BBG ) & ( ntrc_vec=="F" ),
+    ( vol_source_id_smidx==VOL_BBG_LMEVOL ),
+    ( vol_source_id_smidx==VOL_CV )
 ]
 
+vol_ticker_smidx = vol_ticker[smidx]
+vol_near_smidx = vol_near[smidx]
+vol_far_smidx = vol_far[smidx]
 choices_volt = [
-    vol_ticker[smidx],
-    vol_ticker[smidx],
-    hedge_fut_code[smidx]+"R"+fut_month_code[smidx]+(year_vec+yo).astype("U")+" " + hedge_market_code[smidx],
-    vol_near[smidx]
+    vol_ticker_smidx,
+    vol_ticker_smidx,
+    hedge_fut_code_smidx+"R"+opt_tail,
+    vol_near_smidx
 ]
 choices_volf = [
-    vol_near[smidx],
-    vol_far[smidx],
+    vol_near_smidx,
+    vol_far_smidx,
     "PX_LAST",
     "none"
 ]
@@ -301,25 +293,29 @@ volf_vec      = np.select(cond_vol,choices_volf,default="")
 
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
-#print(f"{asset_vec.shape[0]:,} assets")
-#print(f"{year_vec.shape[0]:,} years")
-#print(f"{month_vec.shape[0]:,} years")
-#print(f" monthly straddle_count: {np.sum(aschlen[inidx])}")
-#print(f"   total straddle_count: {len(smidx):,}")
-
 # ============================================================================
-# expand to daily calendar
+# precumpute days
 # ============================================================================
-print("expand to days".ljust(20, "."), end="")
+print("precompute days".ljust(20, "."), end="")
 start_time = time.perf_counter()
 
 # Precompute days-since-epoch lookup for all year-months (2000-01 to 2026-12)
 # This avoids slow datetime64 string parsing
 _ym_base = 2000 * 12  # base year-month
 _ym_range = np.arange(2000*12, 2027*12)  # year-months as integers
-_ym_dates = ((_ym_range // 12).astype('U') + '-' +
-             np.char.zfill((_ym_range % 12 + 1).astype('U'), 2) + '-01').astype('datetime64[D]')
+_ym_dates = (
+    (_ym_range // 12).astype('U') + '-' +
+    np.char.zfill((_ym_range % 12 + 1).astype('U'), 2) + '-01'
+).astype('datetime64[D]')
 _ym_epoch = _ym_dates.astype(np.int64)  # days since 1970-01-01
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+# ============================================================================
+# expand to daily calendar
+# ============================================================================
+print("expand days".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
 
 # Start year-month for each straddle (as integer year*12 + month-1)
 d_start_ym = np.where(ntrc_vec == "F", year2 * 12 + month2 - 1, year1 * 12 + month1 - 1)
@@ -346,8 +342,25 @@ d_epoch = _ym_epoch[d_start_ym[d_stridx] - _ym_base] + di
 # Skip Y/M/D extraction - use d_epoch directly for joining with prices
 # The prices file has date as datetime64[D], convert to epoch days for O(1) lookup
 
-print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms (total day-straddles: {total_days:,})")
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({len(list(amap.keys()))} assets)")
+# ============================================================================
+# load price data
+# ============================================================================
+print("load prices".ljust(20, "."), end="")
+start_time = time.perf_counter()
+px = pq.read_table("data/prices_sorted.parquet")
 
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({px.num_rows:,} rows read)")
+# ============================================================================
+# convert date to epoch days for fast joining
+# ============================================================================
+print("extract epoch".ljust(20, "."), end="")
+start_time = time.perf_counter()
+px_epoch = px.column('date').to_numpy().astype('datetime64[D]').astype(np.int64)
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms (total day-straddles: {total_days:,})")
+print("-"*40)
+print(f"total: {1e3*(time.perf_counter()-script_start_time):0.3f}ms")
 # ============================================================================
 # show results
 # ============================================================================
