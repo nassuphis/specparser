@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 import yaml
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 
@@ -147,6 +148,23 @@ STR_R = sch2id_map["R"]
 STR_W = sch2id_map["W"]
 STR_BD = sch2id_map["BD"]
 
+# Load price dictionaries early for asset-level ID precomputation
+ticker_dict = pq.read_table("data/prices_ticker_dict.parquet")["ticker"]
+field_dict = pq.read_table("data/prices_field_dict.parquet")["field"]
+n_fields = len(field_dict)
+
+# Pre-build ticker/field ID dicts (once, at startup)
+ticker_to_id = {s: i for i, s in enumerate(ticker_dict.to_pylist())}
+field_to_id = {s: i for i, s in enumerate(field_dict.to_pylist())}
+
+# Map asset-level tickers to IDs (avoids expensive np.unique later)
+hedge_ticker_tid = np.array([ticker_to_id.get(str(s), -1) for s in hedge_ticker], dtype=np.int32)
+hedge_hedge_tid = np.array([ticker_to_id.get(str(s), -1) for s in hedge_hedge], dtype=np.int32)
+calc_hedge1_tid = np.array([ticker_to_id.get(str(s), -1) for s in calc_hedge1], dtype=np.int32)
+hedge_field_fid = np.array([field_to_id.get(str(s), -1) for s in hedge_field], dtype=np.int32)
+PX_LAST_FID = field_to_id.get("PX_LAST", -1)
+EMPTY_FID = field_to_id.get("", -1)
+
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 # ============================================================================
 # compute straddles
@@ -240,25 +258,30 @@ cond_hedge = [
 # hedge ticker for nonfut
 hedge_ticker_smidx = hedge_ticker[smidx]
 
-# future calc for fut
-#
-# TODO: this calculation is expensive and only applied to futures
-# use mask np.flatnozero(hedge_source_id_smidx == HEDGE_FUT)
-#
+# future calc for fut - only compute for futures (11.3% of straddles)
+fut_idx = np.flatnonzero(hedge_source_id_fut_smidx)
 
-hedge_fut_code_smidx = hedge_fut_code[smidx]
-hedge_fut_month_code_smidx = hedge_fut_month_mtrx[smidx,month_vec-1]
+# Compute expensive string operations only for futures indices
+hedge_fut_code_m = hedge_fut_code[smidx[fut_idx]]
+hedge_fut_month_code_m = hedge_fut_month_mtrx[smidx[fut_idx], month_vec[fut_idx]-1]
 month_code = np.frombuffer(b"FGHJKMNQUVXZ", dtype="S1").astype("U1")
-hedge_opt_month_code_smidx = month_code[month_vec-1]
+hedge_opt_month_code_m = month_code[month_vec[fut_idx]-1]
 
-myo_smidx = hedge_min_year_offset_int[smidx]
-yo_smidx = np.maximum(np.where(hedge_fut_month_code_smidx < hedge_opt_month_code_smidx,1,0),myo_smidx)
+myo_m = hedge_min_year_offset_int[smidx[fut_idx]]
+yo_m = np.maximum(np.where(hedge_fut_month_code_m < hedge_opt_month_code_m, 1, 0), myo_m)
 
-hedge_fut_yeartxt_smidx = (year_vec+yo_smidx).astype("U")
-hedge_fut_tail_smidx = hedge_fut_month_code_smidx + hedge_fut_yeartxt_smidx + " " + hedge_market_code[smidx]
+hedge_fut_yeartxt_m = (year_vec[fut_idx] + yo_m).astype("U")
+hedge_fut_tail_m = hedge_fut_month_code_m + hedge_fut_yeartxt_m + " " + hedge_market_code[smidx[fut_idx]]
+hedge_fut_ticker_m = hedge_fut_code_m + hedge_fut_tail_m
 
+# Create full arrays with empty strings, fill only futures rows
+hedge_fut_code_smidx = np.full(smlen, "", dtype=nps)
+hedge_fut_tail_smidx = np.full(smlen, "", dtype=nps)
+hedge_fut_ticker = np.full(smlen, "", dtype=nps)
 
-hedge_fut_ticker = hedge_fut_code_smidx+hedge_fut_tail_smidx
+hedge_fut_code_smidx[fut_idx] = hedge_fut_code_m
+hedge_fut_tail_smidx[fut_idx] = hedge_fut_tail_m
+hedge_fut_ticker[fut_idx] = hedge_fut_ticker_m
 
 # hedge from cds, hedge1 from calc
 hedge_hedge_smidx = hedge_hedge[smidx]
@@ -377,10 +400,11 @@ d_start_ym = np.where(ntrc_vec == "F", year2 * 12 + month2 - 1, year1 * 12 + mon
 
 # Day index within each straddle (0, 1, 2, ..., day_count-1)
 total_days = np.sum(day_count_vec)
-di = np.arange(total_days) - np.repeat(np.cumsum(day_count_vec) - day_count_vec, day_count_vec)
+cumsum_vec = (np.cumsum(day_count_vec) - day_count_vec).astype(np.int32)
+di = np.arange(total_days, dtype=np.int32) - np.repeat(cumsum_vec, day_count_vec)
 
 # Straddle index for each day (index into the 222K monthly straddle vectors)
-d_stridx = np.repeat(np.arange(len(day_count_vec)), day_count_vec)
+d_stridx = np.repeat(np.arange(len(day_count_vec), dtype=np.int32), day_count_vec)
 
 # Asset index for each day (index into asset-level arrays like anames, hedge_ticker, etc)
 d_smidx = np.repeat(smidx, day_count_vec)
@@ -399,26 +423,86 @@ d_epoch = _ym_epoch[d_start_ym[d_stridx] - _ym_base] + di
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({len(list(amap.keys()))} assets)")
 # ============================================================================
-# load price data
+# load pre-keyed price data
 # ============================================================================
 print("load prices".ljust(20, "."), end="")
 start_time = time.perf_counter()
-px = pq.read_table("data/prices_sorted.parquet")
 
-print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({px.num_rows:,} rows read)")
+px_int = pq.read_table("data/prices_keyed.parquet")  # key, date, value only
+# Note: ticker_dict, field_dict, n_fields loaded earlier in processing amt
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({px_int.num_rows:,} rows)")
+
 # ============================================================================
-# convert date to epoch days for fast joining
+# map monthly hedge tickers to price dictionary IDs
 # ============================================================================
-print("extract epoch".ljust(20, "."), end="")
+print("map monthly ids".ljust(20, "."), end="")
 start_time = time.perf_counter()
-px_epoch = px.column('date').to_numpy().astype('datetime64[D]').astype(np.int64)
+
+# Map futures tickers (dynamic, depend on month) - small unique set
+unique_fut_tickers = np.unique(hedge_fut_ticker_m)
+fut_ticker_to_id = {str(s): ticker_to_id.get(str(s), -1) for s in unique_fut_tickers.tolist()}
+hedge_fut_ticker_tid_m = np.array([fut_ticker_to_id.get(str(s), -1) for s in hedge_fut_ticker_m], dtype=np.int32)
+
+# Expand asset-level IDs to straddle level (fast integer indexing)
+hedge_ticker_tid_smidx = hedge_ticker_tid[smidx]
+hedge_hedge_tid_smidx = hedge_hedge_tid[smidx]
+calc_hedge1_tid_smidx = calc_hedge1_tid[smidx]
+
+# Futures: full array with -1 for non-futures
+hedge_fut_ticker_tid = np.full(smlen, -1, dtype=np.int32)
+hedge_fut_ticker_tid[fut_idx] = hedge_fut_ticker_tid_m
+
+hedge_field_fid_smidx = hedge_field_fid[smidx]
+
+# np.select with integer arrays (no np.unique needed - 38x faster!)
+choices_tid = [hedge_ticker_tid_smidx, hedge_fut_ticker_tid, hedge_hedge_tid_smidx, calc_hedge1_tid_smidx]
+choices_fid = [hedge_field_fid_smidx, PX_LAST_FID, PX_LAST_FID, EMPTY_FID]
+
+month_tid = np.select(cond_hedge, choices_tid, default=-1).astype(np.int32)
+month_fid = np.select(cond_hedge, choices_fid, default=-1).astype(np.int32)
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+
+print("expand to daily".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+# Expand monthly IDs to daily via d_stridx (fast integer indexing)
+d_tid = month_tid[d_stridx]
+d_fid = month_fid[d_stridx]
+d_key = d_tid * n_fields + d_fid
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms (total day-straddles: {total_days:,})")
-print("-"*40)
-print(f"total: {1e3*(time.perf_counter()-script_start_time):0.3f}ms")
+
+print("build query table".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+# Build query table with integer keys (no string arrays!)
+q_int = pa.table({
+    "key": pa.array(d_key),
+    "date": pa.array(d_epoch.astype("datetime64[D]")),
+})
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+
+print("arrow join".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+# Join on integer keys
+out = q_int.join(px_int, keys=["key", "date"], join_type="left outer")
+
+# Extract result
+d_hedge1_value = out.column("value").to_numpy()
+
+found = np.sum(~np.isnan(d_hedge1_value))
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({found:,} found, {total_days-found:,} missing)")
+
 # ============================================================================
 # show results
 # ============================================================================
+print("-"*40)
+print(f"total: {1e3*(time.perf_counter()-script_start_time):0.3f}ms")
+
 result = {
     "orientation": "numpy",
     "columns": [
