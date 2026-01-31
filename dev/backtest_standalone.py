@@ -46,21 +46,23 @@ nps = np.dtypes.StringDType()
 
 # some info is converted into integers for speed
 hedge_source = np.array(list(map(lambda a:amap[a]["Hedge"].get("Source",""),anames)),dtype=nps)
-hedge_sources = list(set(hedge_source))
+hedge_sources, hedge_source_id = np.unique(hedge_source,return_inverse=True)
 hs2id_map = dict(zip(hedge_sources,range(len(hedge_sources)))) # integer codes for speed
-hedge_source_id = np.array([hs2id_map[x] for x in hedge_source],dtype=np.uint64)
-HEDGE_FUT      = hs2id_map["fut"]
-HEDGE_NONFUT   = hs2id_map["nonfut"]
-HEDGE_FUT      = hs2id_map["fut"]
-HEDGE_CDS      = hs2id_map["cds"]
-HEDGE_CALC     = hs2id_map["calc"]
+HEDGE_FUT = hs2id_map["fut"]
+hedge_source_id_fut = hedge_source_id == HEDGE_FUT
+HEDGE_NONFUT = hs2id_map["nonfut"]
+hedge_source_id_nonfut = hedge_source_id == HEDGE_NONFUT
+HEDGE_CDS = hs2id_map["cds"]
+hedge_source_id_cds = hedge_source_id == HEDGE_CDS
+HEDGE_CALC = hs2id_map["calc"]
+hedge_source_id_calc = hedge_source_id == HEDGE_CALC
 
 hedge_ticker = np.array(list(map(lambda a:amap[a]["Hedge"].get("Ticker",""),anames)),dtype=nps)
 hedge_field = np.array(list(map(lambda a:amap[a]["Hedge"].get("Field",""),anames)),dtype=nps)
 hedge_hedge = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge",""),anames)),dtype=nps)
 hedge_hedge1 = np.array(list(map(lambda a:amap[a]["Hedge"].get("hedge1",""),anames)),dtype=nps)
 
-
+# calc-type hedges are fixed concats, do here
 hedge_ccy = np.array(list(map(lambda a:amap[a]["Hedge"].get("ccy",""),anames)),dtype=nps)
 hedge_tenor = np.array(list(map(lambda a:amap[a]["Hedge"].get("tenor",""),anames)),dtype=nps)
 calc_hedge1 = hedge_ccy + "_fsw0m_"+ hedge_tenor
@@ -68,9 +70,9 @@ calc_hedge2 = hedge_ccy + "_fsw6m_"+ hedge_tenor
 calc_hedge3 = hedge_ccy + "_pva0m_"+ hedge_tenor
 calc_hedge4 = hedge_ccy + "_pva6m_"+ hedge_tenor
 
+# matrix of assets x months -> month_codes
 hedge_fut_month_map = np.array(list(map(lambda a:amap[a]["Hedge"].get("fut_month_map"," "*12),anames)),dtype=nps)
 hedge_fut_month_mtrx = hedge_fut_month_map.astype('S12').view('S1').reshape(-1,12).astype('U1')
-
 
 hedge_min_year_offset = np.array(list(map(lambda a:amap[a]["Hedge"].get("min_year_offset","0"),anames)),dtype=nps)
 hedge_min_year_offset_int = hedge_min_year_offset.astype(np.int64) # this is used as a number
@@ -78,34 +80,39 @@ hedge_fut_code = np.array(list(map(lambda a:amap[a]["Hedge"].get("fut_code",""),
 hedge_market_code = np.array(list(map(lambda a:amap[a]["Hedge"].get("market_code",""),anames)),dtype=nps)
 
 vol_source = np.array(list(map(lambda a:amap[a]["Vol"].get("Source",""),anames)),dtype=nps)
-vol_sources = list(set(vol_source))
+vol_sources, vol_source_id = np.unique(vol_source,return_inverse=True)
 vs2id_map = dict(zip(vol_sources,range(len(vol_sources))))
-vol_source_id = np.array([vs2id_map[x] for x in vol_source],dtype=np.uint64)
 VOL_BBG_LMEVOL = vs2id_map["BBG_LMEVOL"]
-VOL_BBG        = vs2id_map["BBG"]
-VOL_CV         = vs2id_map["CV"]
+vol_source_id_bbg_lmevol = vol_source_id == VOL_BBG_LMEVOL
+VOL_BBG = vs2id_map["BBG"]
+vol_source_id_bbg = vol_source_id == VOL_BBG
+VOL_CV = vs2id_map["CV"]
+vol_source_id_cv = vol_source_id == VOL_CV
+
 vol_ticker = np.array(list(map(lambda a:amap[a]["Vol"].get("Ticker",""),anames)),dtype=nps)
 vol_near = np.array(list(map(lambda a:amap[a]["Vol"].get("Near",""),anames)),dtype=nps)
 vol_far = np.array(list(map(lambda a:amap[a]["Vol"].get("Far",""),anames)),dtype=nps)
 
 # checksum of asset names
 achk = np.array([np.sum(np.frombuffer(x.encode('ascii'),dtype=np.uint8)) for x in anames],dtype=np.int64)
-# schedule names
-aschnam = np.array(list(map(lambda a:amap[a]["Options"],anames)),dtype=nps)
+
 # schedule count
-aschlen = np.array(list(map(
+aschcnt = np.array(list(map(
     lambda a:len(expiry_schedules[amap[a]["Options"]]),
     anames
 )),dtype=np.int64)
-easchcnt = np.repeat(aschlen,aschlen)
+
+# expanded count
+easchcnt = np.repeat(aschcnt,aschcnt)
+# expanded schedules
 eastmp = np.concatenate(list(map(
     lambda a:np.array(expiry_schedules[amap[a]["Options"]],dtype="|U20"),
     anames
 )),dtype="|U20")
 
 schedule_matrix = np.full((len(amap),np.max(easchcnt),5),"",dtype=np.dtypes.StringDType())
-easchj = np.arange(np.sum(aschlen))-np.repeat(np.cumsum(aschlen)-aschlen,aschlen)
-easchi = np.repeat(np.arange(len(anames)),aschlen)
+easchj = np.arange(np.sum(aschcnt))-np.repeat(np.cumsum(aschcnt)-aschcnt,aschcnt)
+easchi = np.repeat(np.arange(len(anames)),aschcnt)
 
 #ea_ntrcv,_,rest = np.strings.partition(eastmp,'_')
 easntrcv, _, rest = np.strings.partition(eastmp,'_')
@@ -130,7 +137,15 @@ choices_xprv=[
 schedule_matrix[easchi,easchj,2]=np.select(conds,choices_xprc,default=np.strings.slice(easxprcv,1))
 schedule_matrix[easchi,easchj,3]=np.select(conds,choices_xprv,default=np.strings.slice(easxprcv,1,20))
 schedule_matrix[easchi,easchj,4], _, rest = np.strings.partition(rest,'_')
-
+uniq_schedules, schedule_id_flat = np.unique(schedule_matrix, return_inverse=True)
+sch2id_map = dict(zip(uniq_schedules,range(len(uniq_schedules))))
+schedule_id_matrix = schedule_id_flat.reshape(schedule_matrix.shape)
+STR_OVERRIDE = sch2id_map["OVERRIDE"]
+STR_N = sch2id_map["N"]
+STR_F = sch2id_map["F"]
+STR_R = sch2id_map["R"]
+STR_W = sch2id_map["W"]
+STR_BD = sch2id_map["BD"]
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 # ============================================================================
@@ -147,10 +162,10 @@ ym_len = len(ym)
 # inas: input asset
 inas = anames
 inalen = len(inas)
-# asset_idxs : asset-count-length numpy array of index into numpy matrices with info
+# inidx : asset-count-length numpy array of index into numpy matrices with info
 inidx = np.array([idx_map[a] for a in inas],dtype=np.uint64)
 # inasc : input asset straddle count. # straddles by asset
-inasc = aschlen[inidx] # lengths
+inasc = aschcnt[inidx] # lengths
 sidx = np.repeat(inidx,inasc)  # by straddle asset index
 sc  = np.repeat(inasc,inasc)   # by straddle strad count for this index
 si1 = np.arange(np.sum(inasc)) 
@@ -165,8 +180,8 @@ smlen  = len(smidx)
 
 # asset, year, month
 asset_vec  =  inas[smidx]
-year_vec =  smym //12
-month_vec = smym % 12 + 1
+year_vec   =  smym //12
+month_vec  =  smym % 12 + 1
 
 # straddle days
 dpm = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],dtype=np.int8)
@@ -187,11 +202,21 @@ days2_vec = np.where(leap2,leap_feb,dpm[month2 - 1])
 # straddle 
 schcnt_vec = np.repeat(sc,ym_len)
 schid_vec  = np.repeat(si,ym_len)
-ntrc_vec   = schedule_matrix[smidx,schid_vec,0]
-ntrv_vec   = schedule_matrix[smidx,schid_vec,1]
-xprc_vec   = schedule_matrix[smidx,schid_vec,2]
-xprv_vec   = schedule_matrix[smidx,schid_vec,3]
-wgt_vec    = schedule_matrix[smidx,schid_vec,4]
+schedule_matrix_smidx = schedule_matrix[smidx,schid_vec,:]
+ntrc_vec   = schedule_matrix_smidx[:,0]
+ntrv_vec   = schedule_matrix_smidx[:,1]
+xprc_vec   = schedule_matrix_smidx[:,2]
+xprv_vec   = schedule_matrix_smidx[:,3]
+wgt_vec    = schedule_matrix_smidx[:,4]
+
+schedule_id_matrix_smidx = schedule_id_matrix[smidx,schid_vec,:]
+ntrc_id_vec   = schedule_id_matrix_smidx[:,0]
+ntrv_id_vec   = schedule_id_matrix_smidx[:,1]
+xprc_id_vec   = schedule_id_matrix_smidx[:,2]
+xprv_id_vec   = schedule_id_matrix_smidx[:,3]
+
+# total day-count
+day_count_vec = days0_vec + days1_vec + np.where(ntrc_id_vec==STR_F,days2_vec,0)
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 # ============================================================================
@@ -200,97 +225,127 @@ print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 print("hedge tickers".ljust(20, "."), end="")
 start_time = time.perf_counter()
 
-# total day-count
-day_count_vec = days0_vec + days1_vec + np.where(ntrc_vec=="F",days2_vec,0)
-
-hedge_source_id_smidx = hedge_source_id[smidx]
+hedge_source_id_nonfut_smidx = hedge_source_id_nonfut[smidx]
+hedge_source_id_fut_smidx    = hedge_source_id_fut[smidx]
+hedge_source_id_cds_smidx    = hedge_source_id_cds[smidx]
+hedge_source_id_calc_smidx   = hedge_source_id_calc[smidx]
 
 cond_hedge = [
-    hedge_source_id_smidx == HEDGE_NONFUT,
-    hedge_source_id_smidx == HEDGE_FUT,
-    hedge_source_id_smidx == HEDGE_CDS,
-    hedge_source_id_smidx == HEDGE_CALC
+    hedge_source_id_nonfut_smidx, 
+    hedge_source_id_fut_smidx, 
+    hedge_source_id_cds_smidx, 
+    hedge_source_id_calc_smidx
 ]
 
-fut_month_code = hedge_fut_month_mtrx[smidx,month_vec-1]
-month_code = np.frombuffer(b"FGHJKMNQUVXZ", dtype="S1").astype("U1")
-opt_month_code = month_code[month_vec-1]
-
-myo = hedge_min_year_offset_int[smidx]
-yo = np.maximum(np.where(fut_month_code < opt_month_code,1,0),myo)
-
-opt_yeartxt_vec = (year_vec+yo).astype("U")
-
-opt_tail = fut_month_code[smidx]+opt_yeartxt_vec+" " + hedge_market_code[smidx]
-
+# hedge ticker for nonfut
 hedge_ticker_smidx = hedge_ticker[smidx]
 
+# future calc for fut
+#
+# TODO: this calculation is expensive and only applied to futures
+# use mask np.flatnozero(hedge_source_id_smidx == HEDGE_FUT)
+#
+
 hedge_fut_code_smidx = hedge_fut_code[smidx]
+hedge_fut_month_code_smidx = hedge_fut_month_mtrx[smidx,month_vec-1]
+month_code = np.frombuffer(b"FGHJKMNQUVXZ", dtype="S1").astype("U1")
+hedge_opt_month_code_smidx = month_code[month_vec-1]
 
-choices_hedge1t = [
-    hedge_ticker_smidx,
-    hedge_fut_code_smidx+opt_tail,
-    hedge_hedge[smidx],
-    calc_hedge1[smidx]
-]
-hedge1t_vec = np.select(cond_hedge,choices_hedge1t,default="")
+myo_smidx = hedge_min_year_offset_int[smidx]
+yo_smidx = np.maximum(np.where(hedge_fut_month_code_smidx < hedge_opt_month_code_smidx,1,0),myo_smidx)
 
+hedge_fut_yeartxt_smidx = (year_vec+yo_smidx).astype("U")
+hedge_fut_tail_smidx = hedge_fut_month_code_smidx + hedge_fut_yeartxt_smidx + " " + hedge_market_code[smidx]
+
+
+hedge_fut_ticker = hedge_fut_code_smidx+hedge_fut_tail_smidx
+
+# hedge from cds, hedge1 from calc
+hedge_hedge_smidx = hedge_hedge[smidx]
+calc_hedge1_smidx = calc_hedge1[smidx]
+
+choices_hedge1t = [ hedge_ticker_smidx, hedge_fut_ticker, hedge_hedge_smidx, calc_hedge1_smidx ]
 choices_hedge1f = [ hedge_field[smidx], "PX_LAST", "PX_LAST", "" ]
+hedge1t_vec = np.select(cond_hedge,choices_hedge1t,default="")
 hedge1f_vec = np.select(cond_hedge,choices_hedge1f,default="")
 
 choices_hedge2t = ["","",hedge_hedge1[smidx],calc_hedge2[smidx]]
-hedge2t_vec = np.select(cond_hedge,choices_hedge1f,default="")
-
 choices_hedge2f = ["","","PX_LAST",""]
+hedge2t_vec = np.select(cond_hedge,choices_hedge1f,default="")
 hedge2f_vec = np.select(cond_hedge,choices_hedge2f,default="")
 
 choices_hedge3t = ["","","",calc_hedge3[smidx]]
-hedge3t_vec = np.select(cond_hedge,choices_hedge3t,default="")
-
 #choices_hedge3f = ["","","",""]
+hedge3t_vec = np.select(cond_hedge,choices_hedge3t,default="")
 hedge3f_vec = np.full(len(hedge3t_vec),"",dtype="U")
 
 #choices_hedge4t = ["","","",calc_hedge4[smidx]]
-hedge4t_vec = np.where(cond_hedge[3],calc_hedge4[smidx],"")
-
 #choices_hedge4f = ["","","",""]
+hedge4t_vec = np.where(cond_hedge[3],calc_hedge4[smidx],"")
 hedge4f_vec = hedge3f_vec
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 # ============================================================================
-# straddle vol tickers
+# straddle vol tickers (select)
 # ============================================================================
-print("vol tickers".ljust(20, "."), end="")
+print("vol tickers (select)".ljust(20, "."), end="")
 start_time = time.perf_counter()
 
 vol_source_id_smidx = vol_source_id[smidx]
+vol_source_id_bbg_smidx = vol_source_id_bbg[smidx]
+vol_source_id_bbg_lmevol_smidx = vol_source_id_bbg_lmevol[smidx]
+vol_source_id_bbg_cv_smidx = vol_source_id_cv[smidx]
 
 cond_vol = [
-    ( vol_source_id_smidx==VOL_BBG ) & ( ntrc_vec=="N" ),
-    ( vol_source_id_smidx==VOL_BBG ) & ( ntrc_vec=="F" ),
-    ( vol_source_id_smidx==VOL_BBG_LMEVOL ),
-    ( vol_source_id_smidx==VOL_CV )
+    ( vol_source_id_bbg_smidx ) & ( ntrc_id_vec==STR_N ),
+    ( vol_source_id_bbg_smidx ) & ( ntrc_id_vec==STR_F ),
+    ( vol_source_id_bbg_lmevol_smidx ),
+    ( vol_source_id_bbg_cv_smidx )
 ]
 
 vol_ticker_smidx = vol_ticker[smidx]
-vol_near_smidx = vol_near[smidx]
-vol_far_smidx = vol_far[smidx]
-choices_volt = [
-    vol_ticker_smidx,
-    vol_ticker_smidx,
-    hedge_fut_code_smidx+"R"+opt_tail,
-    vol_near_smidx
-]
-choices_volf = [
-    vol_near_smidx,
-    vol_far_smidx,
-    "PX_LAST",
-    "none"
-]
+vol_near_smidx   = vol_near[smidx]
+vol_far_smidx    = vol_far[smidx]
+vol_tkrz_smidx   = hedge_fut_code_smidx + "R" + hedge_fut_tail_smidx
 
+choices_volt = [vol_ticker_smidx,vol_ticker_smidx,vol_tkrz_smidx,vol_near_smidx]
 volt_vec      = np.select(cond_vol,choices_volt,default="")
+
+choices_volf = [vol_near_smidx,vol_far_smidx,"PX_LAST","none"]
 volf_vec      = np.select(cond_vol,choices_volf,default="")
 
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+# ============================================================================
+# straddle vol tickers (conditional)
+# ============================================================================
+print("vol tickers (cond)".ljust(20, "."), end="")
+start_time = time.perf_counter()
+# was slower then select versions
+"""
+idx1  = np.flatnonzero( ( vol_source_id_bbg_smidx ) & ( ntrc_id_vec==STR_N ) )
+idx2  = np.flatnonzero( ( vol_source_id_bbg_smidx ) & ( ntrc_id_vec==STR_F ) )
+idx3  = np.flatnonzero( vol_source_id_bbg_lmevol_smidx ) 
+idx4  = np.flatnonzero( vol_source_id_bbg_cv_smidx  )
+
+vol_ticker_smidx = vol_ticker[smidx]
+vol_near_smidx   = vol_near[smidx]
+vol_far_smidx    = vol_far[smidx]
+
+volt_vec = np.full(len(smidx),"",dtype=nps)
+volf_vec = np.full(len(smidx),"",dtype=nps)
+
+volt_vec[idx1] = vol_ticker_smidx[idx1]
+volf_vec[idx1] = vol_near_smidx[idx1]
+volt_vec[idx2] = vol_ticker_smidx[idx2]
+volf_vec[idx2] = vol_far_smidx[idx2]
+
+volt_vec[idx3] = hedge_fut_code_smidx[idx3] + "R" + hedge_fut_tail_smidx[idx3]
+volf_vec[idx3] = "PX_LAST"
+
+volt_vec[idx4] = vol_near_smidx[idx4]
+volf_vec[idx4] = "none"
+"""
 
 print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 # ============================================================================
