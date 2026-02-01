@@ -1085,12 +1085,143 @@ total:              ~296ms
 
 ### Performance Floor
 
-The current ~296ms is near its practical floor:
+The current ~312ms (with action detection) is near its practical floor:
 - I/O: ~55ms (YAML + prices)
 - Key computation: ~19ms
-- Merge kernels: ~194ms (memory bandwidth limited after Numba warmup)
+- Anchor computation: ~18ms (LUTs + override matrix + anchor dates)
+- Merge kernels: ~170ms (memory bandwidth limited after Numba warmup)
+- Action detection: ~11ms (parallel kernel)
 
-**Note on Numba warmup:** First run in a new Python process takes ~370ms due to JIT compilation and cache loading. Subsequent runs are at ~296ms. Kernel execution is ~2ms per leg (memory bandwidth limited at 60 GB/s).
+**Note on Numba warmup:** First run in a new Python process takes ~1300ms due to JIT compilation. Subsequent runs are at ~312ms. Kernel execution is ~2ms per leg (memory bandwidth limited at 60 GB/s).
+
+---
+
+## Phase 2-3: Action Detection (Entry/Expiry)
+
+### Goal
+
+Compute `action` array (int8[N]) where:
+- `0` = no action
+- `1` = entry (ntry)
+- `2` = expiry (xpry)
+
+Also outputs `ntry_offsets[S]` and `xpry_offsets[S]` (offset within straddle, -1 if not found).
+
+### Key Optimizations
+
+1. **No `dates[N]` array** - Compute inline: `d = month_start_epoch[s] + i`
+   - Saves 15.4M × 4 bytes = 62MB allocation
+   - Avoids cache pressure from large array access
+2. **Month-precomputed anchor LUTs** - ~324 months, not 222K straddles
+   - BD anchors: loop (cumulative counting)
+   - F/R/W anchors: vectorized (0.04ms)
+3. **Validity = key exists** - `req_vol = (vol_key >= 0)`, not n_hedges
+
+### xprc Distribution
+
+| Type | % | Method |
+|------|---|--------|
+| F (Friday) | 45.3% | Vectorized LUT |
+| BD (Business Day) | 41.0% | Loop LUT |
+| OVERRIDE | 11.9% | CSV lookup |
+| R (Thursday) | 1.1% | Vectorized LUT |
+| W (Wednesday) | 0.7% | Vectorized LUT |
+
+### Implementation
+
+```
+Step 1: Anchor LUTs (324 months)
+  - bd_anchor[month_idx, n]: Nth business day (n=1..23)
+  - fri/thu/wed_anchor[month_idx, n]: Nth weekday (n=1..5)
+
+Step 2: Anchor dates per straddle
+  - Vectorized LUT lookup by xprc type
+  - OVERRIDE: separate entry/expiry month lookups from CSV
+
+Step 3: Month ends
+  - ntry_month_end = month_start_epoch + entry_days - 1
+  - xpry_month_end = xpry_month_start + days0_vec - 1
+
+Step 4: Numba kernel (parallel)
+  - Find entry: first valid day >= target in entry month
+  - Fallback: last valid day in entry month
+  - Find expiry: first valid day >= target, must be >= ntry_off
+```
+
+### OVERRIDE Optimization
+
+Initial implementation had slow Python loop for OVERRIDE lookups:
+```python
+# Slow: Python loop with string formatting + dict lookup
+for i in idx_ovr:
+    k_entry = f"{smidx[i]}_{ntry_mi[i]}"
+    k_xpry = f"{smidx[i]}_{xpry_mi[i]}"
+    ntry_anchor[i] = override_dates.get(k_entry, INVALID)
+    xpry_anchor[i] = override_dates.get(k_xpry, INVALID)
+```
+
+**Optimization:** Build dense matrix once, vectorized lookup:
+```python
+# Build override_epoch[n_assets, N_MONTHS] matrix once (~8ms)
+override_epoch = np.full((n_assets, N_MONTHS), INVALID, dtype=np.int32)
+for key, epoch in override_dates.items():
+    smid, mi = key.split("_")
+    override_epoch[int(smid), int(mi)] = epoch
+
+# Vectorized lookup using smidx (integer asset index)
+idx_ovr = np.flatnonzero(xprc_code == XPRC_OVERRIDE)
+aid = smidx[idx_ovr].astype(np.int32)
+mi_entry = ntry_mi[idx_ovr]
+e_entry = np.where(valid_entry, override_epoch[aid, np.clip(mi_entry, 0, N_MONTHS-1)], INVALID)
+ntry_anchor[idx_ovr[ok_entry]] = e_entry[ok_entry]
+```
+
+**Results:**
+```
+anchor dates (before): 47.6ms  (Python loop)
+anchor dates (after):   5.3ms  (vectorized)
+override matrix:        8.6ms  (one-time build)
+Net savings:           33.7ms
+```
+
+### Parallel vs Serial Kernel
+
+Tested both parallel and serial `compute_actions` kernel:
+```
+Parallel (@njit(parallel=True) + prange):  11.2ms
+Serial (@njit + range):                    26.2ms
+```
+
+**Conclusion:** Parallel is 2.3x faster despite short inner loops (~60-90 days per straddle). Thread overhead is amortized across 222K straddles.
+
+### Benchmark Results (Final)
+
+```
+anchor LUTs.........:  4.1ms
+override matrix.....:  8.6ms  (one-time build)
+anchor dates........:  5.3ms  (vectorized OVERRIDE)
+compute actions.....: 11.2ms  (parallel kernel)
+
+Results:
+  ntry found: 165,913
+  xpry found: 165,913
+  valid straddles: 165,913 / 222,300 (74.6%)
+```
+
+**Note:** ~25% of straddles have INVALID anchors due to missing OVERRIDE CSV data.
+
+### Updated Pipeline Summary
+
+| Stage | Time | Notes |
+|-------|------|-------|
+| YAML + prices | ~55ms | I/O |
+| Key computation | ~19ms | ID-only |
+| Anchor LUTs | ~4ms | 324 months |
+| Override matrix | ~9ms | One-time build |
+| Anchor dates | ~5ms | Vectorized OVERRIDE |
+| Sweep merge (5 legs) | ~170ms | Filter-first |
+| Compute actions | ~11ms | Numba parallel |
+| **Total** | **~312ms** | **+16ms for actions** |
 
 ---
 
