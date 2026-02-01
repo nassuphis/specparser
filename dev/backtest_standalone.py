@@ -1166,6 +1166,15 @@ if DEBUG:
     end_max = int((month_out0.astype(np.int64) + day_count_vec.astype(np.int64)).max())
     assert end_max == total_days, f"out0+len mismatch: {end_max} != {total_days}"
 
+# Build straddle index mapping (daily row -> straddle)
+print("straddle idx".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+# np.repeat is faster than Numba kernel for this simple pattern
+straddle_idx = np.repeat(np.arange(smlen, dtype=np.int32), month_len)
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+
 # ========================================================================
 # Compute anchor dates (vectorized LUT lookup)
 # ========================================================================
@@ -1339,6 +1348,14 @@ print(f"  ntry found: {np.sum(action == 1):,}")
 print(f"  xpry found: {np.sum(action == 2):,}")
 print(f"  valid straddles: {valid_straddles:,} / {smlen:,}")
 
+# Breakdown by hedge source
+valid_mask_s = (ntry_offsets >= 0)
+valid_fut    = np.sum(valid_mask_s[fut_idx])
+valid_nonfut = np.sum(valid_mask_s[nonfut_idx])
+valid_cds    = np.sum(valid_mask_s[cds_idx])
+valid_calc   = np.sum(valid_mask_s[calc_idx])
+print(f"  by hedge source: fut={valid_fut:,} nonfut={valid_nonfut:,} cds={valid_cds:,} calc={valid_calc:,}")
+
 # ========================================================================
 # Phase 4A: Roll-forward (in-place)
 # ========================================================================
@@ -1398,6 +1415,24 @@ print(f"  pnl non-nan: {np.sum(~np.isnan(pnl)):,}")
 print(f"  avg daily pnl: {np.nanmean(pnl):.6f}")
 
 # ========================================================================
+# Compute pnl_valid_days per straddle (dte >= 0 and pnl not NaN)
+# ========================================================================
+print("pnl valid days".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+pnl_valid_days = np.zeros(smlen, dtype=np.int32)
+for s in range(smlen):
+    out0 = month_out0[s]
+    length = month_len[s]
+    dte_slice = days_to_expiry[out0:out0+length]
+    pnl_slice = pnl[out0:out0+length]
+    mask = (dte_slice >= 0) & ~np.isnan(pnl_slice)
+    pnl_valid_days[s] = int(mask.sum())
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
+print(f"  total valid days: {pnl_valid_days.sum():,}")
+
+# ========================================================================
 # Output assembly (strings decoded for reporting)
 # ========================================================================
 # NOTE: For max speed, gate string decoding behind a flag and only decode
@@ -1442,6 +1477,7 @@ result = {
 
 # Daily-level value arrays (total_days length, separate from straddle-month result)
 daily_values = {
+    "straddle_idx": straddle_idx,  # maps daily row -> straddle index
     "vol": d_vol_value,
     "hedge1": d_hedge1_value,
     "hedge2": d_hedge2_value,
@@ -1455,5 +1491,55 @@ daily_values = {
     "hpnl": hpnl,
     "pnl": pnl,
 }
+
+# ========================================================================
+# Save to .npz files
+# ========================================================================
+print("saving npz".ljust(20, "."), end="")
+start_time = time.perf_counter()
+
+# Straddle metadata (222K straddles)
+np.savez_compressed(
+    "data/straddles.npz",
+    year=year_vec,
+    month=month_vec,
+    asset=asset_vec,
+    schcnt=schcnt_vec,
+    schid=schid_vec,
+    ntrc=ntrc_vec,
+    ntrv=ntrv_vec,
+    xprc=xprc_vec,
+    xprv=xprv_vec,
+    wgt=wgt_vec,
+    days0=days0_vec,
+    days1=days1_vec,
+    days2=days2_vec,
+    day_count=day_count_vec,
+    # Slicing arrays for daily values
+    out0=month_out0,
+    length=month_len,
+    month_start_epoch=month_start_epoch,
+    pnl_valid_days=pnl_valid_days,
+)
+
+# Daily valuations (15.4M rows)
+np.savez_compressed(
+    "data/valuations.npz",
+    straddle_idx=straddle_idx,
+    vol=d_vol_value,
+    hedge1=d_hedge1_value,
+    hedge2=d_hedge2_value,
+    hedge3=d_hedge3_value,
+    hedge4=d_hedge4_value,
+    strike=strike,
+    days_to_expiry=days_to_expiry,
+    mv=mv,
+    delta=delta,
+    opnl=opnl,
+    hpnl=hpnl,
+    pnl=pnl,
+)
+
+print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 
     
