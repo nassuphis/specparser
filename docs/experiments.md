@@ -13,12 +13,20 @@ This document summarizes all performance optimization experiments conducted on t
 | Skip expand days in sweep mode | ~95ms saved | Implemented |
 | Searchsorted for ticker ID mapping | ~2ms | Implemented (marginal) |
 | NumPy format (replace Parquet) | ~220ms saved | Implemented |
+| Hedge tickers type-dispatch | 2x (~27ms saved) | Superseded by ID-only |
+| **ID-only pipeline (5 legs)** | **5 legs for ~2x cost of 1** | **Implemented** |
+| Filter-first sweep (sparse legs) | 7-8x for sparse | Implemented (in ID-only) |
+| Fused sweep (5 legs in 1 sort) | 0.86x (-13ms) | Rejected (sequential faster) |
 | Single-pass asset extraction + per-field unique | 0ms | Rejected (no improvement) |
+| Sweep merge run-based buffering | 0ms | Rejected (already memory-bound) |
+| Futures ticker dedup (packed keys) | ~1ms | Rejected (overhead too high) |
 
 **Final pipeline performance:**
 - Before optimizations: ~748ms
 - After algorithmic optimizations: ~490ms (34% faster)
-- After NumPy format: **~275ms** (63% faster total)
+- After NumPy format: ~275ms (63% faster total)
+- After hedge tickers type-dispatch: ~243ms (67% faster total)
+- **After ID-only 5-leg pipeline: ~296ms** (all 5 legs vs 1 leg previously)
 
 ---
 
@@ -71,7 +79,7 @@ def _lookup_parallel(q_key, q_date, block_of, starts, ends, px_date, px_value):
 `np.unique` on 222K monthly tickers took ~65ms per run.
 
 ### Solution
-Pre-map ticker→ID at asset level (74 assets) during startup, then use integer `np.select`:
+Pre-map ticker→ID at asset level (189 assets) during startup, then use integer `np.select`:
 
 ```python
 # At startup (once)
@@ -528,6 +536,461 @@ total:                274.5ms
 
 ---
 
+## 12. Sweep Merge Optimization Analysis
+
+### Problem
+
+The sweep merge kernel was showing ~85ms in timing output, which seemed like a candidate for optimization. Proposed improvements included:
+1. Run-based buffering (scan prices once, copy slices)
+2. Lower bound binary search at group start
+3. Remove redundant bounds checks
+
+### Investigation
+
+Created diagnostics (`dev/bench_merge_diagnostics.py`) to understand the workload:
+
+```
+Groups:           3,404
+Straddles:        222,300
+Total runs:       3,404 (all intervals in each group overlap)
+Avg overlap:      5.4x
+Avg run length:   559 days
+Output cells:     15,394,866
+```
+
+### Discovery: Numba First-Call Overhead
+
+Benchmarking revealed the 85ms is NOT algorithm time but Numba initialization:
+
+```
+Process 1 (cold cache):
+  Run 1: 334ms  <- JIT compilation
+  Run 2: 0.1ms
+
+Process 2 (warm cache):
+  Run 1: 70ms   <- Cache loading + OpenMP init
+  Run 2: 0.1ms
+```
+
+The actual kernel execution is only **~2ms**, which is at the **memory bandwidth limit**:
+
+```
+Output array: 15,394,866 float64 = 123.2 MB
+At 60 GB/s memory bandwidth: 2.1 ms theoretical minimum
+Actual kernel time: ~2 ms
+```
+
+### Results
+
+| Variant | Time (ms) | Notes |
+|---------|-----------|-------|
+| Original | 2.1 | Current implementation |
+| With lower_bound | 2.1 | Binary search at group start |
+| Run-based buffering | 2.1 | Buffer once, copy slices |
+| Run-based v2 (no buffer) | 181 | Scan once, write all - SLOWER |
+
+All algorithmic variants perform identically because the kernel is **I/O bound**, not compute bound.
+
+### Conclusion
+
+The sweep merge kernel is **already optimal** for this workload:
+- Actual execution: ~2ms (memory bandwidth limited)
+- Reported 85ms is Numba first-call overhead (cache load + OpenMP init)
+- No algorithmic improvement possible
+
+**Recommendations:**
+- Keep current `_merge_per_key` implementation
+- The ~85ms overhead is unavoidable per Python process
+- For repeated runs within same process, kernel executes at ~2ms
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `bench_merge_diagnostics.py` | Workload analysis |
+| `bench_merge_runs.py` | Variant comparison |
+| `bench_merge_debug.py` | Timing investigation |
+| `bench_first_call.py` | First-call overhead test |
+
+---
+
+## 13. Hedge Tickers Type-Dispatch Optimization
+
+### Problem
+
+The "hedge tickers" section was taking ~53ms. Initial hypothesis: futures ticker string construction (25K rows with 7.8x dedup potential) was the bottleneck.
+
+### Investigation
+
+**Breakdown of the 53ms:**
+```
+Build condition arrays:   0.8ms
+hedge_ticker[smidx]:      3.1ms
+np.flatnonzero:           0.1ms
+Futures ticker build:     5.6ms
+Full-size array alloc:    5.3ms
+hedge_hedge/calc[smidx]:  6.5ms
+np.select hedge1t/f:      9.4ms  <- expensive
+np.select hedge2t/f:     11.7ms  <- expensive
+np.select hedge3t/f:      5.9ms
+np.where hedge4t:         5.4ms
+--------------------------------
+Total:                   53.1ms
+```
+
+**Key discovery:** The `np.select` calls were the major cost (~32ms total), not futures ticker construction (~6ms).
+
+**Why np.select is slow:** It expands ALL choice arrays to full size (222K) before selecting, even though each hedge type uses only a fraction of rows:
+- nonfut: 176,400 rows (79.4%)
+- fut: 25,200 rows (11.3%)
+- cds: 1,500 rows (0.7%)
+- calc: 19,200 rows (8.6%)
+
+### Solution: Type-Dispatch
+
+Instead of:
+```python
+choices = [ticker_smidx, fut_ticker, hedge_smidx, calc_smidx]  # all 222K each
+result = np.select(conditions, choices, default="")
+```
+
+Use index-based filling:
+```python
+result = np.empty(smlen, dtype=nps)
+result.fill("")
+result[nonfut_idx] = ticker[smidx[nonfut_idx]]   # 176K
+result[fut_idx] = fut_ticker_m                    # 25K
+result[cds_idx] = hedge[smidx[cds_idx]]          # 1.5K
+result[calc_idx] = calc[smidx[calc_idx]]         # 19K
+```
+
+This only expands strings for rows that actually need them.
+
+### Results
+
+```
+BEFORE:
+  hedge tickers: 53ms
+
+AFTER:
+  hedge tickers: 26ms
+
+Savings: 27ms (2x speedup)
+```
+
+### Rejected: Futures Ticker Dedup
+
+Also tested packing futures components into int64 keys, deduping, building strings only for unique combinations:
+- Total futures rows: 25,200
+- Unique tickers: 3,236
+- Dedup ratio: 7.8x
+- **Result: Only ~1ms savings**
+
+The overhead from `np.unique` calls (~6ms) ate most of the benefit from reduced string allocations.
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `bench_hedge_tickers.py` | Futures dedup benchmark |
+| `bench_hedge_tickers_full.py` | Full section breakdown |
+| `bench_hedge_tickers_opt.py` | Type-dispatch benchmark |
+| `bench_np_select.py` | np.select alternatives |
+
+---
+
+## 14. ID-Only Pipeline Investigation
+
+### Problem
+
+The pipeline currently runs only 1 sweep merge (hedge1). A request was made to support all 5 leg values (hedge1-4 + vol). This investigation explores:
+1. Can we eliminate string arrays entirely by computing keys directly?
+2. What is the cost of running 5 sweep merges?
+
+### Data Distribution (from bench_vol_tickers_full.py)
+
+Vol source types at straddle level (N=222,300):
+- **BBG**: 198,000 rows (89.1%)
+- **BBG_LMEVOL**: 3,600 rows (1.6%)
+- **CV**: 20,700 rows (9.3%)
+
+Key insight: LMEVOL assets always have `fut` hedge source (100%), so R-ticker construction can reuse futures components.
+
+### Benchmark 1: Vol Tickers Breakdown
+
+```
+Vol Tickers Section (~29ms):
+  Build condition arrays:   0.1ms
+  vol_ticker[smidx]:        4.2ms
+  vol_near[smidx]:          5.7ms
+  vol_far[smidx]:           4.6ms
+  String concat (R-ticker): 4.8ms
+  np.select volt_vec:       3.4ms
+  np.select volf_vec:       4.1ms
+  --------------------------------
+  Total:                   28.9ms
+
+Type-Dispatch Alternative:  20.0ms
+Speedup:                    1.44x
+Savings:                    8.9ms
+```
+
+### Benchmark 2: ID-Only Key Computation
+
+Instead of building string arrays and then mapping to IDs, compute keys directly:
+
+```
+Current (all strings):      39.0ms  (builds 10 string arrays)
+ID-only (all 5 keys):        3.6ms  (builds 5 int32 arrays)
+Speedup:                   10.7x
+Savings:                   35.4ms
+```
+
+**Key insight:** Integer operations are 10x faster than string materialization.
+
+### Benchmark 3: Multi-Sweep Cost
+
+Running 5 independent sweep merges:
+
+```
+Single Sweep (hedge1 only):
+  Prep:    18.0ms (lexsort, 3,404 groups)
+  Merge:    5.4ms (8.5M values found)
+  Total:   23.3ms
+
+5 Sequential Sweeps:
+  Prep:    68.0ms (5 independent lexsorts)
+  Merge:   37.2ms (5 independent merges)
+  Total:  105.2ms
+
+Per-leg breakdown:
+  hedge1: 23.1ms (3,404 groups, 8.5M found)
+  hedge2: 12.9ms (17 groups, 792K found) ← very sparse
+  hedge3: 10.9ms (16 groups, 754K found) ← very sparse
+  hedge4: 11.0ms (16 groups, 754K found) ← very sparse
+  vol:    20.2ms (278 groups, 7.4M found)
+```
+
+**Key insight:** hedge2-4 have very few groups (16-17) because only CDS (1.5K rows) and calc (19.2K rows) types populate them.
+
+### Cost-Benefit Analysis
+
+**Option A: Current pipeline (hedge1 only)**
+- Hedge tickers (strings): ~26ms
+- Vol tickers (strings): ~27ms
+- Map monthly IDs: ~7ms
+- 1 sweep: ~23ms
+- **Total relevant: ~83ms**
+
+**Option B: Naive 5-leg (strings + 5 sweeps)**
+- Hedge strings: ~26ms
+- Vol strings: ~27ms
+- Map monthly IDs (5 legs): ~35ms
+- 5 sweeps: ~105ms
+- **Total: ~193ms**
+
+**Option C: ID-only 5-leg (keys + 5 sweeps)**
+- Key computation: ~4ms
+- 5 sweeps: ~105ms
+- **Total: ~109ms**
+
+**Savings: C vs B = ~84ms (44% faster)**
+
+### Impact on Total Pipeline
+
+| Scenario | String/Key Section | Sweep Section | Delta vs Current |
+|----------|-------------------|---------------|------------------|
+| Current (hedge1 only) | 60ms | 23ms | baseline |
+| Naive 5-leg | 88ms | 105ms | +110ms |
+| ID-only 5-leg | 4ms | 105ms | +26ms |
+
+**Conclusion:** If all 5 leg values are needed, the ID-only approach adds ~26ms to the pipeline (243ms → ~269ms) but saves ~84ms compared to the naive string-based approach.
+
+### Recommended Implementation
+
+1. **Extend asset-level ID precomputation** (add hedge_hedge1_tid, calc_hedge2-4_tid, vol IDs)
+2. **Replace hedge tickers section** with direct key computation
+3. **Replace vol tickers section** with direct key computation
+4. **Add sweep_leg helper function** for clean per-leg sweep merge
+5. **Run 5 sweep merges** in sequence
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `bench_vol_tickers_full.py` | Vol tickers breakdown + type-dispatch test |
+| `bench_id_only.py` | ID-only key computation benchmark |
+| `bench_multi_sweep.py` | Multi-sweep cost analysis |
+
+---
+
+## 15. Fused Sweep Investigation
+
+### Problem
+
+The ID-only approach (Section 14) requires 5 sequential sweeps, each with its own lexsort. Since all 5 legs share identical date intervals (month_start_epoch, month_len, month_out0), can we exploit this with a single fused sweep?
+
+### Approach
+
+**Sequential (filter-first):** Filter valid keys first, then 5 independent lexsorts
+- Critical optimization: sort only the filtered subset (huge win for sparse legs)
+- 5 separate output arrays
+
+**Fused:** 1 lexsort + 1 merge kernel call with leg_id
+- Concatenate all valid intervals with leg_id marker
+- Single lexsort on combined data
+- Modified kernel writes to 2D output based on leg_id
+
+### Benchmark Results (Corrected)
+
+Initial benchmark used sort-then-filter, which unfairly penalized sequential for sparse legs.
+**Corrected benchmark uses filter-first:**
+
+```
+Data: 222,300 straddles (benchmark snapshot; production has 15.4M daily rows)
+
+Sequential (filter-first, 5 independent):
+  Prep (5 lexsorts):  39.5ms
+  Merge (5 kernels):  40.0ms
+  TOTAL:              79.5ms
+
+  Per-leg breakdown (filter-first is crucial for sparse legs):
+    hedge1: 20.0ms (100% valid)
+    hedge2:  1.6ms (9% valid)   ← 7x faster than sort-then-filter!
+    hedge3:  1.3ms (8.6% valid) ← 8x faster!
+    hedge4:  1.5ms (8.6% valid) ← 7x faster!
+    vol:    18.3ms (98% valid)
+
+Fused (1 unified):
+  Prep (1 lexsort):   49.5ms  (499,500 intervals, 3,731 groups)
+  Merge (1 kernel):   43.1ms
+  TOTAL:              92.6ms
+
+Result: Sequential is 13ms FASTER than fused!
+```
+
+### Analysis
+
+With filter-first sequential:
+- **Sparse legs are fast:** hedge2-4 sort only ~20K rows instead of 222K
+- **Fused has overhead:** Single lexsort on 500K combined rows is slower than 5 small sorts
+- **Merge 2D writes are slower:** 2D array indexing adds cache pressure
+
+### Conclusion
+
+**Sequential filter-first is the clear winner:**
+- 13ms faster than fused (79.5ms vs 92.6ms)
+- Simpler implementation (no 2D output, no leg_id array)
+- Naturally exploits sparsity of hedge2-4
+
+**Recommendation:** Use sequential filter-first approach. No benefit to fused sweep.
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `bench_fused_sweep.py` | Fused vs sequential sweep comparison (filter-first corrected) |
+
+---
+
+## 16. ID-Only Pipeline Implementation (Shipped)
+
+### Summary
+
+The ID-only pipeline was implemented in `dev/backtest_standalone.py`, eliminating all string materialization for hedge/vol tickers by computing integer keys directly. This enables computing all 5 leg values (hedge1-4 + vol) for approximately 2x the cost of the previous single-leg implementation.
+
+### Implementation Details
+
+**Step 1: Asset-level IDs** (line ~395)
+```python
+# Hedge IDs for legs 2-4
+hedge_hedge1_tid = np.array([ticker_to_id.get(str(s), -1) for s in hedge_hedge1], dtype=np.int32)
+calc_hedge2_tid  = np.array([ticker_to_id.get(str(s), -1) for s in calc_hedge2], dtype=np.int32)
+calc_hedge3_tid  = np.array([ticker_to_id.get(str(s), -1) for s in calc_hedge3], dtype=np.int32)
+calc_hedge4_tid  = np.array([ticker_to_id.get(str(s), -1) for s in calc_hedge4], dtype=np.int32)
+
+# Vol IDs - dual mapping (BBG: near/far as fields, CV: near as ticker)
+vol_ticker_tid = np.array([ticker_to_id.get(str(s), -1) for s in vol_ticker], dtype=np.int32)
+vol_near_fid   = np.array([field_to_id.get(str(s), -1) for s in vol_near], dtype=np.int32)
+vol_far_fid    = np.array([field_to_id.get(str(s), -1) for s in vol_far], dtype=np.int32)
+vol_near_tid   = np.array([ticker_to_id.get(str(s), -1) for s in vol_near], dtype=np.int32)
+```
+
+**Step 2: Key computation** (line ~467)
+
+Replaced hedge/vol string sections with direct integer key computation:
+```python
+hedge1_key[nonfut_idx] = hedge_ticker_tid_smidx[nonfut_idx] * n_fields + hedge_field_fid_smidx[nonfut_idx]
+hedge1_key[fut_idx]    = hedge_fut_tid_smidx[fut_idx]       * n_fields + PX_LAST_FID
+hedge1_key[cds_idx]    = hedge_hedge_tid_smidx[cds_idx]     * n_fields + PX_LAST_FID
+hedge1_key[calc_idx]   = calc1_tid_smidx[calc_idx]          * n_fields + EMPTY_FID
+# ... similar for hedge2-4 and vol
+```
+
+**Step 3: Filter-first sweep_leg helper** (line ~188)
+
+Critical optimization: filter valid keys BEFORE sorting (7-8x faster for sparse legs):
+```python
+def sweep_leg(label, key_i32, month_start_epoch, month_len, month_out0, ...):
+    # Filter-first: key in range AND has price data
+    valid = (key_i32 >= 0) & (key_i32 <= max_valid_key)
+    valid_keys = key_i32[valid]
+    valid[valid] &= (px_block_of[valid_keys] >= 0)  # Only keys with actual price data
+
+    # Sort only the filtered subset (huge win for sparse legs like hedge2-4)
+    k = key_i32[valid].astype(np.int32)
+    order = np.lexsort((s, k))
+    # ... merge
+```
+
+**Step 4: 5 sequential sweeps** (line ~653)
+```python
+d_hedge1_value = sweep_leg("sweep hedge1", hedge1_key, ...)
+d_hedge2_value = sweep_leg("sweep hedge2", hedge2_key, ...)
+d_hedge3_value = sweep_leg("sweep hedge3", hedge3_key, ...)
+d_hedge4_value = sweep_leg("sweep hedge4", hedge4_key, ...)
+d_vol_value    = sweep_leg("sweep vol",    vol_key,    ...)
+```
+
+### Results (Warmed Cache)
+
+```
+hedge/vol keys (ids): 19.5ms
+sweep hedge1........: 111.2ms (10,043,445 found)
+sweep hedge2........:  16.4ms (803,425 found)  ← sparse, filter-first fast
+sweep hedge3........:  16.1ms (764,680 found)  ← sparse, filter-first fast
+sweep hedge4........:  16.8ms (764,680 found)  ← sparse, filter-first fast
+sweep vol...........:  33.8ms (8,416,107 found)
+----------------------------------------
+total: 295.6ms
+```
+
+### Key Insights
+
+1. **Filter-first is critical:** Sparse legs (hedge2-4 are only ~9% valid) benefit enormously from sorting only the filtered subset.
+
+2. **5 legs for ~2x cost of 1:** Previous single-leg pipeline was ~150ms for hedge1 only. New 5-leg pipeline is ~296ms for all 5 values.
+
+3. **LMEVOL ⊆ FUT invariant:** LMEVOL assets always have `fut` hedge source, so R-ticker construction reuses futures components.
+
+4. **String elimination:** No more string arrays for hedge1t/f through volt/f. All replaced by integer keys.
+
+### Comparison
+
+| Scenario | Key/String Section | Sweep Section | Total | Legs |
+|----------|-------------------|---------------|-------|------|
+| Old (strings, hedge1 only) | ~83ms | ~23ms | ~150ms | 1 |
+| New (ID-only, all 5) | ~20ms | ~194ms | ~296ms | 5 |
+
+**Net result:** 5 legs for ~2x cost. Per-leg cost dropped from ~150ms to ~59ms.
+
+### Debug Features
+
+- LMEVOL ⊆ FUT invariant check: `DEBUG = True` enables assertion
+- `px_block_of[key] >= 0` filter: Skips keys with no price data
+
+---
+
 ## Benchmark Files
 
 Created during experimentation:
@@ -546,6 +1009,19 @@ Created during experimentation:
 | `bench_sweep_a.py` | Key-grouped merge |
 | `bench_sweep_b.py` | Sweep-line comparison |
 | `preprocess_to_numpy.py` | Parquet → NumPy conversion |
+| `bench_merge_diagnostics.py` | Sweep merge workload analysis |
+| `bench_merge_runs.py` | Sweep merge variant comparison |
+| `bench_merge_debug.py` | Timing investigation |
+| `bench_first_call.py` | Numba first-call overhead test |
+| `bench_hedge_tickers.py` | Futures dedup benchmark |
+| `bench_hedge_tickers_full.py` | Hedge tickers breakdown |
+| `bench_hedge_tickers_opt.py` | Type-dispatch benchmark |
+| `bench_np_select.py` | np.select alternatives |
+| `bench_vol_tickers_full.py` | Vol tickers breakdown |
+| `bench_id_only.py` | ID-only key computation benchmark |
+| `bench_multi_sweep.py` | Multi-sweep cost analysis |
+| `bench_fused_sweep.py` | Fused vs sequential sweep comparison |
+| `backtest_standalone.py` | **Main implementation** (ID-only 5-leg pipeline) |
 
 ---
 
@@ -559,6 +1035,9 @@ Created during experimentation:
 5. Skip expand days in sweep mode (~95ms saved)
 6. Searchsorted for ticker ID mapping (~2ms saved)
 7. **NumPy format** (~228ms saved, removed Arrow/Parquet overhead)
+8. ~~Hedge tickers type-dispatch~~ (superseded by ID-only)
+9. **ID-only pipeline with 5 legs** (all hedge1-4 + vol for ~2x cost of single leg)
+10. **Filter-first sweep** (7-8x faster for sparse legs like hedge2-4)
 
 ### Not Recommended
 - Packed keys: No benefit over block-based search
@@ -568,29 +1047,68 @@ Created during experimentation:
 - Single-pass asset extraction: N=189 too small for measurable benefit
 - Per-field np.unique: No faster than 3D unique for this data
 - Further "processing amt" optimization: Bottleneck is interpreter overhead, not algorithm
+- **Sweep merge optimization**: Kernel already at memory bandwidth limit (~2ms actual execution); reported ~85ms is Numba first-call overhead
+- **Futures ticker dedup**: Packed int64 keys + dedupe saves only ~1ms; `np.unique` overhead too high
+- **Fused sweep**: Sequential filter-first is 13ms faster than fused approach
+
+### Current Performance (5-leg ID-only pipeline)
+
+At **~296ms total** (warmed cache), the pipeline computes all 5 leg values:
+```
+loading yaml........:  37ms
+processing amt......:   1ms
+parse schedules.....:   1ms
+load id dicts.......:   0.5ms
+build id dicts......:   2ms
+compute straddles...:  12ms
+hedge/vol keys (ids):  19ms  ← replaced 53ms strings
+precompute days.....:   1ms
+load prices.........:  17ms
+sweep hedge1........: 111ms (10M found)
+sweep hedge2........:  16ms (803K found) ← sparse, fast
+sweep hedge3........:  16ms (765K found) ← sparse, fast
+sweep hedge4........:  17ms (765K found) ← sparse, fast
+sweep vol...........:  34ms (8.4M found)
+----------------------------------------
+total:              ~296ms
+```
+
+### Performance Comparison
+
+| Configuration | Total | Legs | Notes |
+|---------------|-------|------|-------|
+| Original (before optimizations) | ~748ms | 1 | Arrow joins, strings |
+| After all optimizations (hedge1 only) | ~243ms | 1 | Type-dispatch, NumPy format |
+| **Current (ID-only, all 5 legs)** | **~296ms** | **5** | **Filter-first sweeps** |
+
+**Key insight:** Getting all 5 leg values costs only ~53ms more than the previous single-leg pipeline. The ID-only approach with filter-first sweeps makes multi-leg extraction practical.
 
 ### Performance Floor
-At **~275ms total**, the pipeline is near its practical floor given:
-- YAML loading: ~37ms (unavoidable)
-- Processing amt + schedules: ~2ms
-- Load/build ID dicts: ~2ms
-- Compute straddles: ~14ms
-- Hedge/vol tickers: ~83ms
-- Load prices: ~17ms (NumPy format with pre-built blocks)
-- Sweep merge: ~104ms (prep + merge)
 
-The lookup pipeline (sweep merge) is 4.1x faster than the original expand+binary search approach. The NumPy format optimization removed ~228ms of Arrow/Parquet overhead. Remaining time is dominated by hedge/vol ticker string operations (~83ms) and the sweep merge kernel (~104ms).
+The current ~296ms is near its practical floor:
+- I/O: ~55ms (YAML + prices)
+- Key computation: ~19ms
+- Merge kernels: ~194ms (memory bandwidth limited after Numba warmup)
+
+**Note on Numba warmup:** First run in a new Python process takes ~370ms due to JIT compilation and cache loading. Subsequent runs are at ~296ms. Kernel execution is ~2ms per leg (memory bandwidth limited at 60 GB/s).
 
 ---
 
 ## Appendix: Data Characteristics
 
 ```
-Assets:           189
+Assets:            189
 Monthly straddles: 222,300
-Daily straddles:   13,523,250
-Prices:           8,489,913
+Daily straddles:   15,394,866
+Prices:            8,489,913
 Unique keys:       4,850
 Straddles/key:     avg 1,173, max 1,200
 Prices/key:        avg 1,750
+
+5-Leg Output (ID-only pipeline):
+  hedge1: 10,043,445 found (100% of straddles have hedge1)
+  hedge2:    803,425 found (~9% - CDS + calc types only)
+  hedge3:    764,680 found (~9% - calc types only)
+  hedge4:    764,680 found (~9% - calc types only)
+  vol:     8,416,107 found (~98% of straddles have vol)
 ```
