@@ -518,7 +518,7 @@ def main() -> dict:
 
     choices_hedge2t = ["", "", hedge_hedge1[smidx], calc_hedge2[smidx]]
     choices_hedge2f = ["", "", "PX_LAST", ""]
-    hedge2t_vec = np.select(cond_hedge, choices_hedge1f, default="")
+    hedge2t_vec = np.select(cond_hedge, choices_hedge2t, default="")
     hedge2f_vec = np.select(cond_hedge, choices_hedge2f, default="")
 
     choices_hedge3t = ["", "", "", calc_hedge3[smidx]]
