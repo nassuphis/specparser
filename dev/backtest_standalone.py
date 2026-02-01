@@ -11,7 +11,6 @@ import yaml
 # ============================================================================
 # Configuration
 # ============================================================================
-USE_SWEEP_MERGE = True  # Toggle: True=new 3.55x faster algorithm, False=old binary search
 USE_PARALLEL_MERGE = False  # Toggle: True=parallel, False=serial (test OpenMP overhead)
 DEBUG = False  # Enable sanity assertions
 
@@ -20,44 +19,11 @@ TICKER_U = "U100"
 FIELD_U = "U100"
 FUT_MONTH_MAP_LEN = 12
 
-print(f"USE_SWEEP_MERGE {USE_SWEEP_MERGE}")
 print(f"USE_PARALLEL_MERGE {USE_PARALLEL_MERGE}")
 
 # ============================================================================
 # Numba kernels
 # ============================================================================
-@njit(cache=True)
-def _binsearch(a, lo, hi, x):
-    """Binary search for exact match in sorted array slice a[lo:hi]."""
-    while lo < hi:
-        mid = (lo + hi) // 2
-        v = a[mid]
-        if v < x:
-            lo = mid + 1
-        elif v > x:
-            hi = mid
-        else:
-            return mid
-    return -1
-
-@njit(parallel=True, cache=True)
-def _lookup_parallel(q_key, q_date, block_of, starts, ends, px_date, px_value):
-    """Parallel price lookup using binary search per key block."""
-    out = np.empty(len(q_key), dtype=np.float64)
-    out[:] = np.nan
-    n_block = len(block_of)
-    for i in prange(len(q_key)):
-        k = q_key[i]
-        if k < 0 or k >= n_block:
-            continue
-        b = block_of[k]
-        if b < 0:
-            continue
-        j = _binsearch(px_date, starts[b], ends[b], q_date[i])
-        if j >= 0:
-            out[i] = px_value[j]
-    return out
-
 @njit(parallel=True, cache=True)
 def _merge_per_key(g_keys, g_starts, g_ends, m_start_s, m_len_s, m_out0_s,
                    px_block_of, px_starts, px_ends, px_date, px_value, out):
@@ -653,22 +619,7 @@ print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms")
 d_start_ym = np.where(ntrc_id_vec == STR_F, year2 * 12 + month2 - 1, year1 * 12 + month1 - 1)
 total_days = int(np.sum(day_count_vec))
 
-if USE_SWEEP_MERGE:
-    # Sweep mode only needs d_start_ym and total_days (computed above)
-    pass
-else:
-    # Full expand for binary search mode
-    print("expand days".ljust(20, "."), end="")
-    start_time = time.perf_counter()
-
-    cumsum_vec = (np.cumsum(day_count_vec) - day_count_vec).astype(np.int32)
-    di = np.arange(total_days, dtype=np.int32) - np.repeat(cumsum_vec, day_count_vec)
-    d_stridx = np.repeat(np.arange(len(day_count_vec), dtype=np.int32), day_count_vec)
-    d_smidx = np.repeat(smidx, day_count_vec)
-    d_schid = np.repeat(schid_vec, day_count_vec)
-    d_epoch = _ym_epoch[d_start_ym[d_stridx] - _ym_base] + di
-
-    print(f": {1e3*(time.perf_counter()-start_time):0.3f}ms ({len(list(amap.keys()))} assets)")
+# Sweep mode only needs d_start_ym and total_days (computed above)
 
 # ========================================================================
 # Load price data (NumPy format with pre-built block metadata)
@@ -698,22 +649,17 @@ if DEBUG:
     end_max = int((month_out0.astype(np.int64) + day_count_vec.astype(np.int64)).max())
     assert end_max == total_days, f"out0+len mismatch: {end_max} != {total_days}"
 
-if USE_SWEEP_MERGE:
-    # === All legs use filter-first (sparse path is best for all) ===
-    d_hedge1_value = sweep_leg_sparse("sweep hedge1", hedge1_key, month_start_epoch, month_len, month_out0,
-                                      px_block_of, px_starts, px_ends, px_date, px_value, total_days)
-    d_hedge2_value = sweep_leg_sparse("sweep hedge2", hedge2_key, month_start_epoch, month_len, month_out0,
-                                      px_block_of, px_starts, px_ends, px_date, px_value, total_days)
-    d_hedge3_value = sweep_leg_sparse("sweep hedge3", hedge3_key, month_start_epoch, month_len, month_out0,
-                                      px_block_of, px_starts, px_ends, px_date, px_value, total_days)
-    d_hedge4_value = sweep_leg_sparse("sweep hedge4", hedge4_key, month_start_epoch, month_len, month_out0,
-                                      px_block_of, px_starts, px_ends, px_date, px_value, total_days)
-    d_vol_value    = sweep_leg_sparse("sweep vol",    vol_key,    month_start_epoch, month_len, month_out0,
-                                      px_block_of, px_starts, px_ends, px_date, px_value, total_days)
-
-else:
-    # === Original approach (expand + binary search) - deprecated, use USE_SWEEP_MERGE=True ===
-    raise NotImplementedError("Binary search fallback not updated for ID-only pipeline. Use USE_SWEEP_MERGE=True")
+# === All legs use filter-first (sparse path is best for all) ===
+d_hedge1_value = sweep_leg_sparse("sweep hedge1", hedge1_key, month_start_epoch, month_len, month_out0,
+                                  px_block_of, px_starts, px_ends, px_date, px_value, total_days)
+d_hedge2_value = sweep_leg_sparse("sweep hedge2", hedge2_key, month_start_epoch, month_len, month_out0,
+                                  px_block_of, px_starts, px_ends, px_date, px_value, total_days)
+d_hedge3_value = sweep_leg_sparse("sweep hedge3", hedge3_key, month_start_epoch, month_len, month_out0,
+                                  px_block_of, px_starts, px_ends, px_date, px_value, total_days)
+d_hedge4_value = sweep_leg_sparse("sweep hedge4", hedge4_key, month_start_epoch, month_len, month_out0,
+                                  px_block_of, px_starts, px_ends, px_date, px_value, total_days)
+d_vol_value    = sweep_leg_sparse("sweep vol",    vol_key,    month_start_epoch, month_len, month_out0,
+                                  px_block_of, px_starts, px_ends, px_date, px_value, total_days)
 
 # ========================================================================
 # Output assembly (strings decoded for reporting)
