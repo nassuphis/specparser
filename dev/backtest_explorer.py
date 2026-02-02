@@ -17,6 +17,7 @@ from scipy.sparse.csgraph import minimum_spanning_tree
 import networkx as nx
 from sklearn.manifold import TSNE, MDS
 import umap
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Backtest Explorer", layout="wide")
 
@@ -293,7 +294,8 @@ def _aggregate_daily(out0s, lens, starts_epoch, d0, pnl, vol, mv, opnl, hpnl,
 
     Single-threaded for safe shared writes to output arrays.
 
-    Returns: (pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum) daily arrays
+    Returns: (pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum,
+              norm_pnl_sum, norm_opnl_sum, norm_hpnl_sum) daily arrays
     """
     pnl_sum = np.zeros(grid_size, np.float64)
     pnl_cnt = np.zeros(grid_size, np.int32)
@@ -302,6 +304,9 @@ def _aggregate_daily(out0s, lens, starts_epoch, d0, pnl, vol, mv, opnl, hpnl,
     mv_sum = np.zeros(grid_size, np.float64)
     opnl_sum = np.zeros(grid_size, np.float64)
     hpnl_sum = np.zeros(grid_size, np.float64)
+    norm_pnl_sum = np.zeros(grid_size, np.float64)
+    norm_opnl_sum = np.zeros(grid_size, np.float64)
+    norm_hpnl_sum = np.zeros(grid_size, np.float64)
 
     n = out0s.shape[0]
     for k in range(n):  # Single-threaded for safe writes
@@ -323,12 +328,15 @@ def _aggregate_daily(out0s, lens, starts_epoch, d0, pnl, vol, mv, opnl, hpnl,
 
             # PnL
             p = pnl[idx]
+            v = vol[idx]
             if not np.isnan(p):
                 pnl_sum[day_idx] += p
                 pnl_cnt[day_idx] += 1
+                # Normalized P&L: pnl / (vol / 16) = pnl * 16 / vol
+                if not np.isnan(v) and v > 0:
+                    norm_pnl_sum[day_idx] += p * 16.0 / v
 
-            # Vol
-            v = vol[idx]
+            # Vol (v already read above)
             if not np.isnan(v):
                 vol_sum[day_idx] += v
                 vol_cnt[day_idx] += 1
@@ -343,14 +351,21 @@ def _aggregate_daily(out0s, lens, starts_epoch, d0, pnl, vol, mv, opnl, hpnl,
                 op = opnl[idx]
                 if not np.isnan(op):
                     opnl_sum[day_idx] += op
+                    # Normalized option P&L
+                    if not np.isnan(v) and v > 0:
+                        norm_opnl_sum[day_idx] += op * 16.0 / v
 
             # Hedge PnL (if available)
             if have_hpnl:
                 hp = hpnl[idx]
                 if not np.isnan(hp):
                     hpnl_sum[day_idx] += hp
+                    # Normalized hedge P&L
+                    if not np.isnan(v) and v > 0:
+                        norm_hpnl_sum[day_idx] += hp * 16.0 / v
 
-    return pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum
+    return (pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum,
+            norm_pnl_sum, norm_opnl_sum, norm_hpnl_sum)
 
 
 @njit(cache=True)
@@ -423,7 +438,8 @@ def _compute_population_daily_from_indices(straddles, valuations, filtered_indic
 
     # Phase 2: Numba kernel
     t0 = time.perf_counter()
-    pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum = _aggregate_daily(
+    (pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum,
+     norm_pnl_sum, norm_opnl_sum, norm_hpnl_sum) = _aggregate_daily(
         out0s, lens, starts, d0, pnl, vol, mv, opnl, hpnl,
         dte, have_dte, have_opnl, have_hpnl, grid_size
     )
@@ -441,12 +457,15 @@ def _compute_population_daily_from_indices(straddles, valuations, filtered_indic
         "pnl_sum": pnl_sum[has_data],
         "mv_sum": mv_sum[has_data],
         "avg_vol": vol_sum[has_data] / np.maximum(vol_cnt[has_data], 1),
+        "norm_pnl_sum": norm_pnl_sum[has_data],
     }
 
     if have_opnl:
         result["opnl_sum"] = opnl_sum[has_data]
+        result["norm_opnl_sum"] = norm_opnl_sum[has_data]
     if have_hpnl:
         result["hpnl_sum"] = hpnl_sum[has_data]
+        result["norm_hpnl_sum"] = norm_hpnl_sum[has_data]
 
     df = pd.DataFrame(result, index=pd.DatetimeIndex(dates[has_data]))
     df.index.name = "date"
@@ -537,31 +556,167 @@ def compute_asset_daily_matrix(filter_key):
 
 
 @st.cache_data
-def compute_corr_and_overlap(filter_key, corr_method: str, min_overlap: int):
-    """Compute correlation matrix, overlap counts, and coverage (cached for reuse)."""
+def compute_corr_and_overlap(filter_key, corr_method: str, min_overlap: int,
+                             partial_fill: str = "median", partial_estimator: str = "ledoitwolf",
+                             partial_standardize: bool = True, partial_mask: bool = True):
+    """Compute correlation matrix, overlap counts, and coverage (cached for reuse).
+
+    Supports pearson, spearman, sign, and partial correlation methods.
+    """
     dfX, _ = compute_asset_daily_matrix(filter_key)
     if dfX.empty:
         return pd.DataFrame(), np.zeros((0, 0), dtype=np.int32), np.array([]), pd.Series(dtype=np.int32), {}
 
-    corr = dfX.corr(method=corr_method, min_periods=min_overlap)
-    # Convert to int32 BEFORE matrix multiply (bool @ bool returns bool, not counts!)
-    notna = np.asarray(dfX.notna(), dtype=np.int32)
-    overlap = notna.T @ notna
+    if corr_method in ("pearson", "spearman"):
+        corr = dfX.corr(method=corr_method, min_periods=min_overlap)
+        # Convert to int32 BEFORE matrix multiply (bool @ bool returns bool, not counts!)
+        notna = np.asarray(dfX.notna(), dtype=np.int32)
+        overlap = notna.T @ notna
+    elif corr_method == "sign":
+        corr_mat, overlap, _ = compute_sign_corr(dfX, min_overlap)
+        corr = pd.DataFrame(corr_mat, index=dfX.columns, columns=dfX.columns)
+    else:  # partial
+        corr_mat, overlap, _ = compute_partial_corr(
+            dfX, min_overlap,
+            fill_mode=partial_fill,
+            estimator=partial_estimator,
+            standardize=partial_standardize,
+            mask_low_overlap=partial_mask,
+        )
+        corr = pd.DataFrame(corr_mat, index=dfX.columns, columns=dfX.columns)
+
     coverage = dfX.notna().sum().astype(np.int32)  # per-asset day count (for Top N selection)
 
     # Debug info
     debug_info = {
         "dfX_shape": dfX.shape,
-        "notna_shape": notna.shape,
-        "notna_dtype": str(notna.dtype),
-        "notna_sum": int(notna.sum()),
-        "notna_col_sums_max": int(notna.sum(axis=0).max()),
-        "overlap_shape": overlap.shape,
-        "overlap_dtype": str(overlap.dtype),
-        "overlap_diag_max": int(np.diag(overlap).max()),
+        "method": corr_method,
     }
 
     return corr, overlap, np.array(dfX.columns, dtype=object), coverage, debug_info
+
+
+def compute_sign_corr(dfX: pd.DataFrame, min_overlap: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute sign correlation matrix.
+
+    Sign correlation: s_{t,i} = sign(x_{t,i} - median_i), then corr = mean(s_i * s_j) over overlap.
+    Robust to outliers and scale differences.
+
+    Returns: (corr_mat, overlap_mat, asset_names)
+    """
+    X = dfX.values.astype(np.float64)
+    M = np.isfinite(X)
+
+    # Per-asset median (ignoring NaNs)
+    med = np.nanmedian(X, axis=0)
+
+    # Sign matrix: +1 if >= median, -1 if < median, 0 if NaN
+    S = np.where(X >= med, 1, -1).astype(np.int32)
+    S[~M] = 0
+
+    # Overlap matrix
+    Mi = M.astype(np.int32)
+    overlap = Mi.T @ Mi
+
+    # Sign product sum
+    prod_sum = S.T @ S
+
+    # Sign correlation = prod_sum / overlap (with safe division)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        corr = prod_sum.astype(np.float64) / overlap
+
+    # Set diagonal to 1, mask low overlap to NaN
+    np.fill_diagonal(corr, 1.0)
+    corr[overlap < min_overlap] = np.nan
+
+    return corr, overlap, dfX.columns.to_numpy()
+
+
+def compute_partial_corr(
+    dfX: pd.DataFrame,
+    min_overlap: int,
+    fill_mode: str = "median",
+    estimator: str = "ledoitwolf",
+    standardize: bool = True,
+    mask_low_overlap: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute partial correlation matrix via precision matrix inversion.
+
+    Partial correlation: rho_{ij|rest} = -Omega_{ij} / sqrt(Omega_ii * Omega_jj)
+    where Omega = Sigma^{-1} (precision matrix).
+
+    Returns: (pcorr_mat, overlap_mat, asset_names)
+    """
+    from sklearn.covariance import LedoitWolf, OAS
+
+    X = dfX.values.astype(np.float64)
+    n_assets = X.shape[1]
+
+    # Compute overlap from raw missingness (for hover and optional masking)
+    M = np.isfinite(X).astype(np.int32)
+    overlap = M.T @ M
+
+    # Fill NaNs
+    if fill_mode == "median":
+        fill_vals = np.nanmedian(X, axis=0)
+    elif fill_mode == "mean":
+        fill_vals = np.nanmean(X, axis=0)
+    else:  # zero
+        fill_vals = np.zeros(n_assets)
+
+    # Handle all-NaN columns: fill_vals will be NaN, replace with 0
+    fill_vals = np.nan_to_num(fill_vals, nan=0.0)
+
+    # Replace NaNs with fill values
+    X_filled = X.copy()
+    for j in range(n_assets):
+        mask = ~np.isfinite(X_filled[:, j])
+        X_filled[mask, j] = fill_vals[j]
+
+    # Final safety check: ensure no NaNs remain
+    X_filled = np.nan_to_num(X_filled, nan=0.0)
+
+    # Standardize (recommended for partial correlation)
+    if standardize:
+        mu = X_filled.mean(axis=0)
+        std = X_filled.std(axis=0)
+        std[std < 1e-12] = 1.0  # Prevent div by zero
+        X_filled = (X_filled - mu) / std
+
+    # Estimate covariance with shrinkage
+    if estimator == "ledoitwolf":
+        cov = LedoitWolf().fit(X_filled).covariance_
+    elif estimator == "oas":
+        cov = OAS().fit(X_filled).covariance_
+    else:  # ridge
+        cov = np.cov(X_filled, rowvar=False, bias=False)
+        cov += 1e-3 * np.eye(n_assets)  # Ridge regularization
+
+    # Invert to precision matrix
+    try:
+        precision = np.linalg.inv(cov)
+    except np.linalg.LinAlgError:
+        # Fallback: add more regularization
+        cov += 1e-2 * np.eye(n_assets)
+        precision = np.linalg.inv(cov)
+
+    # Convert to partial correlation
+    # pcorr_{ij} = -Omega_{ij} / sqrt(Omega_{ii} * Omega_{jj})
+    diag = np.diag(precision)
+    diag_sqrt = np.sqrt(np.abs(diag))
+    diag_sqrt[diag_sqrt < 1e-12] = 1e-12
+
+    pcorr = -precision / np.outer(diag_sqrt, diag_sqrt)
+    np.fill_diagonal(pcorr, 1.0)
+
+    # Clip to [-1, 1] for numerical safety
+    pcorr = np.clip(pcorr, -1.0, 1.0)
+
+    # Optionally mask low overlap pairs
+    if mask_low_overlap:
+        pcorr[overlap < min_overlap] = np.nan
+
+    return pcorr, overlap, dfX.columns.to_numpy()
 
 
 # ============================================================================
@@ -654,17 +809,24 @@ def mst_edges_from_corr(corr_mat: np.ndarray, overlap_mat: np.ndarray, mode: str
 def compute_embedding(filter_key, method: str, corr_method: str, corr_min_periods: int,
                       distance_mode: str, n_assets: int | None, min_coverage_days: int,
                       perplexity: int = 30, n_neighbors: int = 15, min_dist: float = 0.1,
-                      seed: int = 42):
+                      seed: int = 42,
+                      partial_fill: str = "median", partial_estimator: str = "ledoitwolf",
+                      partial_standardize: bool = True, partial_mask: bool = True):
     """Compute 2D embedding from correlation distance matrix.
 
     Args:
         corr_min_periods: min_periods for .corr() - keep low (5-10) to avoid NaN-heavy matrix
         min_coverage_days: exclude assets with fewer than this many days of data
+        partial_*: parameters for partial correlation method
     """
     # Get correlation with small min_periods to avoid excessive NaNs
     # Note: compute_corr_and_overlap returns 5 values; ignore debug_info
     corr_full, overlap_full, all_assets, coverage, _ = compute_corr_and_overlap(
-        filter_key, corr_method, corr_min_periods
+        filter_key, corr_method, corr_min_periods,
+        partial_fill=partial_fill,
+        partial_estimator=partial_estimator,
+        partial_standardize=partial_standardize,
+        partial_mask=partial_mask,
     )
 
     if corr_full.empty:
@@ -926,6 +1088,267 @@ def render_corr_graph_plotly(G: nx.Graph, pos: dict, assets: list,
     return fig
 
 
+def build_d3_graph_data(G: nx.Graph, assets: list, node_meta: dict,
+                        mst_edge_set: set | None = None) -> tuple[list, list]:
+    """Build nodes and links JSON for D3 force graph.
+
+    Args:
+        G: NetworkX graph with nodes (indexed by int) and edges
+        assets: List of asset names (index i -> assets[i])
+        node_meta: Dict of node_index -> metrics dict
+        mst_edge_set: Set of (i, j) tuples marking MST edges (normalized i < j)
+
+    Returns:
+        (nodes, links) suitable for JSON serialization
+    """
+    nodes = []
+    for n, data in G.nodes(data=True):
+        name = assets[n]
+        node = {
+            "id": name,
+            "degree": G.degree(n),
+        }
+        if node_meta and n in node_meta:
+            node.update(node_meta[n])
+        nodes.append(node)
+
+    links = []
+    for u, v, data in G.edges(data=True):
+        corr = data.get("corr", 0)
+        overlap = data.get("overlap", 0)
+        # Normalize edge key for MST lookup
+        edge_key = (min(u, v), max(u, v))
+        is_mst = mst_edge_set is not None and edge_key in mst_edge_set
+        links.append({
+            "source": assets[u],
+            "target": assets[v],
+            "corr": float(corr),
+            "strength": abs(float(corr)),
+            "overlap": int(overlap),
+            "mst": is_mst,
+        })
+
+    return nodes, links
+
+
+def make_d3_force_html(nodes: list, links: list, height: int = 700,
+                       focus_asset: str | None = None,
+                       show_labels: bool = False) -> str:
+    """Generate self-contained HTML with D3 force-directed graph.
+
+    Features:
+    - Drag nodes (simulation continues)
+    - Zoom/pan (scroll wheel + drag background)
+    - Hover tooltips (asset name + metrics)
+    - Focus mode (dim non-adjacent nodes/edges)
+    - Edge colors: green (positive), red (negative)
+    - MST edges: dashed style
+    """
+    import json
+
+    nodes_json = json.dumps(nodes)
+    links_json = json.dumps(links)
+    focus_json = json.dumps(focus_asset) if focus_asset else "null"
+    show_labels_js = "true" if show_labels else "false"
+
+    html = f'''
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+body {{ margin: 0; overflow: hidden; font-family: sans-serif; }}
+svg {{ width: 100%; height: {height}px; }}
+.node {{ cursor: grab; }}
+.node:active {{ cursor: grabbing; }}
+.node-label {{ font-size: 8px; pointer-events: none; }}
+.tooltip {{
+    position: absolute;
+    background: rgba(0,0,0,0.85);
+    color: white;
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    pointer-events: none;
+    max-width: 250px;
+    z-index: 1000;
+}}
+.link {{ stroke-opacity: 0.6; }}
+.link.positive {{ stroke: #26a69a; }}
+.link.negative {{ stroke: #ef5350; }}
+.link.mst {{ stroke-dasharray: 4,2; }}
+.link.dimmed {{ stroke: #ccc; stroke-opacity: 0.15; }}
+.node.dimmed {{ opacity: 0.2; }}
+.node.focus {{ stroke: #2962FF; stroke-width: 3px; }}
+.node.neighbor {{ stroke: #FF6D00; stroke-width: 2px; }}
+</style>
+</head>
+<body>
+<div id="tooltip" class="tooltip" style="display:none;"></div>
+<svg></svg>
+<script>
+const nodes = {nodes_json};
+const links = {links_json};
+const focusAsset = {focus_json};
+const showLabels = {show_labels_js};
+
+// Helper: D3 mutates link source/target from strings to objects after forceLink runs
+// Use these to safely get the id regardless of current state
+function sid(s) {{ return (typeof s === "object") ? s.id : s; }}
+function tid(t) {{ return (typeof t === "object") ? t.id : t; }}
+
+// Build neighbor lookup for focus mode (using helpers for robustness)
+const neighbors = new Map();
+nodes.forEach(n => neighbors.set(n.id, new Set()));
+links.forEach(l => {{
+    const s = sid(l.source);
+    const t = tid(l.target);
+    neighbors.get(s).add(t);
+    neighbors.get(t).add(s);
+}});
+
+const svg = d3.select("svg");
+
+// Fixed height from Python; bbox width with sanity clamp (can be 0 on first tick in iframe)
+const fixedHeight = {height};
+const bbox = svg.node().getBoundingClientRect();
+const width = (bbox.width > 10) ? bbox.width : 1100;
+const height = fixedHeight;
+
+const g = svg.append("g");
+
+// Zoom behavior
+const zoom = d3.zoom()
+    .scaleExtent([0.1, 4])
+    .on("zoom", (event) => g.attr("transform", event.transform));
+svg.call(zoom);
+
+// Force simulation
+// Note: clamp strength to [0,1] defensively (correlation can drift slightly above 1)
+// Distance has floor of 30 to prevent nodes from collapsing when strength ~1
+const simulation = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(d => d.id)
+        .distance(d => {{ const s = Math.max(0, Math.min(1, d.strength)); return 30 + 120 * (1 - s); }})
+        .strength(d => {{ const s = Math.max(0, Math.min(1, d.strength)); return 0.3 + 0.7 * s; }}))
+    .force("charge", d3.forceManyBody().strength(-150))
+    .force("center", d3.forceCenter(width / 2, height / 2))
+    .force("collide", d3.forceCollide(20));
+
+// Draw links
+const link = g.append("g")
+    .selectAll("line")
+    .data(links)
+    .join("line")
+    .attr("class", d => {{
+        const s = sid(d.source);
+        const t = tid(d.target);
+        let cls = "link";
+        cls += d.corr > 0 ? " positive" : " negative";
+        if (d.mst) cls += " mst";
+        if (focusAsset && s !== focusAsset && t !== focusAsset) cls += " dimmed";
+        return cls;
+    }})
+    .attr("stroke-width", d => 1 + 2 * d.strength);
+
+// Draw nodes
+const node = g.append("g")
+    .selectAll("circle")
+    .data(nodes)
+    .join("circle")
+    .attr("class", d => {{
+        let cls = "node";
+        if (focusAsset) {{
+            if (d.id === focusAsset) cls += " focus";
+            else if (neighbors.get(focusAsset)?.has(d.id)) cls += " neighbor";
+            else cls += " dimmed";
+        }}
+        return cls;
+    }})
+    .attr("r", d => 6 + Math.min(d.degree, 20) * 0.4)
+    .attr("fill", d => {{
+        if (focusAsset) {{
+            if (d.id === focusAsset) return "#2962FF";
+            if (neighbors.get(focusAsset)?.has(d.id)) return "#FF6D00";
+            return "#ccc";
+        }}
+        return "#2962FF";
+    }})
+    .attr("stroke", "#fff")
+    .attr("stroke-width", 1.5)
+    .call(drag(simulation));
+
+// Labels (optional)
+let labels;
+if (showLabels) {{
+    labels = g.append("g")
+        .selectAll("text")
+        .data(nodes)
+        .join("text")
+        .attr("class", "node-label")
+        .attr("dy", -10)
+        .attr("text-anchor", "middle")
+        .text(d => d.id);
+}}
+
+// Tooltip (using <br> for reliable line breaks with .html())
+// Use clientX/clientY instead of pageX/pageY for better iframe behavior
+const tooltip = d3.select("#tooltip");
+node.on("mouseover", (event, d) => {{
+    let html = `<b>${{d.id}}</b><br>Degree: ${{d.degree}}`;
+    if (d.coverage !== undefined) html += `<br>Coverage: ${{d.coverage}}`;
+    if (d.mean_daily_pnl !== undefined) html += `<br>Mean daily PnL: ${{d.mean_daily_pnl.toFixed(6)}}`;
+    if (d.pnl_over_daily_vol !== undefined) html += `<br>PnL/Vol: ${{d.pnl_over_daily_vol.toFixed(3)}}`;
+    tooltip.style("display", "block").html(html);
+}})
+.on("mousemove", (event) => {{
+    tooltip.style("left", (event.clientX + 15) + "px")
+           .style("top", (event.clientY - 10) + "px");
+}})
+.on("mouseout", () => tooltip.style("display", "none"));
+
+// Simulation tick
+simulation.on("tick", () => {{
+    link
+        .attr("x1", d => d.source.x)
+        .attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x)
+        .attr("y2", d => d.target.y);
+    node
+        .attr("cx", d => d.x)
+        .attr("cy", d => d.y);
+    if (showLabels) {{
+        labels
+            .attr("x", d => d.x)
+            .attr("y", d => d.y);
+    }}
+}});
+
+// Drag behavior
+function drag(simulation) {{
+    return d3.drag()
+        .on("start", (event, d) => {{
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }})
+        .on("drag", (event, d) => {{
+            d.fx = event.x;
+            d.fy = event.y;
+        }})
+        .on("end", (event, d) => {{
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }});
+}}
+</script>
+</body>
+</html>
+'''
+    return html
+
+
 def _compute_all_straddle_metrics_from_indices(straddles, valuations, idx: np.ndarray):
     """Core straddle metrics computation (uncached)."""
     if idx.size == 0:
@@ -1175,10 +1598,18 @@ def build_cum_df(pop_df: pd.DataFrame) -> pd.DataFrame:
     cum_df = pd.DataFrame(index=pop_df.index)
     cum_df["pnl_cum"] = pop_df["pnl_sum"].cumsum()
 
+    if "norm_pnl_sum" in pop_df.columns:
+        cum_df["norm_pnl_cum"] = pop_df["norm_pnl_sum"].cumsum()
+
     if "opnl_sum" in pop_df.columns:
         cum_df["opnl_cum"] = pop_df["opnl_sum"].cumsum()
     if "hpnl_sum" in pop_df.columns:
         cum_df["hpnl_cum"] = pop_df["hpnl_sum"].cumsum()
+
+    if "norm_opnl_sum" in pop_df.columns:
+        cum_df["norm_opnl_cum"] = pop_df["norm_opnl_sum"].cumsum()
+    if "norm_hpnl_sum" in pop_df.columns:
+        cum_df["norm_hpnl_cum"] = pop_df["norm_hpnl_sum"].cumsum()
 
     return cum_df
 
@@ -1237,6 +1668,56 @@ def render_cum_plot_plotly(cum_df: pd.DataFrame):
             ])
         ),
         yaxis=dict(title="Cumulative PnL"),
+    )
+
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+
+
+def render_norm_pnl_plot_plotly(cum_df: pd.DataFrame):
+    """Render normalized cumulative PnL with Plotly."""
+    if "norm_pnl_cum" not in cum_df.columns:
+        st.warning("Normalized P&L data not available.")
+        return
+
+    fig = go.Figure()
+
+    # Main normalized cumulative P&L
+    fig.add_trace(go.Scatter(
+        x=cum_df.index, y=cum_df["norm_pnl_cum"],
+        mode="lines", name="Norm PnL cum", line=dict(width=2)
+    ))
+
+    # Normalized option P&L (if available)
+    if "norm_opnl_cum" in cum_df.columns:
+        fig.add_trace(go.Scatter(
+            x=cum_df.index, y=cum_df["norm_opnl_cum"],
+            mode="lines", name="Norm Option PnL cum", line=dict(width=1)
+        ))
+
+    # Normalized hedge P&L (if available)
+    if "norm_hpnl_cum" in cum_df.columns:
+        fig.add_trace(go.Scatter(
+            x=cum_df.index, y=cum_df["norm_hpnl_cum"],
+            mode="lines", name="Norm Hedge PnL cum", line=dict(width=1)
+        ))
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=40, b=90),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            rangeselector=dict(buttons=[
+                dict(count=1, label="1m", step="month", stepmode="backward"),
+                dict(count=3, label="3m", step="month", stepmode="backward"),
+                dict(count=6, label="6m", step="month", stepmode="backward"),
+                dict(count=1, label="YTD", step="year", stepmode="todate"),
+                dict(count=1, label="1y", step="year", stepmode="backward"),
+                dict(step="all", label="All"),
+            ])
+        ),
+        yaxis=dict(title="Normalized P&L"),
     )
 
     st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
@@ -1777,8 +2258,8 @@ else:
 
         st.divider()
 
-        # Tabs: Days, Cumulative PnL, MV, Contributors, Straddles, Assets, Matrices
-        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix", "Correlation", "CorGraph", "Embedding"]
+        # Tabs: Days, Cumulative PnL, Norm PnL, MV, Contributors, Straddles, Assets, Matrices
+        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "Norm PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix", "Correlation", "CorGraph", "Embedding"]
         tabs = dict(zip(tab_names, st.tabs(tab_names)))
 
         # --- Days Tab ---
@@ -1868,6 +2349,19 @@ else:
                     render_cum_plot_tradingview(cum_df)
 
             st.caption(f"Final PnL: {cum_df['pnl_cum'].iloc[-1]:.6f}")
+
+        # --- Normalized P&L Tab ---
+        with tabs["Norm PnL"]:
+            st.subheader("Cumulative Normalized P&L")
+            st.caption("P&L normalized by daily expected move: pnl / (vol / 16)")
+
+            cum_df = build_cum_df(pop_df)
+
+            with timed_collect("render_norm_pnl_plotly", timings):
+                render_norm_pnl_plot_plotly(cum_df)
+
+            if "norm_pnl_cum" in cum_df.columns:
+                st.caption(f"Final Normalized PnL: {cum_df['norm_pnl_cum'].iloc[-1]:.2f}")
 
         # --- MV Tab ---
         with tabs["MV"]:
@@ -2078,7 +2572,7 @@ else:
             # Row 1: Basic controls + ordering
             row1 = st.columns(5)
             with row1[0]:
-                corr_method = st.selectbox("Method", ["pearson", "spearman"], key="corr_method")
+                corr_method = st.selectbox("Method", ["pearson", "spearman", "sign", "partial"], key="corr_method")
             with row1[1]:
                 min_overlap = st.slider("Min overlap days", 10, 250, 30, step=10, key="corr_min_overlap")
             with row1[2]:
@@ -2109,6 +2603,29 @@ else:
                 with row2[3]:
                     show_separators = st.checkbox("Show separators", value=True, key="corr_sep")
 
+            # Partial correlation controls
+            partial_fill = "median"
+            partial_estimator = "ledoitwolf"
+            partial_standardize = True
+            partial_mask_low_overlap = True
+
+            if corr_method == "partial":
+                partial_row = st.columns(4)
+                with partial_row[0]:
+                    partial_fill = st.selectbox("NaN fill", ["median", "mean", "zero"], key="partial_fill")
+                with partial_row[1]:
+                    partial_estimator = st.selectbox("Estimator", ["ledoitwolf", "oas", "ridge"], key="partial_estimator")
+                with partial_row[2]:
+                    partial_standardize = st.checkbox("Standardize", value=True, key="partial_std")
+                with partial_row[3]:
+                    partial_mask_low_overlap = st.checkbox("Mask low overlap", value=True, key="partial_mask")
+
+            # Method explanation captions
+            if corr_method == "sign":
+                st.caption("Sign correlation: how often two assets are on the same side of their median (robust to outliers)")
+            elif corr_method == "partial":
+                st.caption("Partial correlation: correlation after controlling for all other assets (reveals direct relationships)")
+
             with timed_collect("compute_asset_daily_matrix", timings):
                 dfX, all_assets = compute_asset_daily_matrix(filter_key)
 
@@ -2117,10 +2634,22 @@ else:
             else:
                 # Compute correlation on FULL asset set
                 with timed_collect("compute_correlation_full", timings):
-                    corr_full = dfX.corr(method=corr_method, min_periods=min_overlap)
-                    # Convert to int32 BEFORE matrix multiply (bool @ bool returns bool, not counts!)
-                    notna_full = np.asarray(dfX.notna(), dtype=np.int32)
-                    overlap_full = notna_full.T @ notna_full
+                    if corr_method in ("pearson", "spearman"):
+                        corr_full = dfX.corr(method=corr_method, min_periods=min_overlap)
+                        notna_full = np.asarray(dfX.notna(), dtype=np.int32)
+                        overlap_full = notna_full.T @ notna_full
+                    elif corr_method == "sign":
+                        corr_mat_full, overlap_full, _ = compute_sign_corr(dfX, min_overlap)
+                        corr_full = pd.DataFrame(corr_mat_full, index=dfX.columns, columns=dfX.columns)
+                    else:  # partial
+                        corr_mat_full, overlap_full, _ = compute_partial_corr(
+                            dfX, min_overlap,
+                            fill_mode=partial_fill,
+                            estimator=partial_estimator,
+                            standardize=partial_standardize,
+                            mask_low_overlap=partial_mask_low_overlap,
+                        )
+                        corr_full = pd.DataFrame(corr_mat_full, index=dfX.columns, columns=dfX.columns)
 
                 # Determine display subset
                 if display_mode == "Top N" and top_n_assets is not None:
@@ -2159,7 +2688,11 @@ else:
 
                 # Render heatmap
                 with timed_collect("render_correlation_heatmap", timings):
-                    title_prefix = "Clustered Correlation" if order_mode == "Clustered" else "Asset Correlation"
+                    method_name = {"pearson": "Pearson", "spearman": "Spearman", "sign": "Sign", "partial": "Partial"}[corr_method]
+                    if order_mode == "Clustered":
+                        title_prefix = f"Clustered {method_name} Correlation"
+                    else:
+                        title_prefix = f"{method_name} Correlation"
                     render_correlation_heatmap(
                         corr_mat=corr_mat,
                         overlap=overlap_mat,
@@ -2184,11 +2717,12 @@ else:
         # --- CorGraph Tab ---
         with tabs["CorGraph"]:
             st.subheader("Correlation Network")
+            cg_view_mode = st.radio("View", ["Plotly", "D3 Interactive"], horizontal=True, key="cg_view_mode")
 
             # Controls row 1
             cg_row1 = st.columns(4)
             with cg_row1[0]:
-                cg_method = st.selectbox("Method", ["pearson", "spearman"], key="cg_method")
+                cg_method = st.selectbox("Method", ["pearson", "spearman", "sign", "partial"], key="cg_method")
             with cg_row1[1]:
                 cg_min_overlap = st.slider("Min overlap", 5, 250, 10, step=5, key="cg_min_overlap")
             with cg_row1[2]:
@@ -2214,10 +2748,37 @@ else:
             cg_show_labels = st.checkbox("Show labels", value=False, key="cg_show_labels")
             cg_use_mst = st.checkbox("Ensure connected (MST backbone)", value=True, key="cg_use_mst")
 
+            # Partial correlation controls (CorGraph)
+            cg_partial_fill = "median"
+            cg_partial_estimator = "ledoitwolf"
+            cg_partial_standardize = True
+            cg_partial_mask = True
+
+            if cg_method == "partial":
+                cg_partial_row = st.columns(4)
+                with cg_partial_row[0]:
+                    cg_partial_fill = st.selectbox("NaN fill", ["median", "mean", "zero"], key="cg_partial_fill")
+                with cg_partial_row[1]:
+                    cg_partial_estimator = st.selectbox("Estimator", ["ledoitwolf", "oas", "ridge"], key="cg_partial_estimator")
+                with cg_partial_row[2]:
+                    cg_partial_standardize = st.checkbox("Standardize", value=True, key="cg_partial_std")
+                with cg_partial_row[3]:
+                    cg_partial_mask = st.checkbox("Mask low overlap", value=True, key="cg_partial_mask")
+
+            # Method caption
+            if cg_method == "sign":
+                st.caption("Sign correlation: how often two assets are on the same side of their median")
+            elif cg_method == "partial":
+                st.caption("Partial correlation: correlation after controlling for all other assets")
+
             # Compute correlation (reuse cached) - now returns coverage too
             with timed_collect("corgraph_corr", timings):
                 cg_corr_full, cg_overlap_full, cg_all_assets, cg_coverage, cg_debug = compute_corr_and_overlap(
-                    filter_key, cg_method, cg_min_overlap
+                    filter_key, cg_method, cg_min_overlap,
+                    partial_fill=cg_partial_fill,
+                    partial_estimator=cg_partial_estimator,
+                    partial_standardize=cg_partial_standardize,
+                    partial_mask=cg_partial_mask,
                 )
 
             if cg_corr_full.empty:
@@ -2288,9 +2849,17 @@ else:
                     )
 
                 # Optionally add MST backbone for connectivity
+                cg_mst_edges_set = set()  # Track which edges are from MST (for dashed styling)
                 if cg_use_mst:
                     with timed_collect("corgraph_mst", timings):
                         mst_edges = mst_edges_from_corr(cg_corr_sub.values, cg_overlap_sub)
+
+                        # First, mark ALL MST edges (even if they already exist in threshold edges)
+                        # This ensures MST backbone is always styled consistently
+                        for i, j, c, o in mst_edges:
+                            a, b = (i, j) if i < j else (j, i)
+                            cg_mst_edges_set.add((a, b))
+
                         # Merge: keep unique undirected pairs
                         seen = set()
                         merged = []
@@ -2304,6 +2873,8 @@ else:
                                 seen.add((a, b))
                                 merged.append((a, b, c, o))
                         cg_edges = merged
+                else:
+                    cg_mst_edges_set = None
 
                 # Edge count warning
                 if len(cg_edges) > MAX_EDGES_HARD_CAP:
@@ -2327,6 +2898,12 @@ else:
                             if a in meta_lookup:
                                 cg_node_meta[i] = meta_lookup[a]
 
+                    # Add coverage to node_meta
+                    for i, a in enumerate(cg_assets):
+                        if i not in cg_node_meta:
+                            cg_node_meta[i] = {}
+                        cg_node_meta[i]["coverage"] = int(cg_coverage.get(a, 0))
+
                     # Focus asset selector
                     cg_connected_nodes = [n for n in cg_G.nodes() if cg_G.degree(n) > 0]
                     cg_connected_assets = [cg_assets[n] for n in cg_connected_nodes]
@@ -2341,15 +2918,37 @@ else:
                     if cg_focus_asset != "None":
                         cg_focus_node = cg_assets.index(cg_focus_asset)
 
-                    # Render
-                    with timed_collect("corgraph_render", timings):
-                        cg_fig = render_corr_graph_plotly(
-                            cg_G, cg_pos, cg_assets,
-                            node_meta=cg_node_meta,
-                            focus_node=cg_focus_node,
-                            show_labels=cg_show_labels
-                        )
-                        st.plotly_chart(cg_fig, use_container_width=True, config={"displaylogo": False})
+                    # Render based on view mode
+                    if cg_view_mode == "Plotly":
+                        with timed_collect("corgraph_render", timings):
+                            cg_fig = render_corr_graph_plotly(
+                                cg_G, cg_pos, cg_assets,
+                                node_meta=cg_node_meta,
+                                focus_node=cg_focus_node,
+                                show_labels=cg_show_labels
+                            )
+                            st.plotly_chart(cg_fig, use_container_width=True, config={"displaylogo": False})
+                    else:
+                        # D3 Interactive view
+                        with timed_collect("corgraph_d3_build", timings):
+                            d3_nodes, d3_links = build_d3_graph_data(
+                                cg_G, cg_assets, cg_node_meta, cg_mst_edges_set
+                            )
+
+                        # Hard cap warning for D3
+                        if len(d3_links) > 4000:
+                            st.error(f"Too many edges for D3 ({len(d3_links):,}). Use Plotly view or reduce edges.")
+                        else:
+                            with timed_collect("corgraph_d3_render", timings):
+                                d3_html = make_d3_force_html(
+                                    d3_nodes, d3_links,
+                                    height=700,
+                                    focus_asset=cg_focus_asset if cg_focus_asset != "None" else None,
+                                    show_labels=cg_show_labels,
+                                )
+                                components.html(d3_html, height=720, scrolling=False)
+
+                            st.caption("Drag nodes to reposition. Scroll to zoom. Drag background to pan.")
 
                     # Summary stats
                     cg_c1, cg_c2, cg_c3, cg_c4, cg_c5 = st.columns(5)
@@ -2369,7 +2968,7 @@ else:
             with col1:
                 emb_method = st.selectbox("Method", ["UMAP", "t-SNE", "MDS"], key="emb_method")
             with col2:
-                emb_corr_method = st.selectbox("Correlation", ["pearson", "spearman"], key="emb_corr_method")
+                emb_corr_method = st.selectbox("Correlation", ["pearson", "spearman", "sign", "partial"], key="emb_corr_method")
             with col3:
                 emb_distance = st.radio("Distance", ["1-abs(corr)", "1-corr"], horizontal=True, key="emb_distance")
                 st.caption("1-abs: anti-correlated cluster together; 1-corr: they separate")
@@ -2418,6 +3017,29 @@ else:
                 emb_n_neighbors = 15
                 emb_min_dist = 0.1
 
+            # Partial correlation controls (Embedding)
+            emb_partial_fill = "median"
+            emb_partial_estimator = "ledoitwolf"
+            emb_partial_standardize = True
+            emb_partial_mask = True
+
+            if emb_corr_method == "partial":
+                emb_partial_row = st.columns(4)
+                with emb_partial_row[0]:
+                    emb_partial_fill = st.selectbox("NaN fill", ["median", "mean", "zero"], key="emb_partial_fill")
+                with emb_partial_row[1]:
+                    emb_partial_estimator = st.selectbox("Estimator", ["ledoitwolf", "oas", "ridge"], key="emb_partial_estimator")
+                with emb_partial_row[2]:
+                    emb_partial_standardize = st.checkbox("Standardize", value=True, key="emb_partial_std")
+                with emb_partial_row[3]:
+                    emb_partial_mask = st.checkbox("Mask low overlap", value=True, key="emb_partial_mask")
+
+            # Method caption
+            if emb_corr_method == "sign":
+                st.caption("Sign correlation: robust to outliers")
+            elif emb_corr_method == "partial":
+                st.caption("Partial correlation: reveals direct relationships")
+
             # Compute embedding
             with timed_collect("embedding_compute", timings):
                 coords, emb_assets, emb_coverage = compute_embedding(
@@ -2432,6 +3054,10 @@ else:
                     n_neighbors=emb_n_neighbors,
                     min_dist=emb_min_dist,
                     seed=emb_seed,
+                    partial_fill=emb_partial_fill,
+                    partial_estimator=emb_partial_estimator,
+                    partial_standardize=emb_partial_standardize,
+                    partial_mask=emb_partial_mask,
                 )
 
             if len(coords) == 0:
