@@ -1,14 +1,98 @@
 """Backtest Explorer v2 - Interactive straddle analysis."""
 import re
-from datetime import date
+import time
+from contextlib import contextmanager
+from datetime import date, datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from numba import njit, prange
+from streamlit_lightweight_charts import renderLightweightCharts
+from scipy.cluster.hierarchy import linkage, leaves_list, fcluster
+from scipy.spatial.distance import squareform
 
 st.set_page_config(page_title="Backtest Explorer", layout="wide")
+
+# ============================================================================
+# Timing Utilities
+# ============================================================================
+def _fmt_dt_s(dt: float) -> str:
+    """Format duration as ms or seconds."""
+    ms = dt * 1000.0
+    return f"{ms:.0f} ms" if ms < 1000.0 else f"{dt:.3f} s"
+
+def _ts() -> str:
+    """Current timestamp HH:MM:SS."""
+    return datetime.now().strftime("%H:%M:%S")
+
+def tlog(msg: str) -> None:
+    """Append message to timing log (respects enabled flag and keep limit)."""
+    if not st.session_state.get("timing_enabled", True):
+        return
+    keep = int(st.session_state.get("timing_keep", 50))
+    log = st.session_state.setdefault("timing_log", [])
+    log.append(msg)
+    if len(log) > keep:
+        del log[:-keep]
+
+@contextmanager
+def timed_collect(name: str, store: dict, meta: str = ""):
+    """Context manager: times block, logs, and stores in dict."""
+    t0 = time.perf_counter()
+    ok = True
+    try:
+        yield
+    except Exception:
+        ok = False
+        raise
+    finally:
+        dt = time.perf_counter() - t0
+        store[name] = dt
+        if st.session_state.get("timing_enabled", True):
+            status = "" if ok else " (error)"
+            m = f" {meta}" if meta else ""
+            tlog(f"{_ts()} {name}: {_fmt_dt_s(dt)}{status}{m}")
+
+def record_timings(store: dict) -> None:
+    """Record timings to session state for summary table."""
+    st.session_state["timing_last"] = store
+    hist = st.session_state.setdefault("timing_hist", {})
+    for k, v in store.items():
+        arr = hist.setdefault(k, [])
+        arr.append(float(v))
+        if len(arr) > 30:
+            del arr[0]
+
+def render_timings_panel():
+    """Render timing panel in sidebar."""
+    with st.sidebar.expander("Timings", expanded=False):
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.checkbox("Enable", value=st.session_state.get("timing_enabled", True), key="timing_enabled")
+        with c2:
+            st.number_input("Keep", 10, 500, st.session_state.get("timing_keep", 50), 10, key="timing_keep")
+
+        if st.button("Clear log"):
+            st.session_state["timing_log"] = []
+            st.rerun()
+
+        log = st.session_state.get("timing_log", [])
+        st.text_area("log", "\n".join(log), height=200, label_visibility="collapsed")
+
+        # Summary table
+        last = st.session_state.get("timing_last", {})
+        hist = st.session_state.get("timing_hist", {})
+        if last:
+            rows = []
+            for k, v in sorted(last.items(), key=lambda kv: kv[1], reverse=True):
+                h = hist.get(k, [])
+                avg = (sum(h) / len(h)) if h else float("nan")
+                rows.append((k, v*1000.0, avg*1000.0, len(h)))
+            df = pd.DataFrame(rows, columns=["block", "last_ms", "avg_ms", "n"])
+            st.dataframe(df, width='stretch', hide_index=True)
 
 # Global CSS for slicker look
 st.markdown("""
@@ -82,6 +166,43 @@ def ym_to_date(ym: int) -> date:
 def date_to_ym(d: date) -> int:
     """Convert date to year-month index."""
     return d.year * 12 + (d.month - 1)
+
+
+def make_filter_key(asset_mode: str, asset_value, ym_lo: int, ym_hi: int, selected_schids):
+    """Build a small, hashable cache key from filter parameters."""
+    if asset_mode == "dropdown":
+        asset_part = ("dropdown", asset_value)
+    else:
+        pattern, flags = asset_value
+        asset_part = ("regex", pattern, int(flags))
+
+    sch_part = tuple(sorted(int(s) for s in selected_schids))
+    return (asset_part, int(ym_lo), int(ym_hi), sch_part)
+
+
+@st.cache_data
+def get_filtered_indices_cached(filter_key):
+    """Cached filter_key → indices. Computes asset_str/straddle_ym locally."""
+    straddles, _, _, _, _ = load_data()
+
+    # Compute locally to avoid nested cache hashing of straddles dict
+    asset_str_local = np.asarray([str(x) for x in straddles["asset"]], dtype=object)
+    straddle_ym_local = (straddles["year"].astype(np.int32) * 12 +
+                         straddles["month"].astype(np.int32) - 1)
+
+    asset_part, ym_lo, ym_hi, sch_part = filter_key
+    if asset_part[0] == "dropdown":
+        asset_mode, asset_value = "dropdown", asset_part[1]
+    else:
+        asset_mode = "regex"
+        asset_value = (asset_part[1], asset_part[2])
+
+    idx, _ = get_filtered_indices(
+        straddles, asset_str_local, straddle_ym_local,
+        asset_mode, asset_value, ym_lo, ym_hi, set(sch_part)
+    )
+    return idx.astype(np.int64)
+
 
 @st.cache_data
 def build_label_map(straddles, filtered_indices, limit=1000):
@@ -222,6 +343,40 @@ def _aggregate_daily(out0s, lens, starts_epoch, d0, pnl, vol, mv, opnl, hpnl,
     return pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum
 
 
+@njit(cache=True)
+def _aggregate_daily_by_asset(out0s, lens, starts_epoch, asset_ids, d0,
+                               pnl, vol, dte, have_dte, grid_size, n_assets):
+    """Aggregate daily pnl/vol per asset into 2D grids [days, assets]."""
+    pnl_sum = np.zeros((grid_size, n_assets), np.float64)
+    vol_sum = np.zeros((grid_size, n_assets), np.float64)
+
+    n = out0s.shape[0]
+    for k in range(n):  # Single-threaded for safe shared writes
+        o = out0s[k]
+        L = lens[k]
+        start = starts_epoch[k]
+        a = asset_ids[k]
+
+        for j in range(L):
+            idx = o + j
+            day_idx = start + j - d0
+
+            if day_idx < 0 or day_idx >= grid_size:
+                continue
+            if have_dte and dte[idx] < 0:
+                continue
+
+            p = pnl[idx]
+            v = vol[idx]
+
+            if not np.isnan(p):
+                pnl_sum[day_idx, a] += p
+            if not np.isnan(v):
+                vol_sum[day_idx, a] += v
+
+    return pnl_sum, vol_sum
+
+
 @st.cache_data
 def factorize_assets(_asset_str_tuple):
     """Convert asset strings to integer codes for bincount."""
@@ -230,20 +385,13 @@ def factorize_assets(_asset_str_tuple):
     return codes.astype(np.int32), np.asarray(uniques, dtype=object)
 
 
-@st.cache_data
-def compute_population_daily(_straddles, _valuations, filtered_indices_tuple):
-    """Aggregate daily pnl/mv across all straddles using Numba kernel.
-
-    Returns DataFrame indexed by date with columns:
-        n_straddles, pnl_sum, mv_sum, avg_vol, [opnl_sum, hpnl_sum if available]
-    """
-    filtered_indices = np.array(filtered_indices_tuple, dtype=np.int64)
-    if len(filtered_indices) == 0:
+def _compute_population_daily_from_indices(straddles, valuations, filtered_indices: np.ndarray) -> pd.DataFrame:
+    """Core population daily computation (uncached)."""
+    if filtered_indices.size == 0:
         return pd.DataFrame()
 
-    straddles, valuations = _straddles, _valuations
-
-    # Extract arrays for Numba kernel
+    # Phase 1: Array prep
+    t0 = time.perf_counter()
     out0s = straddles["out0"][filtered_indices].astype(np.int32)
     lens = straddles["length"][filtered_indices].astype(np.int32)
     starts = straddles["month_start_epoch"][filtered_indices].astype(np.int32)
@@ -257,23 +405,25 @@ def compute_population_daily(_straddles, _valuations, filtered_indices_tuple):
     have_dte = "days_to_expiry" in valuations
     dte = valuations["days_to_expiry"] if have_dte else np.empty(1, dtype=np.int32)
 
-    # Check for optional opnl/hpnl columns
     have_opnl = "opnl" in valuations
     have_hpnl = "hpnl" in valuations
     opnl = valuations["opnl"] if have_opnl else np.empty(1, dtype=np.float64)
     hpnl = valuations["hpnl"] if have_hpnl else np.empty(1, dtype=np.float64)
+    dt_prep = time.perf_counter() - t0
 
-    # Single Numba pass for daily aggregation
+    # Phase 2: Numba kernel
+    t0 = time.perf_counter()
     pnl_sum, pnl_cnt, vol_sum, vol_cnt, mv_sum, opnl_sum, hpnl_sum = _aggregate_daily(
         out0s, lens, starts, d0, pnl, vol, mv, opnl, hpnl,
         dte, have_dte, have_opnl, have_hpnl, grid_size
     )
+    dt_kernel = time.perf_counter() - t0
 
-    # Build result DataFrame
+    # Phase 3: DataFrame build
+    t0 = time.perf_counter()
     base = np.datetime64('1970-01-01', 'D')
     dates = base + np.arange(d0, d1 + 1)
 
-    # Only keep dates with at least one contributor
     has_data = pnl_cnt > 0
 
     result = {
@@ -283,7 +433,6 @@ def compute_population_daily(_straddles, _valuations, filtered_indices_tuple):
         "avg_vol": vol_sum[has_data] / np.maximum(vol_cnt[has_data], 1),
     }
 
-    # Add optional columns if they exist
     if have_opnl:
         result["opnl_sum"] = opnl_sum[has_data]
     if have_hpnl:
@@ -291,21 +440,100 @@ def compute_population_daily(_straddles, _valuations, filtered_indices_tuple):
 
     df = pd.DataFrame(result, index=pd.DatetimeIndex(dates[has_data]))
     df.index.name = "date"
+    dt_df = time.perf_counter() - t0
+
+    # Log sub-timings
+    tlog(f"       pop_daily.prep: {_fmt_dt_s(dt_prep)}")
+    tlog(f"       pop_daily.kernel: {_fmt_dt_s(dt_kernel)}")
+    tlog(f"       pop_daily.df: {_fmt_dt_s(dt_df)}")
+
     return df
 
 
 @st.cache_data
-def compute_all_straddle_metrics(_straddles, _valuations, filtered_indices_tuple):
-    """Compute ALL per-straddle metrics in ONE Numba pass.
+def compute_population_daily(filter_key):
+    """Aggregate daily pnl/mv. Cached by filter params."""
+    straddles, valuations, _, _, _ = load_data()
+    idx = get_filtered_indices_cached(filter_key)
+    return _compute_population_daily_from_indices(straddles, valuations, idx)
 
-    Returns: (pnl_sum, pnl_days, vol_sum, vol_days, mv_sum, idx) arrays
-    """
-    idx = np.array(filtered_indices_tuple, dtype=np.int64)
-    if len(idx) == 0:
+
+def make_single_asset_filter_key(filter_key, asset_name: str):
+    """Create filter key for a single asset."""
+    _, ym_lo, ym_hi, sch_part = filter_key
+    return (("dropdown", asset_name), ym_lo, ym_hi, sch_part)
+
+
+@st.cache_data
+def compute_population_daily_for_asset(filter_key, asset_name: str) -> pd.DataFrame:
+    """Compute daily aggregates for a single asset (cached)."""
+    asset_filter_key = make_single_asset_filter_key(filter_key, asset_name)
+    return compute_population_daily(asset_filter_key)
+
+
+@st.cache_data
+def compute_asset_daily_matrix(filter_key):
+    """Build normalized daily pnl matrix [dates × assets] for correlation."""
+    straddles, valuations, _, _, _ = load_data()
+    idx = get_filtered_indices_cached(filter_key)
+
+    if idx.size == 0:
+        return pd.DataFrame(), np.array([])
+
+    # Prep arrays
+    out0s = straddles["out0"][idx].astype(np.int32)
+    lens = straddles["length"][idx].astype(np.int32)
+    starts = straddles["month_start_epoch"][idx].astype(np.int32)
+
+    # Factorize assets for selected straddles only
+    asset_str_sel = np.asarray([str(straddles["asset"][i]) for i in idx], dtype=object)
+    asset_codes, asset_names = pd.factorize(asset_str_sel, sort=True)
+    asset_ids = asset_codes.astype(np.int32)
+    n_assets = len(asset_names)
+
+    # Grid bounds
+    d0, d1 = int(starts.min()), int((starts + lens - 1).max())
+    grid_size = d1 - d0 + 1
+
+    # Valuations
+    pnl = valuations["pnl"]
+    vol = valuations["vol"]
+    have_dte = "days_to_expiry" in valuations
+    dte = valuations["days_to_expiry"] if have_dte else np.empty(1, dtype=np.int32)
+
+    # Run kernel
+    pnl_sum, vol_sum = _aggregate_daily_by_asset(
+        out0s, lens, starts, asset_ids, d0,
+        pnl, vol, dte, have_dte, grid_size, n_assets
+    )
+
+    # Normalize: daily_vol = vol_sum / 16, then pnl / daily_vol
+    with np.errstate(divide='ignore', invalid='ignore'):
+        daily_vol = vol_sum / 16.0
+        X = pnl_sum / daily_vol
+        X[~np.isfinite(X)] = np.nan
+
+    # Build DataFrame with date index
+    base = np.datetime64('1970-01-01', 'D')
+    dates = pd.DatetimeIndex(base + np.arange(d0, d1 + 1))
+
+    # Filter rows where at least one asset has data
+    row_mask = np.any(np.isfinite(X), axis=1)
+    X = X[row_mask]
+    dates = dates[row_mask]
+
+    df = pd.DataFrame(X, index=dates, columns=asset_names)
+    return df, np.asarray(asset_names)
+
+
+def _compute_all_straddle_metrics_from_indices(straddles, valuations, idx: np.ndarray):
+    """Core straddle metrics computation (uncached)."""
+    if idx.size == 0:
         empty = np.array([])
         return empty, empty, empty, empty, empty, idx
 
-    straddles, valuations = _straddles, _valuations
+    # Phase 1: Array prep
+    t0 = time.perf_counter()
     out0s = straddles["out0"][idx].astype(np.int32)
     lens = straddles["length"][idx].astype(np.int32)
     pnl = valuations["pnl"]
@@ -313,16 +541,34 @@ def compute_all_straddle_metrics(_straddles, _valuations, filtered_indices_tuple
     mv = valuations["mv"]
     have_dte = "days_to_expiry" in valuations
     dte = valuations["days_to_expiry"] if have_dte else np.empty(1, dtype=np.int32)
+    dt_prep = time.perf_counter() - t0
 
+    # Phase 2: Numba kernel
+    t0 = time.perf_counter()
     pnl_sum, pnl_days, vol_sum, vol_days, mv_sum = _summarize_all(
         out0s, lens, pnl, vol, mv, dte, have_dte
     )
+    dt_kernel = time.perf_counter() - t0
+
+    # Log sub-timings
+    tlog(f"       straddle_metrics.prep: {_fmt_dt_s(dt_prep)}")
+    tlog(f"       straddle_metrics.kernel: {_fmt_dt_s(dt_kernel)}")
+
     return pnl_sum, pnl_days, vol_sum, vol_days, mv_sum, idx
 
 
 @st.cache_data
-def compute_ym_matrix_from_cache(_straddles, filtered_indices_tuple, weights, value_type="pnl"):
+def compute_all_straddle_metrics(filter_key):
+    """Compute per-straddle metrics. Cached by filter params."""
+    straddles, valuations, _, _, _ = load_data()
+    idx = get_filtered_indices_cached(filter_key)
+    return _compute_all_straddle_metrics_from_indices(straddles, valuations, idx)
+
+
+def compute_ym_matrix_from_cache(filtered_indices_tuple, weights, value_type="pnl"):
     """Compute year×month matrix from CACHED per-straddle arrays (no kernel calls).
+
+    NOTE: Not cached - computation is fast (bincount), caching overhead was 7+ seconds.
 
     Args:
         weights: Pre-computed per-straddle values (pnl_sum, pnl_days, or mv_sum)
@@ -334,7 +580,7 @@ def compute_ym_matrix_from_cache(_straddles, filtered_indices_tuple, weights, va
     if len(idx) == 0:
         return pd.DataFrame(), (0, 0)
 
-    straddles = _straddles
+    straddles, _, _, _, _ = load_data()
     years = straddles["year"][idx].astype(np.int32)
     months = straddles["month"][idx].astype(np.int32)
 
@@ -523,10 +769,453 @@ def plot_cumsum_valid(dates, series, title):
     st.line_chart(df)
     st.caption(f"Final: {cumsum[-1]:.6f} | Points: {len(cumsum):,}")
 
+
+def build_cum_df(pop_df: pd.DataFrame) -> pd.DataFrame:
+    """Build cumulative series dataframe."""
+    cum_df = pd.DataFrame(index=pop_df.index)
+    cum_df["pnl_cum"] = pop_df["pnl_sum"].cumsum()
+
+    if "opnl_sum" in pop_df.columns:
+        cum_df["opnl_cum"] = pop_df["opnl_sum"].cumsum()
+    if "hpnl_sum" in pop_df.columns:
+        cum_df["hpnl_cum"] = pop_df["hpnl_sum"].cumsum()
+
+    return cum_df
+
+
+def build_asset_daily_df(asset_pop: pd.DataFrame) -> pd.DataFrame:
+    """Build daily + cumulative series for asset drilldown."""
+    out = pd.DataFrame(index=asset_pop.index)
+    out["pnl_sum"] = asset_pop["pnl_sum"]
+    out["pnl_cum"] = asset_pop["pnl_sum"].cumsum()
+
+    if "opnl_sum" in asset_pop.columns:
+        out["opnl_sum"] = asset_pop["opnl_sum"]
+        out["opnl_cum"] = asset_pop["opnl_sum"].cumsum()
+    if "hpnl_sum" in asset_pop.columns:
+        out["hpnl_sum"] = asset_pop["hpnl_sum"]
+        out["hpnl_cum"] = asset_pop["hpnl_sum"].cumsum()
+
+    return out
+
+
+def render_cum_plot_plotly(cum_df: pd.DataFrame):
+    """Render cumulative PnL with Plotly (range slider, buttons)."""
+    fig = go.Figure()
+
+    # Main cumulative lines
+    fig.add_trace(go.Scatter(
+        x=cum_df.index, y=cum_df["pnl_cum"],
+        mode="lines", name="PnL cum", line=dict(width=2)
+    ))
+
+    if "opnl_cum" in cum_df.columns:
+        fig.add_trace(go.Scatter(
+            x=cum_df.index, y=cum_df["opnl_cum"],
+            mode="lines", name="Option PnL cum", line=dict(width=1)
+        ))
+    if "hpnl_cum" in cum_df.columns:
+        fig.add_trace(go.Scatter(
+            x=cum_df.index, y=cum_df["hpnl_cum"],
+            mode="lines", name="Hedge PnL cum", line=dict(width=1)
+        ))
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=40, b=90),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            rangeselector=dict(buttons=[
+                dict(count=1, label="1m", step="month", stepmode="backward"),
+                dict(count=3, label="3m", step="month", stepmode="backward"),
+                dict(count=6, label="6m", step="month", stepmode="backward"),
+                dict(count=1, label="YTD", step="year", stepmode="todate"),
+                dict(count=1, label="1y", step="year", stepmode="backward"),
+                dict(step="all", label="All"),
+            ])
+        ),
+        yaxis=dict(title="Cumulative PnL"),
+    )
+
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+
+
+def _tv_series_from_pd(s: pd.Series):
+    """Convert pandas Series to TradingView time/value format (YYYY-MM-DD strings)."""
+    s = s.astype(float)
+    mask = np.isfinite(s.values)
+    s = s.iloc[mask]
+    # Use business-day strings for daily series (wrapper expects this format)
+    t = s.index.strftime("%Y-%m-%d")
+    v = s.values
+    return [{"time": str(t[i]), "value": float(v[i])} for i in range(len(v))]
+
+
+def render_cum_plot_tradingview(cum_df: pd.DataFrame):
+    """Render cumulative PnL with TradingView Lightweight Charts."""
+    chart_options = {
+        "height": 520,
+        "layout": {
+            "background": {"type": "solid", "color": "white"},
+            "textColor": "black",
+        },
+        "grid": {
+            "vertLines": {"color": "rgba(197, 203, 206, 0.5)"},
+            "horzLines": {"color": "rgba(197, 203, 206, 0.5)"},
+        },
+        "timeScale": {"timeVisible": True, "secondsVisible": False},
+        "rightPriceScale": {"borderVisible": False},
+        "crosshair": {"mode": 1},
+    }
+
+    series = [
+        {
+            "type": "Line",
+            "data": _tv_series_from_pd(cum_df["pnl_cum"]),
+            "options": {"lineWidth": 2, "color": "#2962FF", "title": "PnL cum"},
+        }
+    ]
+
+    if "opnl_cum" in cum_df.columns:
+        series.append({
+            "type": "Line",
+            "data": _tv_series_from_pd(cum_df["opnl_cum"]),
+            "options": {"lineWidth": 1, "color": "#26a69a", "title": "Option cum"},
+        })
+    if "hpnl_cum" in cum_df.columns:
+        series.append({
+            "type": "Line",
+            "data": _tv_series_from_pd(cum_df["hpnl_cum"]),
+            "options": {"lineWidth": 1, "color": "#ef5350", "title": "Hedge cum"},
+        })
+
+    renderLightweightCharts([{"chart": chart_options, "series": series}], key="tv_cum")
+
+
+def render_timeseries_plotly(df: pd.DataFrame, cols: list, title: str, height: int = 420):
+    """Render time-series with Plotly (range slider, unified hover)."""
+    fig = go.Figure()
+    for c in cols:
+        fig.add_trace(go.Scatter(x=df.index, y=df[c], mode="lines", name=c))
+    fig.update_layout(
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=70),
+        hovermode="x unified",
+        title=dict(text=title, x=0.01, xanchor="left"),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0),
+        xaxis=dict(rangeslider=dict(visible=True)),
+    )
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+
+
+def render_hist_plotly(x: np.ndarray, title: str, xlabel: str, bins: int = 80, clip_pct=(1, 99)):
+    """Render histogram with Plotly, mean/median lines, clipped to percentiles."""
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        st.warning("No valid data.")
+        return
+
+    lo, hi = np.percentile(x, clip_pct)
+    clipped = x[(x >= lo) & (x <= hi)]
+
+    mean_x = float(np.mean(x))
+    med_x = float(np.median(x))
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=clipped, nbinsx=bins, name=""))
+
+    # Mean/median vertical lines
+    fig.add_vline(x=mean_x, line_width=2, line_dash="dash", annotation_text=f"Mean {mean_x:.4f}")
+    fig.add_vline(x=med_x, line_width=2, line_dash="solid", annotation_text=f"Median {med_x:.4f}")
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title=title,
+        bargap=0.05,
+        xaxis_title=xlabel,
+        yaxis_title="Frequency",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Mean", f"{mean_x:.4f}")
+    c2.metric("Median", f"{med_x:.4f}")
+    c3.metric("Std Dev", f"{float(np.std(x)):.4f}")
+    c4.metric("Days", f"{x.size:,}")
+
+
+def render_asset_bar_ratio(df: pd.DataFrame, top_n: int = 80):
+    """Bar chart of mean daily PnL / mean daily vol by asset."""
+    d = df.head(top_n).copy()
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=d["asset"],
+        y=d["pnl_over_daily_vol"],
+        customdata=np.stack([d["mean_daily_pnl"], d["mean_daily_vol"]], axis=1),
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "PnL / daily vol: %{y:.3f}<br>"
+            "mean daily pnl: %{customdata[0]:.6f}<br>"
+            "mean daily vol: %{customdata[1]:.6f}<extra></extra>"
+        ),
+        name="",
+    ))
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title=f"Mean Daily PnL / Daily Vol by Asset (top {top_n})",
+        xaxis=dict(showticklabels=False),
+        yaxis_title="PnL / daily vol",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+    st.caption("X labels hidden; use hover and zoom/pan.")
+
+
+def render_asset_bar_vol(df: pd.DataFrame, top_n: int = 80, which: str = "annual"):
+    """Bar chart of vol by asset (annual or daily)."""
+    col = "avg_vol" if which == "annual" else "mean_daily_vol"
+    title = "Mean Annual Vol by Asset" if which == "annual" else "Mean Daily Vol by Asset"
+    d = df.sort_values(col, ascending=False).head(top_n).copy()
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=d["asset"],
+        y=d[col],
+        customdata=np.stack([d["mean_daily_pnl"]], axis=1),
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            f"{col}: %{{y:.6f}}<br>"
+            "mean daily pnl: %{customdata[0]:.6f}<extra></extra>"
+        ),
+        name="",
+    ))
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title=f"{title} (top {top_n})",
+        xaxis=dict(showticklabels=False),
+        yaxis_title=("Annual vol" if which == "annual" else "Daily vol"),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+    st.caption("X labels hidden; use hover and zoom/pan.")
+
+
+def render_asset_pnl_plotly(asset_name: str, df: pd.DataFrame):
+    """Render asset drilldown with Plotly (daily/cumulative toggle)."""
+    view = st.radio("View", ["Cumulative", "Daily"], horizontal=True, key=f"asset_view_{asset_name}")
+
+    if view == "Cumulative":
+        cols = ["pnl_cum"]
+        labels = {"pnl_cum": "PnL cum", "opnl_cum": "Option PnL cum", "hpnl_cum": "Hedge PnL cum"}
+        if "opnl_cum" in df.columns:
+            cols.append("opnl_cum")
+        if "hpnl_cum" in df.columns:
+            cols.append("hpnl_cum")
+        title = f"{asset_name} — Cumulative PnL"
+    else:
+        cols = ["pnl_sum"]
+        labels = {"pnl_sum": "PnL daily", "opnl_sum": "Option PnL daily", "hpnl_sum": "Hedge PnL daily"}
+        if "opnl_sum" in df.columns:
+            cols.append("opnl_sum")
+        if "hpnl_sum" in df.columns:
+            cols.append("hpnl_sum")
+        title = f"{asset_name} — Daily PnL"
+
+    fig = go.Figure()
+    for c in cols:
+        fig.add_trace(go.Scatter(x=df.index, y=df[c], mode="lines", name=labels.get(c, c)))
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=40, b=90),
+        title=title,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            rangeselector=dict(buttons=[
+                dict(count=1, label="1m", step="month", stepmode="backward"),
+                dict(count=3, label="3m", step="month", stepmode="backward"),
+                dict(count=6, label="6m", step="month", stepmode="backward"),
+                dict(count=1, label="YTD", step="year", stepmode="todate"),
+                dict(count=1, label="1y", step="year", stepmode="backward"),
+                dict(step="all", label="All"),
+            ]),
+        ),
+    )
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+
+
+def render_correlation_heatmap(
+    corr_mat: np.ndarray,
+    overlap: np.ndarray,
+    asset_names: np.ndarray,
+    boundaries: list = None,
+    title_prefix: str = "Asset Correlation Heatmap"
+):
+    """Render interactive Plotly correlation heatmap with optional cluster separators."""
+    n = len(asset_names)
+    boundaries = boundaries or []
+
+    # Build hover text matrix
+    hover_text = []
+    for i in range(n):
+        row = []
+        for j in range(n):
+            c = corr_mat[i, j]
+            o = int(overlap[i, j])
+            if np.isfinite(c):
+                row.append(f"{asset_names[i]} x {asset_names[j]}<br>corr: {c:.3f}<br>overlap: {o} days")
+            else:
+                row.append(f"{asset_names[i]} x {asset_names[j]}<br>corr: NaN<br>overlap: {o} days")
+        hover_text.append(row)
+
+    # Use numeric axes for precise separator placement
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_mat,
+        x=np.arange(n),
+        y=np.arange(n),
+        colorscale="RdBu_r",
+        zmid=0,
+        zmin=-1,
+        zmax=1,
+        hoverinfo="text",
+        text=hover_text,
+        colorbar=dict(title="Correlation"),
+    ))
+
+    # Dynamic height: scale with assets, cap at 1200
+    height = min(1200, max(520, 8 * n))
+
+    # Tick label policy: hide if too many assets
+    show_ticks = n <= 60
+    tick_font_size = 8 if n <= 40 else 6
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title=f"{title_prefix} ({n} assets)",
+        xaxis=dict(
+            showticklabels=show_ticks,
+            tickvals=np.arange(n) if show_ticks else None,
+            ticktext=asset_names if show_ticks else None,
+            tickfont=dict(size=tick_font_size) if show_ticks else None,
+            title="",
+        ),
+        yaxis=dict(
+            showticklabels=show_ticks,
+            tickvals=np.arange(n) if show_ticks else None,
+            ticktext=asset_names if show_ticks else None,
+            tickfont=dict(size=tick_font_size) if show_ticks else None,
+            title="",
+            autorange="reversed",
+        ),
+    )
+
+    # Draw cluster separators
+    for b in boundaries:
+        pos = b - 0.5
+        # Vertical line
+        fig.add_shape(
+            type="line",
+            x0=pos, x1=pos, y0=-0.5, y1=n - 0.5,
+            xref="x", yref="y",
+            line=dict(width=2, color="black"),
+        )
+        # Horizontal line
+        fig.add_shape(
+            type="line",
+            x0=-0.5, x1=n - 0.5, y0=pos, y1=pos,
+            xref="x", yref="y",
+            line=dict(width=2, color="black"),
+        )
+
+    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+
+    # Show note about hidden labels
+    if not show_ticks:
+        st.caption("Axis labels hidden (>60 assets). Hover over cells to see asset names.")
+
+
+# ============================================================================
+# Clustering Helpers
+# ============================================================================
+def corr_to_distance(corr_mat: np.ndarray, mode: str) -> np.ndarray:
+    """Convert correlation matrix to distance matrix for clustering.
+
+    mode:
+      - "1-corr": D = 1 - corr (negative correlations are far)
+      - "1-abs(corr)": D = 1 - abs(corr) (opposite movers cluster together)
+    """
+    C = corr_mat.copy()
+    C[~np.isfinite(C)] = 0.0  # NaN -> 0 corr -> distance 1
+
+    if mode == "1-corr":
+        D = 1.0 - C
+    elif mode == "1-abs(corr)":
+        D = 1.0 - np.abs(C)
+    else:
+        raise ValueError(f"Unknown distance mode: {mode}")
+
+    np.fill_diagonal(D, 0.0)
+    D = np.clip(D, 0.0, 2.0)
+    return D
+
+
+def cluster_order_from_corr(corr_mat: np.ndarray, dist_mode: str, linkage_method: str) -> np.ndarray:
+    """Return permutation (leaf order) from hierarchical clustering."""
+    n = corr_mat.shape[0]
+    if n <= 2:
+        return np.arange(n, dtype=np.int64)
+
+    D = corr_to_distance(corr_mat, dist_mode)
+    condensed = squareform(D, checks=False)
+    Z = linkage(condensed, method=linkage_method)
+    return leaves_list(Z).astype(np.int64)
+
+
+def cluster_boundaries_from_corr(
+    corr_mat: np.ndarray, dist_mode: str, linkage_method: str, k: int
+):
+    """Return (order, boundaries) where boundaries mark cluster changes.
+
+    boundaries: list of indices where cluster membership changes in leaf order
+    """
+    n = corr_mat.shape[0]
+    if n <= 2 or k <= 1:
+        return np.arange(n, dtype=np.int64), []
+
+    D = corr_to_distance(corr_mat, dist_mode)
+    condensed = squareform(D, checks=False)
+    Z = linkage(condensed, method=linkage_method)
+
+    order = leaves_list(Z).astype(np.int64)
+    labels = fcluster(Z, t=k, criterion="maxclust").astype(np.int64)
+    labels_ord = labels[order]
+
+    boundaries = []
+    for i in range(1, n):
+        if labels_ord[i] != labels_ord[i - 1]:
+            boundaries.append(i)
+    return order, boundaries
+
+
 # ============================================================================
 # Main App
 # ============================================================================
-straddles, valuations, missing_s, missing_v, avail_opt = load_data()
+timings = {}
+tlog(f"{_ts()} ---- run ----")
+
+with timed_collect("load_data", timings):
+    straddles, valuations, missing_s, missing_v, avail_opt = load_data()
 
 # Schema warnings
 if missing_s or missing_v:
@@ -539,11 +1228,15 @@ st.title("Backtest Explorer")
 # Sidebar with Tabs
 # ============================================================================
 # Precompute for filtering
-asset_str, unique_assets = get_asset_strings(straddles)
-straddle_ym = get_straddle_ym(straddles)
+with timed_collect("get_asset_strings", timings):
+    asset_str, unique_assets = get_asset_strings(straddles)
+
+with timed_collect("get_straddle_ym", timings):
+    straddle_ym = get_straddle_ym(straddles)
 
 # Precompute asset IDs once for fast slicing in Assets tab
-asset_ids_all, asset_names_all = factorize_assets(tuple(asset_str))
+with timed_collect("factorize_assets", timings):
+    asset_ids_all, asset_names_all = factorize_assets(tuple(asset_str))
 
 with st.sidebar:
     st.header("Filters")
@@ -625,10 +1318,12 @@ with st.sidebar:
     st.divider()
 
     # --- Apply filters ---
-    filtered_indices, regex_error = get_filtered_indices(
-        straddles, asset_str, straddle_ym,
-        asset_mode.lower(), asset_value, ym_lo, ym_hi, set(selected_schids)
-    )
+    with timed_collect("get_filtered_indices", timings, meta=f"(schids={len(selected_schids)})"):
+        filtered_indices, regex_error = get_filtered_indices(
+            straddles, asset_str, straddle_ym,
+            asset_mode.lower(), asset_value, ym_lo, ym_hi, set(selected_schids)
+        )
+    tlog(f"       -> matched {len(filtered_indices):,} straddles")
 
     if regex_error:
         st.error(f"Regex error: {regex_error}")
@@ -641,12 +1336,17 @@ with st.sidebar:
 if len(filtered_indices) == 0:
     st.warning("No straddles match the current filters.")
 else:
+    # Build filter key once (small, hashable)
+    filter_key = make_filter_key(asset_mode.lower(), asset_value, ym_lo, ym_hi, selected_schids)
+
     # Compute population daily aggregates (Numba kernel)
-    pop_df = compute_population_daily(straddles, valuations, tuple(filtered_indices))
+    with timed_collect("compute_population_daily", timings, meta=f"(n={len(filtered_indices):,})"):
+        pop_df = compute_population_daily(filter_key)
 
     # Compute ALL per-straddle metrics ONCE (Numba kernel) - reuse everywhere
-    pnl_sum_sel, pnl_days_sel, vol_sum_sel, vol_days_sel, mv_sum_sel, idx_sel = \
-        compute_all_straddle_metrics(straddles, valuations, tuple(filtered_indices))
+    with timed_collect("compute_all_straddle_metrics", timings, meta=f"(n={len(filtered_indices):,})"):
+        pnl_sum_sel, pnl_days_sel, vol_sum_sel, vol_days_sel, mv_sum_sel, idx_sel = \
+            compute_all_straddle_metrics(filter_key)
 
     if pop_df.empty:
         st.warning("No valid data for selected population.")
@@ -678,7 +1378,7 @@ else:
         st.divider()
 
         # Tabs: Days, Cumulative PnL, MV, Contributors, Straddles, Assets, Matrices
-        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix"]
+        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix", "Correlation"]
         tabs = dict(zip(tab_names, st.tabs(tab_names)))
 
         # --- Days Tab ---
@@ -692,7 +1392,8 @@ else:
             if "hpnl_sum" in pop_df.columns:
                 display_cols.insert(3, "hpnl_sum")
 
-            st.dataframe(pop_df[display_cols], width='stretch', height=400)
+            with timed_collect("render_days_table", timings, meta=f"(rows={len(pop_df)})"):
+                st.dataframe(pop_df[display_cols], width='stretch', height=400)
             st.caption("n_straddles = straddles with finite pnl on that date (dte >= 0)")
 
         # --- Density Tab ---
@@ -729,45 +1430,22 @@ else:
 
         # --- Normalized Density Tab ---
         with tabs["Norm Density"]:
-            st.subheader("Daily P&L / Vol Distribution")
+            st.subheader("Daily P&L / Daily Vol Distribution")
 
             # Filter valid avg_vol > 0
             valid_mask = pop_df["avg_vol"] > 0
             if valid_mask.sum() > 0:
                 pnl_vals = pop_df.loc[valid_mask, "pnl_sum"].values
-                vol_vals = pop_df.loc[valid_mask, "avg_vol"].values
-                norm_pnl = pnl_vals / vol_vals
+                vol_vals = pop_df.loc[valid_mask, "avg_vol"].values  # annual vol
+                daily_vol = vol_vals / 16.0  # convert to daily vol
+                norm_pnl = pnl_vals / daily_vol
 
-                # Clip extreme tails for better visualization
-                q01, q99 = np.percentile(norm_pnl, [1, 99])
-                clipped = norm_pnl[(norm_pnl >= q01) & (norm_pnl <= q99)]
-
-                mean_norm = np.mean(norm_pnl)
-                median_norm = np.median(norm_pnl)
-
-                fig, ax = plt.subplots(figsize=(10, 5))
-                ax.hist(clipped, bins=80, color="#9b59b6", edgecolor="white", alpha=0.8)
-
-                # Mean and median lines (use full data stats)
-                ax.axvline(mean_norm, color="#e74c3c", linestyle="--", linewidth=2, label=f"Mean: {mean_norm:.4f}")
-                ax.axvline(median_norm, color="#2ecc71", linestyle="-", linewidth=2, label=f"Median: {median_norm:.4f}")
-
-                ax.set_xlabel("Daily P&L / Avg Vol", fontsize=11)
-                ax.set_ylabel("Frequency", fontsize=11)
-                ax.set_title("Normalized Daily P&L Distribution (1%-99% shown)", fontsize=13, fontweight="bold")
-                ax.legend(loc="upper right", fontsize=10)
-                ax.spines["top"].set_visible(False)
-                ax.spines["right"].set_visible(False)
-                ax.grid(axis="y", alpha=0.3)
-
-                st.pyplot(fig)
-                plt.close(fig)
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Mean", f"{mean_norm:.4f}")
-                c2.metric("Median", f"{median_norm:.4f}")
-                c3.metric("Std Dev", f"{np.std(norm_pnl):.4f}")
-                c4.metric("Valid Days", f"{len(norm_pnl):,}")
+                with timed_collect("render_norm_density_plotly", timings):
+                    render_hist_plotly(
+                        norm_pnl,
+                        title="Daily P&L / Daily Vol Distribution (1%-99% shown)",
+                        xlabel="Daily P&L / Daily Vol"
+                    )
             else:
                 st.warning("No valid avg_vol data for normalization.")
 
@@ -775,35 +1453,44 @@ else:
         with tabs["Cumulative PnL"]:
             st.subheader("Cumulative PnL")
 
-            cum_df = pd.DataFrame(index=pop_df.index)
-            cum_df["pnl_cum"] = pop_df["pnl_sum"].cumsum()
-            if "opnl_sum" in pop_df.columns:
-                cum_df["opnl_cum"] = pop_df["opnl_sum"].cumsum()
-            if "hpnl_sum" in pop_df.columns:
-                cum_df["hpnl_cum"] = pop_df["hpnl_sum"].cumsum()
+            cum_df = build_cum_df(pop_df)
 
-            st.line_chart(cum_df)
+            chart_mode = st.radio(
+                "Chart", ["Plotly", "TradingView"],
+                horizontal=True, key="cum_chart_mode"
+            )
+
+            if chart_mode == "Plotly":
+                with timed_collect("render_cum_plotly", timings):
+                    render_cum_plot_plotly(cum_df)
+            else:
+                with timed_collect("render_cum_tradingview", timings):
+                    render_cum_plot_tradingview(cum_df)
+
             st.caption(f"Final PnL: {cum_df['pnl_cum'].iloc[-1]:.6f}")
 
         # --- MV Tab ---
         with tabs["MV"]:
             st.subheader("Population MV (sum)")
 
-            st.line_chart(pop_df[["mv_sum"]])
+            with timed_collect("render_mv_plotly", timings):
+                render_timeseries_plotly(pop_df, ["mv_sum"], "MV Sum")
             st.caption(f"MV sum across {pop_df['n_straddles'].mean():.1f} avg contributors/day")
 
         # --- Contributors Tab ---
         with tabs["Contributors"]:
             st.subheader("Daily P&L Contributors")
 
-            st.line_chart(pop_df[["n_straddles"]])
+            with timed_collect("render_contributors_plotly", timings):
+                render_timeseries_plotly(pop_df, ["n_straddles"], "Contributors")
             st.caption(f"Straddles with valid P&L per day | Avg: {pop_df['n_straddles'].mean():.1f} | Max: {pop_df['n_straddles'].max():,}")
 
         # --- Avg Vol Tab ---
         with tabs["Avg Vol"]:
             st.subheader("Daily Average Vol")
 
-            st.line_chart(pop_df[["avg_vol"]])
+            with timed_collect("render_avgvol_plotly", timings):
+                render_timeseries_plotly(pop_df, ["avg_vol"], "Avg Vol")
             st.caption(f"Average vol across contributors | Mean: {pop_df['avg_vol'].mean():.4f} | Max: {pop_df['avg_vol'].max():.4f}")
 
         # --- Straddles Tab ---
@@ -851,14 +1538,20 @@ else:
                 n_assets = len(asset_names_all)
 
                 # Fast aggregation with bincount
-                asset_pnl_sum = np.bincount(asset_ids, weights=pnl_sum_sel, minlength=n_assets)
-                asset_pnl_days = np.bincount(asset_ids, weights=pnl_days_sel.astype(np.float64), minlength=n_assets)
-                asset_n_straddles = np.bincount(asset_ids, minlength=n_assets)
-                asset_vol_sum = np.bincount(asset_ids, weights=vol_sum_sel, minlength=n_assets)
-                asset_vol_days = np.bincount(asset_ids, weights=vol_days_sel.astype(np.float64), minlength=n_assets)
+                with timed_collect("assets_bincount", timings, meta=f"(n={len(idx_sel):,})"):
+                    asset_pnl_sum = np.bincount(asset_ids, weights=pnl_sum_sel, minlength=n_assets)
+                    asset_pnl_days = np.bincount(asset_ids, weights=pnl_days_sel.astype(np.float64), minlength=n_assets)
+                    asset_n_straddles = np.bincount(asset_ids, minlength=n_assets)
+                    asset_vol_sum = np.bincount(asset_ids, weights=vol_sum_sel, minlength=n_assets)
+                    asset_vol_days = np.bincount(asset_ids, weights=vol_days_sel.astype(np.float64), minlength=n_assets)
 
                 # Compute avg_vol (avoid div by zero)
                 avg_vol = asset_vol_sum / np.maximum(asset_vol_days, 1.0)
+
+                # Compute daily metrics for bar charts
+                mean_daily_pnl = asset_pnl_sum / np.maximum(asset_pnl_days, 1.0)
+                mean_daily_vol = avg_vol / 16.0  # avg_vol is annual, divide by 16 for daily
+                pnl_over_daily_vol = mean_daily_pnl / np.maximum(mean_daily_vol, 1e-12)
 
                 # Build dataframe with pct columns
                 total_pnl = asset_pnl_sum.sum()
@@ -869,6 +1562,9 @@ else:
                     "pnl_days": asset_pnl_days.astype(np.int64),
                     "n_straddles": asset_n_straddles,
                     "avg_vol": avg_vol,
+                    "mean_daily_pnl": mean_daily_pnl,
+                    "mean_daily_vol": mean_daily_vol,
+                    "pnl_over_daily_vol": pnl_over_daily_vol,
                 })
                 asset_df = asset_df[asset_df["n_straddles"] > 0].sort_values("pnl_sum", ascending=False).reset_index(drop=True)
 
@@ -893,64 +1589,197 @@ else:
                 }).background_gradient(subset=["pnl_sum"], cmap="RdYlGn"
                 ).background_gradient(subset=["avg_vol"], cmap="Blues")
 
-                st.dataframe(styled_df, width='stretch', height=500)
+                with timed_collect("render_assets_table", timings, meta=f"(rows={len(asset_df)})"):
+                    st.dataframe(styled_df, width='stretch', height=500)
 
-                # Sparklines for top assets
-                show_sparklines = st.checkbox("Show sparklines (top 10 assets)", value=False, key="spark_check")
+                st.divider()
+                st.subheader("Asset Drilldown")
 
-                if show_sparklines and len(asset_df) > 0:
-                    top_assets = asset_df.head(10)["asset"].tolist()
+                asset_choice = st.selectbox(
+                    "Select asset",
+                    options=asset_df["asset"].tolist(),
+                    index=0,
+                    key="asset_drill_select"
+                )
 
-                    # Get indices for each top asset
-                    spark_cols = st.columns(5)
-                    for i, asset_name in enumerate(top_assets):
-                        asset_mask = (asset_str == asset_name)
-                        asset_indices = np.where(asset_mask)[0]
+                with timed_collect("asset_drilldown_pop_daily", timings, meta=f"({asset_choice})"):
+                    asset_pop = compute_population_daily_for_asset(filter_key, asset_choice)
 
-                        # Filter to current selection
-                        asset_sel = np.intersect1d(asset_indices, filtered_indices)
+                if asset_pop.empty:
+                    st.warning("No data for this asset in the current filter range.")
+                else:
+                    asset_daily = build_asset_daily_df(asset_pop)
+                    with timed_collect("asset_drilldown_plot", timings, meta=f"({asset_choice})"):
+                        render_asset_pnl_plotly(asset_choice, asset_daily)
 
-                        if len(asset_sel) > 0:
-                            # Compute daily cumulative pnl for this asset
-                            asset_pop = compute_population_daily(straddles, valuations, tuple(asset_sel.tolist()))
-                            cum_pnl = asset_pop["pnl_sum"].cumsum()
+                st.divider()
+                st.subheader("Asset Bar Charts")
 
-                            with spark_cols[i % 5]:
-                                st.caption(f"{asset_name}")
-                                st.line_chart(cum_pnl, height=80)
+                if len(asset_df) > 10:
+                    bar_top_n = st.slider("Assets in bar charts", 10, len(asset_df), len(asset_df), step=10, key="asset_bar_topn")
+                else:
+                    bar_top_n = len(asset_df)
+
+                with timed_collect("render_asset_bar_ratio", timings):
+                    # Sort by pnl/vol ratio for this chart
+                    ratio_df = asset_df.sort_values("pnl_over_daily_vol", ascending=False)
+                    render_asset_bar_ratio(ratio_df, top_n=bar_top_n)
+
+                vol_kind = st.radio("Vol scale", ["annual", "daily"], horizontal=True, key="vol_scale")
+                with timed_collect("render_asset_bar_vol", timings):
+                    render_asset_bar_vol(asset_df, top_n=bar_top_n, which=vol_kind)
 
         # --- P&L Matrix Tab ---
         with tabs["P&L Matrix"]:
             st.subheader("P&L by Year x Month")
 
             # Use pre-computed pnl_sum_sel (no kernel call!)
-            pnl_mat, year_range = compute_ym_matrix_from_cache(
-                straddles, tuple(filtered_indices), pnl_sum_sel, "pnl"
-            )
+            with timed_collect("compute_pnl_matrix", timings):
+                pnl_mat, year_range = compute_ym_matrix_from_cache(
+                    tuple(filtered_indices), pnl_sum_sel, "pnl"
+                )
 
             if not pnl_mat.empty:
-                render_matrix_view(pnl_mat, year_range, "P&L by Year x Month", ".4f", "RdYlGn", "pnl_mat_view")
+                with timed_collect("render_pnl_heatmap", timings):
+                    render_matrix_view(pnl_mat, year_range, "P&L by Year x Month", ".4f", "RdYlGn", "pnl_mat_view")
 
         # --- Live Days Matrix Tab ---
         with tabs["Live Days"]:
             st.subheader("Live Days by Year x Month")
 
             # Use pre-computed pnl_days_sel (no kernel call!)
-            days_mat, year_range = compute_ym_matrix_from_cache(
-                straddles, tuple(filtered_indices), pnl_days_sel, "live_days"
-            )
+            with timed_collect("compute_days_matrix", timings):
+                days_mat, year_range = compute_ym_matrix_from_cache(
+                    tuple(filtered_indices), pnl_days_sel, "live_days"
+                )
 
             if not days_mat.empty:
-                render_matrix_view(days_mat, year_range, "Live Days by Year x Month", ",.0f", "Blues", "days_mat_view")
+                with timed_collect("render_days_heatmap", timings):
+                    render_matrix_view(days_mat, year_range, "Live Days by Year x Month", ",.0f", "Blues", "days_mat_view")
 
         # --- MV Matrix Tab ---
         with tabs["MV Matrix"]:
             st.subheader("MV by Year x Month")
 
             # Use pre-computed mv_sum_sel (no kernel call!)
-            mv_mat, year_range = compute_ym_matrix_from_cache(
-                straddles, tuple(filtered_indices), mv_sum_sel, "mv"
-            )
+            with timed_collect("compute_mv_matrix", timings):
+                mv_mat, year_range = compute_ym_matrix_from_cache(
+                    tuple(filtered_indices), mv_sum_sel, "mv"
+                )
 
             if not mv_mat.empty:
-                render_matrix_view(mv_mat, year_range, "MV by Year x Month", ".2f", "Purples", "mv_mat_view")
+                with timed_collect("render_mv_heatmap", timings):
+                    render_matrix_view(mv_mat, year_range, "MV by Year x Month", ".2f", "Purples", "mv_mat_view")
+
+        # --- Correlation Tab ---
+        with tabs["Correlation"]:
+            st.subheader("Asset Correlation Heatmap")
+
+            # Row 1: Basic controls + ordering
+            row1 = st.columns(5)
+            with row1[0]:
+                corr_method = st.selectbox("Method", ["pearson", "spearman"], key="corr_method")
+            with row1[1]:
+                min_overlap = st.slider("Min overlap days", 10, 250, 30, step=10, key="corr_min_overlap")
+            with row1[2]:
+                display_mode = st.radio("Assets", ["All", "Top N"], horizontal=True, key="corr_display_mode")
+            with row1[3]:
+                if display_mode == "Top N":
+                    top_n_assets = st.slider("N", 20, 500, 60, step=10, key="corr_top_n")
+                else:
+                    top_n_assets = None
+                    st.caption("All assets")
+            with row1[4]:
+                order_mode = st.radio("Order", ["Original", "Clustered"], horizontal=True, key="corr_order_mode")
+
+            # Row 2: Clustering controls (only if Clustered)
+            dist_mode = "1-corr"
+            linkage_method = "average"
+            cluster_k = 8
+            show_separators = True
+
+            if order_mode == "Clustered":
+                row2 = st.columns(4)
+                with row2[0]:
+                    dist_mode = st.selectbox("Distance", ["1-corr", "1-abs(corr)"], index=0, key="corr_dist_mode")
+                with row2[1]:
+                    linkage_method = st.selectbox("Linkage", ["average", "complete", "single", "ward"], index=0, key="corr_linkage")
+                with row2[2]:
+                    cluster_k = st.slider("Clusters (k)", 2, 20, 8, step=1, key="corr_k")
+                with row2[3]:
+                    show_separators = st.checkbox("Show separators", value=True, key="corr_sep")
+
+            with timed_collect("compute_asset_daily_matrix", timings):
+                dfX, all_assets = compute_asset_daily_matrix(filter_key)
+
+            if dfX.empty:
+                st.warning("No data for correlation.")
+            else:
+                # Compute correlation on FULL asset set
+                with timed_collect("compute_correlation_full", timings):
+                    corr_full = dfX.corr(method=corr_method, min_periods=min_overlap)
+                    notna_full = dfX.notna().values
+                    overlap_full = notna_full.T @ notna_full
+
+                # Determine display subset
+                if display_mode == "Top N" and top_n_assets is not None:
+                    valid_counts = dfX.notna().sum().sort_values(ascending=False)
+                    display_assets = valid_counts.head(top_n_assets).index.tolist()
+                    st.caption(f"Showing top {len(display_assets)} assets (of {len(all_assets)}) by data coverage")
+                else:
+                    display_assets = list(dfX.columns)
+                    st.caption(f"Showing all {len(display_assets)} assets")
+
+                # Subset correlation/overlap for display (optimized lookup)
+                col_index = {a: i for i, a in enumerate(dfX.columns)}
+                asset_idx = [col_index[a] for a in display_assets]
+                corr_mat = corr_full.loc[display_assets, display_assets].values
+                overlap_mat = overlap_full[np.ix_(asset_idx, asset_idx)]
+                asset_names = np.array(display_assets, dtype=object)
+
+                # Apply clustering if requested
+                boundaries = []
+                if order_mode == "Clustered":
+                    with timed_collect("compute_clustering", timings):
+                        if show_separators:
+                            perm, boundaries = cluster_boundaries_from_corr(
+                                corr_mat, dist_mode=dist_mode,
+                                linkage_method=linkage_method, k=cluster_k
+                            )
+                        else:
+                            perm = cluster_order_from_corr(
+                                corr_mat, dist_mode=dist_mode,
+                                linkage_method=linkage_method
+                            )
+                        # Reorder everything
+                        asset_names = asset_names[perm]
+                        corr_mat = corr_mat[np.ix_(perm, perm)]
+                        overlap_mat = overlap_mat[np.ix_(perm, perm)]
+
+                # Render heatmap
+                with timed_collect("render_correlation_heatmap", timings):
+                    title_prefix = "Clustered Correlation" if order_mode == "Clustered" else "Asset Correlation"
+                    render_correlation_heatmap(
+                        corr_mat=corr_mat,
+                        overlap=overlap_mat,
+                        asset_names=asset_names,
+                        boundaries=boundaries if show_separators else None,
+                        title_prefix=title_prefix
+                    )
+
+                # Summary stats
+                mask = np.triu(np.ones_like(corr_mat, dtype=bool), k=1)
+                upper_vals = corr_mat[mask]
+                upper_vals = upper_vals[np.isfinite(upper_vals)]
+
+                if len(upper_vals) > 0:
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Assets", f"{len(display_assets):,}")
+                    c2.metric("Mean corr", f"{np.mean(upper_vals):.3f}")
+                    c3.metric("Median corr", f"{np.median(upper_vals):.3f}")
+                    c4.metric("Min corr", f"{np.min(upper_vals):.3f}")
+                    c5.metric("Max corr", f"{np.max(upper_vals):.3f}")
+
+        # Record and render timings
+        record_timings(timings)
+        render_timings_panel()
