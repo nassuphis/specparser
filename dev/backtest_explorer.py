@@ -13,6 +13,10 @@ from numba import njit, prange
 from streamlit_lightweight_charts import renderLightweightCharts
 from scipy.cluster.hierarchy import linkage, leaves_list, fcluster
 from scipy.spatial.distance import squareform
+from scipy.sparse.csgraph import minimum_spanning_tree
+import networkx as nx
+from sklearn.manifold import TSNE, MDS
+import umap
 
 st.set_page_config(page_title="Backtest Explorer", layout="wide")
 
@@ -75,9 +79,15 @@ def render_timings_panel():
         with c2:
             st.number_input("Keep", 10, 500, st.session_state.get("timing_keep", 50), 10, key="timing_keep")
 
-        if st.button("Clear log"):
-            st.session_state["timing_log"] = []
-            st.rerun()
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Clear log"):
+                st.session_state["timing_log"] = []
+                st.rerun()
+        with col_b:
+            if st.button("Clear cache"):
+                st.cache_data.clear()
+                st.rerun()
 
         log = st.session_state.get("timing_log", [])
         st.text_area("log", "\n".join(log), height=200, label_visibility="collapsed")
@@ -524,6 +534,396 @@ def compute_asset_daily_matrix(filter_key):
 
     df = pd.DataFrame(X, index=dates, columns=asset_names)
     return df, np.asarray(asset_names)
+
+
+@st.cache_data
+def compute_corr_and_overlap(filter_key, corr_method: str, min_overlap: int):
+    """Compute correlation matrix, overlap counts, and coverage (cached for reuse)."""
+    dfX, _ = compute_asset_daily_matrix(filter_key)
+    if dfX.empty:
+        return pd.DataFrame(), np.zeros((0, 0), dtype=np.int32), np.array([]), pd.Series(dtype=np.int32), {}
+
+    corr = dfX.corr(method=corr_method, min_periods=min_overlap)
+    # Convert to int32 BEFORE matrix multiply (bool @ bool returns bool, not counts!)
+    notna = np.asarray(dfX.notna(), dtype=np.int32)
+    overlap = notna.T @ notna
+    coverage = dfX.notna().sum().astype(np.int32)  # per-asset day count (for Top N selection)
+
+    # Debug info
+    debug_info = {
+        "dfX_shape": dfX.shape,
+        "notna_shape": notna.shape,
+        "notna_dtype": str(notna.dtype),
+        "notna_sum": int(notna.sum()),
+        "notna_col_sums_max": int(notna.sum(axis=0).max()),
+        "overlap_shape": overlap.shape,
+        "overlap_dtype": str(overlap.dtype),
+        "overlap_diag_max": int(np.diag(overlap).max()),
+    }
+
+    return corr, overlap, np.array(dfX.columns, dtype=object), coverage, debug_info
+
+
+# ============================================================================
+# Correlation Network (CorGraph) Helpers
+# ============================================================================
+MAX_EDGES_HARD_CAP = 3000  # Plotly performance guardrail
+
+
+def corr_to_edges(corr: pd.DataFrame, overlap: np.ndarray,
+                  min_abs_corr: float, min_overlap: int,
+                  sign: str = "both", max_edges_per_node: int | None = None):
+    """Convert correlation matrix to edge list with thresholding."""
+    assets = list(corr.columns)
+    n = len(assets)
+    C = corr.values
+
+    # Collect candidate edges from upper triangle
+    edges = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            c = C[i, j]
+            if not np.isfinite(c):
+                continue
+            if abs(c) < min_abs_corr:
+                continue
+            o = int(overlap[i, j])
+            if o < min_overlap:
+                continue
+            if sign == "pos" and c < 0:
+                continue
+            if sign == "neg" and c > 0:
+                continue
+            edges.append((i, j, float(c), o))
+
+    # Prune to max edges per node (keeps graph readable)
+    if max_edges_per_node is not None:
+        edges.sort(key=lambda e: abs(e[2]), reverse=True)
+        deg = np.zeros(n, dtype=np.int32)
+        kept = []
+        for i, j, c, o in edges:
+            if deg[i] >= max_edges_per_node or deg[j] >= max_edges_per_node:
+                continue
+            kept.append((i, j, c, o))
+            deg[i] += 1
+            deg[j] += 1
+        edges = kept
+
+    return assets, edges
+
+
+def build_graph_positions(assets: list, edges: list, seed: int = 42):
+    """Build NetworkX graph and compute spring layout positions."""
+    G = nx.Graph()
+    for i, a in enumerate(assets):
+        G.add_node(i, name=a)
+    for i, j, c, o in edges:
+        G.add_edge(i, j, weight=abs(c), corr=c, overlap=o)
+
+    # Spring layout: stronger correlation => closer nodes
+    pos = nx.spring_layout(G, seed=seed, weight="weight", k=None, iterations=200)
+    return G, pos
+
+
+def mst_edges_from_corr(corr_mat: np.ndarray, overlap_mat: np.ndarray, mode: str = "1-abs(corr)"):
+    """Compute MST edges to ensure graph connectivity."""
+    C = corr_mat.copy()
+    C[~np.isfinite(C)] = 0.0  # NaN -> 0 corr -> distance 1
+
+    if mode == "1-abs(corr)":
+        D = 1.0 - np.abs(C)
+    else:  # "1-corr"
+        D = 1.0 - C
+
+    np.fill_diagonal(D, 0.0)
+    D = np.clip(D, 0.0, 2.0)
+
+    mst = minimum_spanning_tree(D).tocoo()
+    edges = []
+    for i, j, w in zip(mst.row, mst.col, mst.data):
+        c = float(C[i, j])
+        o = int(overlap_mat[i, j])
+        edges.append((int(i), int(j), c, o))
+    return edges
+
+
+# ============================================================================
+# Embedding Helpers (UMAP, t-SNE, MDS)
+# ============================================================================
+@st.cache_data
+def compute_embedding(filter_key, method: str, corr_method: str, corr_min_periods: int,
+                      distance_mode: str, n_assets: int | None, min_coverage_days: int,
+                      perplexity: int = 30, n_neighbors: int = 15, min_dist: float = 0.1,
+                      seed: int = 42):
+    """Compute 2D embedding from correlation distance matrix.
+
+    Args:
+        corr_min_periods: min_periods for .corr() - keep low (5-10) to avoid NaN-heavy matrix
+        min_coverage_days: exclude assets with fewer than this many days of data
+    """
+    # Get correlation with small min_periods to avoid excessive NaNs
+    # Note: compute_corr_and_overlap returns 5 values; ignore debug_info
+    corr_full, overlap_full, all_assets, coverage, _ = compute_corr_and_overlap(
+        filter_key, corr_method, corr_min_periods
+    )
+
+    if corr_full.empty:
+        return np.empty((0, 2)), [], pd.Series(dtype=np.int32)
+
+    # Filter assets by minimum coverage days (use coverage.index as canonical source)
+    if min_coverage_days > 0:
+        valid_assets = coverage[coverage >= min_coverage_days].index.tolist()
+    else:
+        valid_assets = list(coverage.index)
+
+    # Select top N assets by coverage if requested
+    if n_assets is not None and n_assets < len(valid_assets):
+        selected = coverage.loc[valid_assets].sort_values(ascending=False).head(n_assets).index.tolist()
+    else:
+        selected = valid_assets
+
+    if len(selected) < 3:
+        return np.empty((0, 2)), selected, coverage.loc[selected] if selected else pd.Series(dtype=np.int32)
+
+    corr_sub = corr_full.loc[selected, selected]
+    C = corr_sub.values.copy()
+
+    # Handle NaN: set to 0 correlation (distance = 1)
+    C[~np.isfinite(C)] = 0.0
+
+    # Convert correlation to distance
+    if distance_mode == "1-abs(corr)":
+        D = 1.0 - np.abs(C)
+    else:  # "1-corr"
+        D = 1.0 - C
+
+    np.fill_diagonal(D, 0.0)
+    D = np.clip(D, 0.0, 2.0)
+
+    # Symmetrize for algorithm stability
+    D = 0.5 * (D + D.T)
+    np.fill_diagonal(D, 0.0)
+
+    n = len(selected)
+
+    # Run embedding algorithm
+    if method == "UMAP":
+        nn = max(2, min(n_neighbors, n - 1))  # UMAP needs n_neighbors >= 2
+        reducer = umap.UMAP(
+            n_components=2,
+            metric="precomputed",
+            n_neighbors=nn,
+            min_dist=min_dist,
+            random_state=seed,
+        )
+        coords = reducer.fit_transform(D)
+    elif method == "t-SNE":
+        # Proper perplexity clamping: perplexity <= (n-1)/3 for stability
+        pmax = max(2, (n - 1) // 3)
+        perp = min(perplexity, pmax)
+        reducer = TSNE(
+            n_components=2,
+            metric="precomputed",
+            perplexity=perp,
+            random_state=seed,
+            init="random",
+            learning_rate="auto",
+            n_iter=1000,
+        )
+        coords = reducer.fit_transform(D)
+    else:  # MDS
+        reducer = MDS(
+            n_components=2,
+            dissimilarity="precomputed",
+            random_state=seed,
+            n_init=4,
+            max_iter=300,
+        )
+        coords = reducer.fit_transform(D)
+
+    # Normalize coordinates for consistent scale across methods
+    coords = coords - coords.mean(axis=0, keepdims=True)
+    s = coords.std(axis=0, keepdims=True) + 1e-9
+    coords = coords / s
+
+    # Return coverage for selected assets (for coloring)
+    return coords, selected, coverage.loc[selected]
+
+
+def render_embedding_plotly(coords: np.ndarray, assets: list,
+                            color_by: str = "none",
+                            node_meta: dict = None,
+                            show_labels: bool = False):
+    """Render 2D embedding as Plotly scatter."""
+    n = len(assets)
+
+    # Build color array
+    if color_by == "none" or node_meta is None:
+        colors = ["#2962FF"] * n
+        colorbar = None
+    else:
+        # Color by metric from node_meta
+        vals = []
+        for i, a in enumerate(assets):
+            if node_meta and a in node_meta:
+                v = node_meta[a].get(color_by, 0.0)
+                vals.append(v if np.isfinite(v) else 0.0)
+            else:
+                vals.append(0.0)
+        # Suppress colorbar if all values are identical (avoids pointless gradient)
+        if len(set(vals)) <= 1:
+            colors = ["#2962FF"] * n
+            colorbar = None
+        else:
+            colors = vals
+            colorbar = dict(title=color_by.replace("_", " "))
+
+    # Build hover text
+    hover_texts = []
+    for i, a in enumerate(assets):
+        parts = [f"<b>{a}</b>"]
+        if node_meta and a in node_meta:
+            m = node_meta[a]
+            for k, v in m.items():
+                if isinstance(v, float):
+                    parts.append(f"{k}: {v:.4f}")
+                else:
+                    parts.append(f"{k}: {v}")
+        hover_texts.append("<br>".join(parts))
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=coords[:, 0],
+        y=coords[:, 1],
+        mode="markers+text" if show_labels else "markers",
+        marker=dict(
+            size=10,
+            color=colors,
+            colorscale="Viridis" if color_by != "none" else None,
+            colorbar=colorbar,
+            line=dict(width=1, color="white"),
+        ),
+        text=assets if show_labels else None,
+        hovertext=hover_texts,
+        hovertemplate="%{hovertext}<extra></extra>",
+        textposition="top center",
+        textfont=dict(size=8),
+        showlegend=False,
+    ))
+
+    fig.update_layout(
+        height=700,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title="Asset Embedding",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, title=""),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, title=""),
+        hovermode="closest",
+    )
+
+    return fig
+
+
+def render_corr_graph_plotly(G: nx.Graph, pos: dict, assets: list,
+                             node_meta: dict = None,
+                             focus_node: int = None,
+                             show_labels: bool = False):
+    """Render correlation network with Plotly (optimized edge rendering)."""
+
+    # Build edge coordinates grouped by type (pos/neg/dimmed)
+    pos_x, pos_y = [], []
+    neg_x, neg_y = [], []
+    dim_x, dim_y = [], []
+
+    for u, v, data in G.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        corr = data.get("corr", 0)
+
+        # Determine which trace this edge belongs to
+        if focus_node is not None and u != focus_node and v != focus_node:
+            dim_x.extend([x0, x1, None])
+            dim_y.extend([y0, y1, None])
+        elif corr > 0:
+            pos_x.extend([x0, x1, None])
+            pos_y.extend([y0, y1, None])
+        else:
+            neg_x.extend([x0, x1, None])
+            neg_y.extend([y0, y1, None])
+
+    # Build edge traces (max 3 traces instead of 1 per edge)
+    edge_traces = []
+    if pos_x:
+        edge_traces.append(go.Scatter(
+            x=pos_x, y=pos_y, mode="lines",
+            line=dict(width=1.5, color="#26a69a"),  # green
+            hoverinfo="skip", showlegend=False,
+        ))
+    if neg_x:
+        edge_traces.append(go.Scatter(
+            x=neg_x, y=neg_y, mode="lines",
+            line=dict(width=1.5, color="#ef5350"),  # red
+            hoverinfo="skip", showlegend=False,
+        ))
+    if dim_x:
+        edge_traces.append(go.Scatter(
+            x=dim_x, y=dim_y, mode="lines",
+            line=dict(width=0.5, color="rgba(200,200,200,0.3)"),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    # Build node trace
+    node_x, node_y, node_labels, node_hover, node_color = [], [], [], [], []
+    for n, data in G.nodes(data=True):
+        x, y = pos[n]
+        node_x.append(x)
+        node_y.append(y)
+        name = data.get("name", str(n))
+        node_labels.append(name)  # Short label for visible text
+
+        # Build detailed hover text
+        hover_parts = [f"<b>{name}</b>", f"neighbors: {G.degree(n)}"]
+        if node_meta and n in node_meta:
+            m = node_meta[n]
+            hover_parts.append(f"mean daily pnl: {m.get('mean_daily_pnl', float('nan')):.6f}")
+            hover_parts.append(f"pnl/daily vol: {m.get('pnl_over_daily_vol', float('nan')):.3f}")
+        node_hover.append("<br>".join(hover_parts))
+
+        # Color: highlight focus node and neighbors
+        if focus_node is not None:
+            if n == focus_node:
+                node_color.append("#2962FF")  # blue
+            elif G.has_edge(n, focus_node):
+                node_color.append("#FF6D00")  # orange (neighbor)
+            else:
+                node_color.append("rgba(200,200,200,0.5)")
+        else:
+            node_color.append("#2962FF")
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers+text" if show_labels else "markers",
+        marker=dict(size=12, color=node_color, line=dict(width=1, color="white")),
+        text=node_labels if show_labels else None,  # Visible labels (short)
+        hovertext=node_hover,  # Detailed hover (long)
+        hovertemplate="%{hovertext}<extra></extra>",
+        textposition="top center",
+        textfont=dict(size=8),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=edge_traces + [node_trace])
+    fig.update_layout(
+        height=700,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title="Correlation Network",
+        showlegend=False,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        hovermode="closest",
+    )
+
+    return fig
 
 
 def _compute_all_straddle_metrics_from_indices(straddles, valuations, idx: np.ndarray):
@@ -1378,7 +1778,7 @@ else:
         st.divider()
 
         # Tabs: Days, Cumulative PnL, MV, Contributors, Straddles, Assets, Matrices
-        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix", "Correlation"]
+        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix", "Correlation", "CorGraph", "Embedding"]
         tabs = dict(zip(tab_names, st.tabs(tab_names)))
 
         # --- Days Tab ---
@@ -1718,7 +2118,8 @@ else:
                 # Compute correlation on FULL asset set
                 with timed_collect("compute_correlation_full", timings):
                     corr_full = dfX.corr(method=corr_method, min_periods=min_overlap)
-                    notna_full = dfX.notna().values
+                    # Convert to int32 BEFORE matrix multiply (bool @ bool returns bool, not counts!)
+                    notna_full = np.asarray(dfX.notna(), dtype=np.int32)
                     overlap_full = notna_full.T @ notna_full
 
                 # Determine display subset
@@ -1779,6 +2180,295 @@ else:
                     c3.metric("Median corr", f"{np.median(upper_vals):.3f}")
                     c4.metric("Min corr", f"{np.min(upper_vals):.3f}")
                     c5.metric("Max corr", f"{np.max(upper_vals):.3f}")
+
+        # --- CorGraph Tab ---
+        with tabs["CorGraph"]:
+            st.subheader("Correlation Network")
+
+            # Controls row 1
+            cg_row1 = st.columns(4)
+            with cg_row1[0]:
+                cg_method = st.selectbox("Method", ["pearson", "spearman"], key="cg_method")
+            with cg_row1[1]:
+                cg_min_overlap = st.slider("Min overlap", 5, 250, 10, step=5, key="cg_min_overlap")
+            with cg_row1[2]:
+                cg_top_pct = st.slider("Top % corr", 1, 50, 10, step=1, key="cg_top_pct")
+            with cg_row1[3]:
+                cg_sign = st.radio("Sign", ["both", "pos", "neg"], horizontal=True, key="cg_sign")
+
+            # Controls row 2
+            cg_row2 = st.columns(4)
+            with cg_row2[0]:
+                cg_max_edges = st.slider("Max edges/node", 3, 30, 10, key="cg_max_edges")
+            with cg_row2[1]:
+                cg_asset_mode = st.radio("Assets", ["All", "Top N"], horizontal=True, key="cg_asset_mode")
+            with cg_row2[2]:
+                if cg_asset_mode == "Top N":
+                    cg_top_n = st.slider("N", 20, 200, 60, step=10, key="cg_top_n")
+                else:
+                    cg_top_n = None
+                    st.caption("All assets")
+            with cg_row2[3]:
+                cg_seed = st.number_input("Layout seed", 1, 999, 42, key="cg_seed")
+
+            cg_show_labels = st.checkbox("Show labels", value=False, key="cg_show_labels")
+            cg_use_mst = st.checkbox("Ensure connected (MST backbone)", value=True, key="cg_use_mst")
+
+            # Compute correlation (reuse cached) - now returns coverage too
+            with timed_collect("corgraph_corr", timings):
+                cg_corr_full, cg_overlap_full, cg_all_assets, cg_coverage, cg_debug = compute_corr_and_overlap(
+                    filter_key, cg_method, cg_min_overlap
+                )
+
+            if cg_corr_full.empty:
+                st.warning("No correlation data available.")
+            else:
+                # Subset to top N assets by COVERAGE (days with data), not corr non-NaN count
+                if cg_asset_mode == "Top N" and cg_top_n is not None:
+                    cg_display_assets = cg_coverage.sort_values(ascending=False).head(cg_top_n).index.tolist()
+                    st.caption(f"Showing top {len(cg_display_assets)} assets by data coverage")
+                else:
+                    cg_display_assets = list(cg_corr_full.columns)
+                    st.caption(f"Showing all {len(cg_display_assets)} assets")
+
+                # Subset correlation/overlap
+                cg_col_index = {a: i for i, a in enumerate(cg_corr_full.columns)}
+                cg_asset_idx = [cg_col_index[a] for a in cg_display_assets]
+                cg_corr_sub = cg_corr_full.loc[cg_display_assets, cg_display_assets]
+                cg_overlap_sub = cg_overlap_full[np.ix_(cg_asset_idx, cg_asset_idx)]
+
+                # Compute threshold from quantile (top X% means 100-X percentile)
+                C = cg_corr_sub.values
+                mask = np.triu(np.ones_like(C, dtype=bool), k=1)
+                finite = np.isfinite(C) & mask
+                absvals = np.abs(C[finite])
+                if absvals.size > 0:
+                    cg_threshold = float(np.percentile(absvals, 100 - cg_top_pct))
+                else:
+                    cg_threshold = 0.0
+                st.caption(f"Top {cg_top_pct}% threshold: |corr| >= {cg_threshold:.3f}")
+
+                # Debug stats (show in expander)
+                with st.expander("Edge Filter Stats", expanded=False):
+
+                    O = cg_overlap_sub
+                    Ovals = O[mask]
+
+                    # Data source info
+                    st.write(f"**Data source:**")
+                    st.write(f"- Assets displayed: {len(cg_display_assets)}")
+                    st.write(f"- Full corr shape: {cg_corr_full.shape}")
+                    st.write(f"- Full overlap shape: {cg_overlap_full.shape}")
+                    st.write(f"- Full overlap range: min={int(cg_overlap_full.min())}, max={int(cg_overlap_full.max())}")
+                    st.write(f"- Coverage range: min={int(cg_coverage.min())}, max={int(cg_coverage.max())}")
+
+                    # Debug info from computation
+                    if cg_debug:
+                        st.write(f"**Debug (from compute):**")
+                        for k, v in cg_debug.items():
+                            st.write(f"- {k}: {v}")
+
+                    st.write(f"**Subset stats:**")
+                    st.write(f"- Finite off-diagonal pairs: {int(finite.sum()):,}")
+                    if absvals.size:
+                        st.write(f"- Max |corr|: {float(absvals.max()):.3f}")
+                        st.write(f"- Threshold (top {cg_top_pct}%): |corr| >= {cg_threshold:.3f}")
+                        st.write(f"- Pairs above threshold: {int((absvals >= cg_threshold).sum()):,}")
+                    st.write(f"- Overlap days: min={int(np.min(Ovals))}, median={float(np.median(Ovals)):.0f}, max={int(np.max(Ovals))}")
+                    st.write(f"- Pairs overlap >= {cg_min_overlap}: {int((Ovals >= cg_min_overlap).sum()):,}")
+
+                # Build edge list
+                with timed_collect("corgraph_edges", timings):
+                    cg_assets, cg_edges = corr_to_edges(
+                        cg_corr_sub, cg_overlap_sub,
+                        min_abs_corr=cg_threshold,
+                        min_overlap=cg_min_overlap,
+                        sign=cg_sign,
+                        max_edges_per_node=cg_max_edges
+                    )
+
+                # Optionally add MST backbone for connectivity
+                if cg_use_mst:
+                    with timed_collect("corgraph_mst", timings):
+                        mst_edges = mst_edges_from_corr(cg_corr_sub.values, cg_overlap_sub)
+                        # Merge: keep unique undirected pairs
+                        seen = set()
+                        merged = []
+                        for i, j, c, o in cg_edges:
+                            a, b = (i, j) if i < j else (j, i)
+                            seen.add((a, b))
+                            merged.append((a, b, c, o))
+                        for i, j, c, o in mst_edges:
+                            a, b = (i, j) if i < j else (j, i)
+                            if (a, b) not in seen:
+                                seen.add((a, b))
+                                merged.append((a, b, c, o))
+                        cg_edges = merged
+
+                # Edge count warning
+                if len(cg_edges) > MAX_EDGES_HARD_CAP:
+                    st.warning(f"Too many edges ({len(cg_edges):,}). Raise threshold or lower max edges/node.")
+                elif len(cg_edges) == 0:
+                    st.warning("No edges passed filters. Try lowering Min overlap or |corr| threshold.")
+                else:
+                    if len(cg_edges) > 1500:
+                        st.info(f"Many edges ({len(cg_edges):,}). Plot may be slow.")
+
+                    # Build graph and layout
+                    with timed_collect("corgraph_layout", timings):
+                        cg_G, cg_pos = build_graph_positions(cg_assets, cg_edges, seed=cg_seed)
+
+                    # Build node metadata from cached asset metrics
+                    cg_node_meta = {}
+                    if 'asset_df' in dir() and asset_df is not None:
+                        # Use asset_df if available (computed in Assets tab)
+                        meta_lookup = asset_df.set_index("asset")[["mean_daily_pnl", "pnl_over_daily_vol"]].to_dict("index")
+                        for i, a in enumerate(cg_assets):
+                            if a in meta_lookup:
+                                cg_node_meta[i] = meta_lookup[a]
+
+                    # Focus asset selector
+                    cg_connected_nodes = [n for n in cg_G.nodes() if cg_G.degree(n) > 0]
+                    cg_connected_assets = [cg_assets[n] for n in cg_connected_nodes]
+
+                    cg_focus_asset = st.selectbox(
+                        "Focus asset (optional)",
+                        ["None"] + sorted(cg_connected_assets),
+                        key="cg_focus"
+                    )
+
+                    cg_focus_node = None
+                    if cg_focus_asset != "None":
+                        cg_focus_node = cg_assets.index(cg_focus_asset)
+
+                    # Render
+                    with timed_collect("corgraph_render", timings):
+                        cg_fig = render_corr_graph_plotly(
+                            cg_G, cg_pos, cg_assets,
+                            node_meta=cg_node_meta,
+                            focus_node=cg_focus_node,
+                            show_labels=cg_show_labels
+                        )
+                        st.plotly_chart(cg_fig, use_container_width=True, config={"displaylogo": False})
+
+                    # Summary stats
+                    cg_c1, cg_c2, cg_c3, cg_c4, cg_c5 = st.columns(5)
+                    cg_c1.metric("Nodes", f"{cg_G.number_of_nodes():,}")
+                    cg_c2.metric("Edges", f"{cg_G.number_of_edges():,}")
+                    cg_c3.metric("Density", f"{nx.density(cg_G):.3f}")
+                    cg_c4.metric("Components", f"{nx.number_connected_components(cg_G):,}")
+                    cg_avg_deg = sum(d for _, d in cg_G.degree()) / max(cg_G.number_of_nodes(), 1)
+                    cg_c5.metric("Avg degree", f"{cg_avg_deg:.1f}")
+
+        # --- Embedding Tab ---
+        with tabs["Embedding"]:
+            st.subheader("Asset Embedding (Dimensionality Reduction)")
+
+            # Controls row 1
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                emb_method = st.selectbox("Method", ["UMAP", "t-SNE", "MDS"], key="emb_method")
+            with col2:
+                emb_corr_method = st.selectbox("Correlation", ["pearson", "spearman"], key="emb_corr_method")
+            with col3:
+                emb_distance = st.radio("Distance", ["1-abs(corr)", "1-corr"], horizontal=True, key="emb_distance")
+                st.caption("1-abs: anti-correlated cluster together; 1-corr: they separate")
+            with col4:
+                emb_corr_min_periods = st.slider("Corr min periods", 2, 30, 5, step=1, key="emb_corr_min_periods")
+
+            # Controls row 2
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                emb_asset_mode = st.radio("Assets", ["All", "Top N"], horizontal=True, key="emb_asset_mode")
+            with col2:
+                if emb_asset_mode == "Top N":
+                    emb_top_n = st.slider("N", 20, 300, 100, step=10, key="emb_top_n")
+                else:
+                    emb_top_n = None
+                    st.caption("All assets")
+            with col3:
+                emb_min_coverage = st.slider("Min coverage days", 0, 100, 0, step=5, key="emb_min_coverage")
+            with col4:
+                emb_seed = st.number_input("Seed", 1, 999, 42, key="emb_seed")
+
+            # Controls row 3
+            col1, col2 = st.columns(2)
+            with col1:
+                emb_show_labels = st.checkbox("Show labels", value=False, key="emb_show_labels")
+            with col2:
+                color_options = ["none", "coverage", "mean_daily_pnl", "mean_daily_vol", "pnl_over_daily_vol"]
+                emb_color_by = st.selectbox("Color by", color_options, key="emb_color_by")
+
+            # Method-specific parameters
+            if emb_method == "UMAP":
+                col1, col2 = st.columns(2)
+                with col1:
+                    emb_n_neighbors = st.slider("n_neighbors", 2, 50, 15, key="emb_n_neighbors")
+                with col2:
+                    emb_min_dist = st.slider("min_dist", 0.0, 1.0, 0.1, step=0.05, key="emb_min_dist")
+                emb_perplexity = 30  # unused
+            elif emb_method == "t-SNE":
+                emb_perplexity = st.slider("perplexity", 2, 50, 30, key="emb_perplexity")
+                st.caption("Auto-clamped to (n-1)/3 if needed")
+                emb_n_neighbors = 15  # unused
+                emb_min_dist = 0.1  # unused
+            else:  # MDS
+                st.caption("MDS has no tunable parameters")
+                emb_perplexity = 30
+                emb_n_neighbors = 15
+                emb_min_dist = 0.1
+
+            # Compute embedding
+            with timed_collect("embedding_compute", timings):
+                coords, emb_assets, emb_coverage = compute_embedding(
+                    filter_key,
+                    method=emb_method,
+                    corr_method=emb_corr_method,
+                    corr_min_periods=emb_corr_min_periods,
+                    distance_mode=emb_distance,
+                    n_assets=emb_top_n,
+                    min_coverage_days=emb_min_coverage,
+                    perplexity=emb_perplexity,
+                    n_neighbors=emb_n_neighbors,
+                    min_dist=emb_min_dist,
+                    seed=emb_seed,
+                )
+
+            if len(coords) == 0:
+                st.warning("Not enough assets for embedding (need at least 3).")
+            else:
+                # Build node metadata for coloring/hover
+                node_meta = {}
+                for a in emb_assets:
+                    node_meta[a] = {"coverage": int(emb_coverage.get(a, 0))}
+
+                # Add asset metrics if available (use locals().get to avoid NameError)
+                asset_df_local = locals().get("asset_df", None)
+                if asset_df_local is not None:
+                    meta_lookup = asset_df_local.set_index("asset")[["mean_daily_pnl", "mean_daily_vol", "pnl_over_daily_vol"]].to_dict("index")
+                    for a in emb_assets:
+                        if a in meta_lookup:
+                            node_meta[a].update(meta_lookup[a])
+
+                st.caption(f"Embedding {len(emb_assets)} assets using {emb_method}")
+
+                # Render
+                with timed_collect("embedding_render", timings):
+                    fig = render_embedding_plotly(
+                        coords, emb_assets,
+                        color_by=emb_color_by,
+                        node_meta=node_meta,
+                        show_labels=emb_show_labels,
+                    )
+                    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+                # Summary metrics
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Assets", f"{len(emb_assets):,}")
+                spread_x = float(np.std(coords[:, 0]))
+                spread_y = float(np.std(coords[:, 1]))
+                c2.metric("Spread (x)", f"{spread_x:.3f}")
+                c3.metric("Spread (y)", f"{spread_y:.3f}")
 
         # Record and render timings
         record_timings(timings)
