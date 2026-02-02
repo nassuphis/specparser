@@ -183,6 +183,9 @@ def make_filter_key(asset_mode: str, asset_value, ym_lo: int, ym_hi: int, select
     """Build a small, hashable cache key from filter parameters."""
     if asset_mode == "dropdown":
         asset_part = ("dropdown", asset_value)
+    elif asset_mode == "similar":
+        # asset_value is tuple: (anchor, n, rank, corr_method, min_overlap, partial_fill, partial_estimator)
+        asset_part = ("similar",) + tuple(asset_value)
     else:
         pattern, flags = asset_value
         asset_part = ("regex", pattern, int(flags))
@@ -204,6 +207,18 @@ def get_filtered_indices_cached(filter_key):
     asset_part, ym_lo, ym_hi, sch_part = filter_key
     if asset_part[0] == "dropdown":
         asset_mode, asset_value = "dropdown", asset_part[1]
+    elif asset_part[0] == "similar":
+        # Similar mode: find N most correlated assets to anchor
+        # asset_part = ("similar", anchor, n, rank, corr_method, min_overlap, partial_fill, partial_estimator)
+        _, anchor, n, rank, corr_method, min_overlap, p_fill, p_est = asset_part
+
+        # Build a temporary filter_key with "All" assets for correlation computation
+        temp_key = (("dropdown", "All"), ym_lo, ym_hi, sch_part)
+        candidates, _ = top_correlated_assets(
+            temp_key, anchor, n, corr_method, min_overlap, rank,
+            partial_fill=p_fill, partial_estimator=p_est
+        )
+        asset_mode, asset_value = "candidates", candidates
     else:
         asset_mode = "regex"
         asset_value = (asset_part[1], asset_part[2])
@@ -596,6 +611,100 @@ def compute_corr_and_overlap(filter_key, corr_method: str, min_overlap: int,
     return corr, overlap, np.array(dfX.columns, dtype=object), coverage, debug_info
 
 
+@st.cache_data
+def compute_corr_frames(
+    filter_key,
+    assets: tuple,  # tuple for hashability
+    method: str,
+    min_overlap: int,
+    window_days: int = 60,
+    step_days: int = 5,
+    top_pct: int = 10,
+    sign: str = "both",
+    max_edges_per_node: int = 10,
+    partial_fill: str = "median",
+    partial_estimator: str = "ledoitwolf",
+    partial_standardize: bool = True,
+    partial_mask: bool = True,
+):
+    """Compute correlation frames for animation over rolling windows.
+
+    Returns list of frame dicts with: t0, t1, threshold, edges, node_meta
+    """
+    dfX, _ = compute_asset_daily_matrix(filter_key)
+    assets_list = list(assets)
+    dfX = dfX[[a for a in assets_list if a in dfX.columns]]
+    if dfX.empty or len(dfX.columns) < 2:
+        return []
+
+    assets_list = list(dfX.columns)
+    dates = dfX.index
+    X = dfX.to_numpy(np.float64)
+    M = np.isfinite(X).astype(np.int32)
+    n = len(assets_list)
+
+    def threshold_from_C(C, top_pct):
+        mask = np.triu(np.ones_like(C, dtype=bool), k=1)
+        vals = np.abs(C[mask & np.isfinite(C)])
+        if vals.size == 0:
+            return 1.0
+        return float(np.percentile(vals, 100 - top_pct))
+
+    frames = []
+    w = window_days
+    s = step_days
+
+    for start in range(0, len(dates) - w + 1, s):
+        end = start + w
+        Xw = X[start:end]
+        Mw = M[start:end]
+
+        dfW = pd.DataFrame(Xw, columns=assets_list)
+
+        # Compute correlation based on method
+        if method in ("pearson", "spearman"):
+            C = dfW.corr(method=method, min_periods=min_overlap).to_numpy()
+            overlap = Mw.T @ Mw
+        elif method == "sign":
+            C, overlap, _ = compute_sign_corr(dfW, min_overlap)
+        else:  # partial
+            C, overlap, _ = compute_partial_corr(
+                dfW, min_overlap, partial_fill, partial_estimator,
+                partial_standardize, partial_mask
+            )
+
+        thr = threshold_from_C(C, top_pct)
+
+        # Build edges
+        corr_df = pd.DataFrame(C, index=assets_list, columns=assets_list)
+        _, edges = corr_to_edges(
+            corr_df, overlap,
+            min_abs_corr=thr,
+            min_overlap=min_overlap,
+            sign=sign,
+            max_edges_per_node=max_edges_per_node,
+        )
+
+        # Node pulse: rolling std of normalized pnl
+        node_vol = np.nanstd(Xw, axis=0)
+        node_meta = {assets_list[i]: {"pulse": float(node_vol[i]) if np.isfinite(node_vol[i]) else 0.0}
+                     for i in range(n)}
+
+        frames.append({
+            "t0": dates[start].strftime("%Y-%m-%d"),
+            "t1": dates[end-1].strftime("%Y-%m-%d"),
+            "threshold": float(thr),
+            "edges": [
+                {"source": assets_list[e[0]], "target": assets_list[e[1]],
+                 "corr": float(e[2]), "strength": abs(float(e[2])), "overlap": int(e[3])}
+                for e in edges
+            ],
+            "node_meta": node_meta,
+        })
+
+    return frames
+
+
 def compute_sign_corr(dfX: pd.DataFrame, min_overlap: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute sign correlation matrix.
 
@@ -719,6 +828,56 @@ def compute_partial_corr(
     return pcorr, overlap, dfX.columns.to_numpy()
 
 
+def top_correlated_assets(filter_key, anchor: str, n: int,
+                          corr_method: str, min_overlap: int,
+                          rank_mode: str = "abs(corr)",
+                          partial_fill: str = "median",
+                          partial_estimator: str = "ledoitwolf",
+                          partial_standardize: bool = True,
+                          partial_mask: bool = True) -> tuple[list[str], pd.DataFrame]:
+    """Find top N assets most correlated with anchor asset.
+
+    Returns: (list of asset names including anchor, DataFrame with corr/overlap)
+    """
+    corr, overlap, assets, coverage, _ = compute_corr_and_overlap(
+        filter_key, corr_method, min_overlap,
+        partial_fill=partial_fill,
+        partial_estimator=partial_estimator,
+        partial_standardize=partial_standardize,
+        partial_mask=partial_mask,
+    )
+    if corr.empty or anchor not in corr.columns:
+        return [anchor], pd.DataFrame()
+
+    a = corr[anchor].copy()
+    a.loc[anchor] = np.nan
+
+    # Enforce overlap for anchor pairs
+    j = list(corr.columns).index(anchor)
+    ov_anchor = overlap[:, j].astype(np.int32)
+    ok = ov_anchor >= min_overlap
+    a[~ok] = np.nan
+
+    if rank_mode == "abs(corr)":
+        score = a.abs()
+    else:  # "corr" - signed, positive first
+        score = a
+
+    top_idx = score.dropna().sort_values(ascending=False).head(n).index.tolist()
+
+    # Build summary dataframe
+    rows = []
+    for asset in top_idx:
+        rows.append({
+            "asset": asset,
+            "corr": corr.loc[asset, anchor],
+            "overlap": ov_anchor[list(corr.columns).index(asset)],
+        })
+    summary_df = pd.DataFrame(rows)
+
+    return [anchor] + top_idx, summary_df
+
+
 # ============================================================================
 # Correlation Network (CorGraph) Helpers
 # ============================================================================
@@ -800,6 +959,60 @@ def mst_edges_from_corr(corr_mat: np.ndarray, overlap_mat: np.ndarray, mode: str
         o = int(overlap_mat[i, j])
         edges.append((int(i), int(j), c, o))
     return edges
+
+
+def detect_communities(G: nx.Graph, seed: int = 42) -> tuple[dict, list]:
+    """Detect communities using Louvain or greedy modularity.
+
+    Returns: (node2community_dict, list_of_community_sets)
+    """
+    from networkx.algorithms import community as nx_comm
+
+    if G.number_of_nodes() == 0:
+        return {}, []
+
+    # Prefer Louvain if available (nx >= 2.7)
+    if hasattr(nx_comm, "louvain_communities"):
+        comms = list(nx_comm.louvain_communities(G, weight="weight", seed=seed))
+    else:
+        comms = list(nx_comm.greedy_modularity_communities(G, weight="weight"))
+
+    # Map node -> community id
+    node2c = {}
+    for cid, nodes in enumerate(comms):
+        for u in nodes:
+            node2c[u] = cid
+    return node2c, comms
+
+
+def community_summary(comms: list, assets: list, node_meta: dict) -> pd.DataFrame:
+    """Build summary table for each community."""
+    rows = []
+    for cid, nodes in enumerate(comms):
+        node_list = list(nodes)
+        size = len(node_list)
+        names = [assets[n] for n in node_list if n < len(assets)]
+
+        # Top 3 names as label
+        top3 = names[:3]
+        label = ", ".join(top3) + ("..." if size > 3 else "")
+
+        # Mean metrics from node_meta
+        pnls = [node_meta.get(n, {}).get("mean_daily_pnl", np.nan) for n in node_list]
+        ratios = [node_meta.get(n, {}).get("pnl_over_daily_vol", np.nan) for n in node_list]
+
+        mean_pnl = np.nanmean(pnls) if pnls else np.nan
+        mean_ratio = np.nanmean(ratios) if ratios else np.nan
+
+        rows.append({
+            "id": cid,
+            "size": size,
+            "members": label,
+            "mean_daily_pnl": mean_pnl,
+            "mean_pnl_ratio": mean_ratio,
+        })
+
+    return pd.DataFrame(rows)
 
 
 # ============================================================================
@@ -989,8 +1202,11 @@ def render_embedding_plotly(coords: np.ndarray, assets: list,
 def render_corr_graph_plotly(G: nx.Graph, pos: dict, assets: list,
                              node_meta: dict = None,
                              focus_node: int = None,
-                             show_labels: bool = False):
+                             show_labels: bool = False,
+                             node2comm: dict = None,
+                             color_by_community: bool = False):
     """Render correlation network with Plotly (optimized edge rendering)."""
+    import plotly.express as px
 
     # Build edge coordinates grouped by type (pos/neg/dimmed)
     pos_x, pos_y = [], []
@@ -1051,7 +1267,7 @@ def render_corr_graph_plotly(G: nx.Graph, pos: dict, assets: list,
             hover_parts.append(f"pnl/daily vol: {m.get('pnl_over_daily_vol', float('nan')):.3f}")
         node_hover.append("<br>".join(hover_parts))
 
-        # Color: highlight focus node and neighbors
+        # Color: highlight focus node and neighbors, or by community
         if focus_node is not None:
             if n == focus_node:
                 node_color.append("#2962FF")  # blue
@@ -1059,6 +1275,10 @@ def render_corr_graph_plotly(G: nx.Graph, pos: dict, assets: list,
                 node_color.append("#FF6D00")  # orange (neighbor)
             else:
                 node_color.append("rgba(200,200,200,0.5)")
+        elif color_by_community and node2comm:
+            # Use community as color
+            cmap = px.colors.qualitative.Set1 + px.colors.qualitative.Set2
+            node_color.append(cmap[node2comm.get(n, 0) % len(cmap)])
         else:
             node_color.append("#2962FF")
 
@@ -1089,7 +1309,8 @@ def render_corr_graph_plotly(G: nx.Graph, pos: dict, assets: list,
 
 
 def build_d3_graph_data(G: nx.Graph, assets: list, node_meta: dict,
-                        mst_edge_set: set | None = None) -> tuple[list, list]:
+                        mst_edge_set: set | None = None,
+                        node2comm: dict | None = None) -> tuple[list, list]:
     """Build nodes and links JSON for D3 force graph.
 
     Args:
@@ -1097,6 +1318,7 @@ def build_d3_graph_data(G: nx.Graph, assets: list, node_meta: dict,
         assets: List of asset names (index i -> assets[i])
         node_meta: Dict of node_index -> metrics dict
         mst_edge_set: Set of (i, j) tuples marking MST edges (normalized i < j)
+        node2comm: Dict of node_index -> community_id
 
     Returns:
         (nodes, links) suitable for JSON serialization
@@ -1110,6 +1332,8 @@ def build_d3_graph_data(G: nx.Graph, assets: list, node_meta: dict,
         }
         if node_meta and n in node_meta:
             node.update(node_meta[n])
+        if node2comm:
+            node["community"] = node2comm.get(n, 0)
         nodes.append(node)
 
     links = []
@@ -1133,7 +1357,8 @@ def build_d3_graph_data(G: nx.Graph, assets: list, node_meta: dict,
 
 def make_d3_force_html(nodes: list, links: list, height: int = 700,
                        focus_asset: str | None = None,
-                       show_labels: bool = False) -> str:
+                       show_labels: bool = False,
+                       color_by_community: bool = False) -> str:
     """Generate self-contained HTML with D3 force-directed graph.
 
     Features:
@@ -1143,6 +1368,7 @@ def make_d3_force_html(nodes: list, links: list, height: int = 700,
     - Focus mode (dim non-adjacent nodes/edges)
     - Edge colors: green (positive), red (negative)
     - MST edges: dashed style
+    - Community coloring (optional)
     """
     import json
 
@@ -1150,6 +1376,7 @@ def make_d3_force_html(nodes: list, links: list, height: int = 700,
     links_json = json.dumps(links)
     focus_json = json.dumps(focus_asset) if focus_asset else "null"
     show_labels_js = "true" if show_labels else "false"
+    color_by_community_js = "true" if color_by_community else "false"
 
     html = f'''
 <!DOCTYPE html>
@@ -1192,6 +1419,8 @@ const nodes = {nodes_json};
 const links = {links_json};
 const focusAsset = {focus_json};
 const showLabels = {show_labels_js};
+const colorByCommunity = {color_by_community_js};
+const communityColors = ["#e41a1c","#377eb8","#4daf4a","#984ea3","#ff7f00","#ffff33","#a65628","#f781bf","#999999","#66c2a5","#fc8d62","#8da0cb"];
 
 // Helper: D3 mutates link source/target from strings to objects after forceLink runs
 // Use these to safely get the id regardless of current state
@@ -1272,6 +1501,9 @@ const node = g.append("g")
             if (neighbors.get(focusAsset)?.has(d.id)) return "#FF6D00";
             return "#ccc";
         }}
+        if (colorByCommunity && d.community !== undefined) {{
+            return communityColors[d.community % communityColors.length];
+        }}
         return "#2962FF";
     }})
     .attr("stroke", "#fff")
@@ -1341,6 +1573,214 @@ function drag(simulation) {{
             d.fx = null;
             d.fy = null;
         }});
+}}
+</script>
+</body>
+</html>
+'''
+    return html
+
+
+def make_d3_animated_html(
+    nodes: list,
+    frames: list,
+    height: int = 700,
+    show_labels: bool = False,
+    play_speed_ms: int = 500,
+) -> str:
+    """Generate D3 HTML for animated correlation network.
+
+    nodes: list of dicts with id, x, y, degree, coverage, etc.
+    frames: list of frame dicts from compute_corr_frames
+    """
+    import json
+
+    nodes_json = json.dumps(nodes)
+    frames_json = json.dumps(frames)
+
+    html = f'''
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  body {{ margin: 0; font-family: -apple-system, sans-serif; }}
+  .controls {{ padding: 10px; background: #f5f5f5; display: flex; align-items: center; gap: 15px; }}
+  .controls button {{ padding: 8px 16px; font-size: 14px; cursor: pointer; }}
+  .controls input[type="range"] {{ width: 300px; }}
+  .frame-info {{ font-size: 14px; color: #333; min-width: 280px; }}
+  .link {{ fill: none; }}
+  .link.positive {{ stroke: #2ca02c; }}
+  .link.negative {{ stroke: #d62728; }}
+  .node {{ stroke: #fff; stroke-width: 1.5px; cursor: pointer; }}
+  .node-label {{ font-size: 9px; text-anchor: middle; pointer-events: none; }}
+  .tooltip {{ position: absolute; background: rgba(0,0,0,0.8); color: white;
+              padding: 8px 12px; border-radius: 4px; font-size: 12px; pointer-events: none; }}
+</style>
+</head>
+<body>
+<div class="controls">
+  <button id="playPause">Play</button>
+  <input type="range" id="frameSlider" min="0" max="0" value="0">
+  <span class="frame-info" id="frameInfo">Loading...</span>
+  <label><input type="checkbox" id="showLabels" {"checked" if show_labels else ""}> Labels</label>
+</div>
+<div id="graph"></div>
+<div class="tooltip" id="tooltip" style="display:none;"></div>
+
+<script>
+const nodes = {nodes_json};
+const frames = {frames_json};
+const playSpeedMs = {play_speed_ms};
+
+if (frames.length === 0) {{
+  document.getElementById('frameInfo').textContent = 'No frames available';
+}} else {{
+  const width = window.innerWidth;
+  const height = {height};
+
+  const svg = d3.select("#graph")
+    .append("svg")
+    .attr("width", width)
+    .attr("height", height);
+
+  const g = svg.append("g");
+
+  // Zoom
+  svg.call(d3.zoom()
+    .scaleExtent([0.1, 4])
+    .on("zoom", (event) => g.attr("transform", event.transform)));
+
+  // Create node map for fast lookup
+  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+
+  // Links group (below nodes)
+  const linkGroup = g.append("g").attr("class", "links");
+
+  // Nodes group
+  const nodeGroup = g.append("g").attr("class", "nodes");
+
+  // Draw nodes (fixed positions)
+  const nodeSelection = nodeGroup.selectAll(".node")
+    .data(nodes)
+    .join("circle")
+    .attr("class", "node")
+    .attr("cx", d => d.x)
+    .attr("cy", d => d.y)
+    .attr("r", d => 4 + Math.sqrt(d.degree || 1) * 2)
+    .attr("fill", "#1f77b4")
+    .on("mouseover", showTooltip)
+    .on("mouseout", hideTooltip);
+
+  // Labels
+  const labelSelection = nodeGroup.selectAll(".node-label")
+    .data(nodes)
+    .join("text")
+    .attr("class", "node-label")
+    .attr("x", d => d.x)
+    .attr("y", d => d.y - 10)
+    .text(d => d.id)
+    .style("display", document.getElementById("showLabels").checked ? "block" : "none");
+
+  document.getElementById("showLabels").addEventListener("change", (e) => {{
+    labelSelection.style("display", e.target.checked ? "block" : "none");
+  }});
+
+  // Animation state
+  let currentFrame = 0;
+  let playing = false;
+  let playInterval = null;
+
+  const slider = document.getElementById("frameSlider");
+  slider.max = frames.length - 1;
+
+  function updateFrame(idx) {{
+    currentFrame = idx;
+    const frame = frames[idx];
+
+    // Update info
+    document.getElementById("frameInfo").textContent =
+      `${{frame.t0}} → ${{frame.t1}} | Threshold: |corr| ≥ ${{frame.threshold.toFixed(3)}} | Edges: ${{frame.edges.length}}`;
+    slider.value = idx;
+
+    // Update links
+    const links = linkGroup.selectAll(".link")
+      .data(frame.edges, d => d.source + "|" + d.target);
+
+    links.exit().remove();
+
+    links.enter()
+      .append("line")
+      .attr("class", d => "link " + (d.corr >= 0 ? "positive" : "negative"))
+      .attr("x1", d => nodeMap.get(d.source)?.x || 0)
+      .attr("y1", d => nodeMap.get(d.source)?.y || 0)
+      .attr("x2", d => nodeMap.get(d.target)?.x || 0)
+      .attr("y2", d => nodeMap.get(d.target)?.y || 0)
+      .attr("stroke-width", d => 1 + d.strength * 3)
+      .attr("opacity", d => 0.3 + d.strength * 0.5);
+
+    links
+      .attr("class", d => "link " + (d.corr >= 0 ? "positive" : "negative"))
+      .attr("x1", d => nodeMap.get(d.source)?.x || 0)
+      .attr("y1", d => nodeMap.get(d.source)?.y || 0)
+      .attr("x2", d => nodeMap.get(d.target)?.x || 0)
+      .attr("y2", d => nodeMap.get(d.target)?.y || 0)
+      .attr("stroke-width", d => 1 + d.strength * 3)
+      .attr("opacity", d => 0.3 + d.strength * 0.5);
+
+    // Update node sizes based on pulse (volatility)
+    const maxPulse = Math.max(...Object.values(frame.node_meta).map(m => m.pulse || 0), 0.001);
+    nodeSelection
+      .transition()
+      .duration(200)
+      .attr("r", d => {{
+        const pulse = frame.node_meta[d.id]?.pulse || 0;
+        const base = 4 + Math.sqrt(d.degree || 1) * 2;
+        return base * (1 + pulse / maxPulse * 0.5);
+      }});
+  }}
+
+  function showTooltip(event, d) {{
+    const frame = frames[currentFrame];
+    const meta = frame.node_meta[d.id] || {{}};
+    document.getElementById("tooltip").innerHTML =
+      `<strong>${{d.id}}</strong><br>Degree: ${{d.degree || 0}}<br>Coverage: ${{d.coverage || 0}} days<br>Pulse: ${{(meta.pulse || 0).toFixed(4)}}`;
+    document.getElementById("tooltip").style.display = "block";
+    document.getElementById("tooltip").style.left = (event.pageX + 10) + "px";
+    document.getElementById("tooltip").style.top = (event.pageY + 10) + "px";
+  }}
+
+  function hideTooltip() {{
+    document.getElementById("tooltip").style.display = "none";
+  }}
+
+  // Play/Pause
+  document.getElementById("playPause").addEventListener("click", () => {{
+    playing = !playing;
+    document.getElementById("playPause").textContent = playing ? "Pause" : "Play";
+    if (playing) {{
+      playInterval = setInterval(() => {{
+        currentFrame = (currentFrame + 1) % frames.length;
+        updateFrame(currentFrame);
+      }}, playSpeedMs);
+    }} else {{
+      clearInterval(playInterval);
+    }}
+  }});
+
+  // Slider
+  slider.addEventListener("input", (e) => {{
+    if (playing) {{
+      playing = false;
+      document.getElementById("playPause").textContent = "Play";
+      clearInterval(playInterval);
+    }}
+    updateFrame(parseInt(e.target.value));
+  }});
+
+  // Initial render
+  updateFrame(0);
 }}
 </script>
 </body>
@@ -1515,6 +1955,12 @@ def get_filtered_indices(straddles, asset_str, straddle_ym,
     if asset_mode == "dropdown":
         if asset_value != "All":
             mask &= (asset_str == asset_value)
+    elif asset_mode == "candidates":
+        # Filter to specific list of asset names (used by "Similar to" mode)
+        if len(asset_value) > 0:
+            mask &= np.isin(asset_str, asset_value)
+        else:
+            return np.array([], dtype=np.int64), None
     else:  # regex mode
         pattern, flags = asset_value
         if pattern.strip():
@@ -2124,13 +2570,36 @@ with st.sidebar:
 
     # --- Asset Filter ---
     st.subheader("Asset")
-    asset_mode = st.radio("Mode", ["Dropdown", "Regex"], horizontal=True,
+    asset_mode = st.radio("Mode", ["Dropdown", "Regex", "Similar to"], horizontal=True,
                           label_visibility="collapsed")
+
+    # Initialize sim_neighbors_df for use in expander later
+    sim_neighbors_df = pd.DataFrame()
 
     if asset_mode == "Dropdown":
         selected_asset = st.selectbox("Asset", ["All"] + unique_assets,
                                       label_visibility="collapsed")
         asset_value = selected_asset
+    elif asset_mode == "Similar to":
+        sim_anchor = st.selectbox("Anchor asset", unique_assets, key="sim_anchor")
+        sim_n = st.slider("N neighbors", 5, 200, 25, step=5, key="sim_n")
+        sim_rank = st.radio("Rank by", ["abs(corr)", "corr"], horizontal=True, key="sim_rank")
+        sim_corr_method = st.selectbox("Corr method", ["pearson", "spearman", "sign", "partial"], key="sim_corr_method")
+        sim_min_overlap = st.slider("Min overlap", 5, 250, 30, step=5, key="sim_min_overlap")
+
+        # Partial controls if needed
+        sim_partial_fill = "median"
+        sim_partial_estimator = "ledoitwolf"
+        if sim_corr_method == "partial":
+            sim_partial_row = st.columns(2)
+            with sim_partial_row[0]:
+                sim_partial_fill = st.selectbox("NaN fill", ["median", "mean", "zero"], key="sim_partial_fill")
+            with sim_partial_row[1]:
+                sim_partial_estimator = st.selectbox("Estimator", ["ledoitwolf", "oas", "ridge"], key="sim_partial_estimator")
+
+        # asset_value = (anchor, n, rank, corr_method, min_overlap, partial_fill, partial_estimator)
+        asset_value = (sim_anchor, sim_n, sim_rank, sim_corr_method, sim_min_overlap, sim_partial_fill, sim_partial_estimator)
+        asset_mode = "similar"  # Internal mode name
     else:
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -2200,10 +2669,16 @@ with st.sidebar:
 
     # --- Apply filters ---
     with timed_collect("get_filtered_indices", timings, meta=f"(schids={len(selected_schids)})"):
-        filtered_indices, regex_error = get_filtered_indices(
-            straddles, asset_str, straddle_ym,
-            asset_mode.lower(), asset_value, ym_lo, ym_hi, set(selected_schids)
-        )
+        if asset_mode.lower() == "similar":
+            # Similar mode requires correlation computation - use cached version
+            temp_key = make_filter_key(asset_mode.lower(), asset_value, ym_lo, ym_hi, selected_schids)
+            filtered_indices = get_filtered_indices_cached(temp_key)
+            regex_error = None
+        else:
+            filtered_indices, regex_error = get_filtered_indices(
+                straddles, asset_str, straddle_ym,
+                asset_mode.lower(), asset_value, ym_lo, ym_hi, set(selected_schids)
+            )
     tlog(f"       -> matched {len(filtered_indices):,} straddles")
 
     if regex_error:
@@ -2219,6 +2694,24 @@ if len(filtered_indices) == 0:
 else:
     # Build filter key once (small, hashable)
     filter_key = make_filter_key(asset_mode.lower(), asset_value, ym_lo, ym_hi, selected_schids)
+
+    # Show selected neighbors if in "Similar to" mode
+    if asset_mode.lower() == "similar" and isinstance(asset_value, tuple) and len(asset_value) >= 5:
+        anchor, n, rank, corr_method, min_overlap = asset_value[:5]
+        p_fill = asset_value[5] if len(asset_value) > 5 else "median"
+        p_est = asset_value[6] if len(asset_value) > 6 else "ledoitwolf"
+
+        # Build temp filter_key for All assets to compute neighbors
+        temp_key = (("dropdown", "All"), ym_lo, ym_hi, tuple(sorted(int(s) for s in selected_schids)))
+        neighbors, neighbors_df = top_correlated_assets(
+            temp_key, anchor, n, corr_method, min_overlap, rank,
+            partial_fill=p_fill, partial_estimator=p_est
+        )
+        with st.expander(f"Selected neighbors ({len(neighbors)} assets)", expanded=False):
+            st.caption(f"Anchor: **{anchor}** + {len(neighbors)-1} neighbors")
+            if not neighbors_df.empty:
+                st.dataframe(neighbors_df.style.format({"corr": "{:.3f}", "overlap": "{:d}"}),
+                            width="stretch", hide_index=True, height=200)
 
     # Compute population daily aggregates (Numba kernel)
     with timed_collect("compute_population_daily", timings, meta=f"(n={len(filtered_indices):,})"):
@@ -2259,7 +2752,7 @@ else:
         st.divider()
 
         # Tabs: Days, Cumulative PnL, Norm PnL, MV, Contributors, Straddles, Assets, Matrices
-        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "Norm PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix", "Correlation", "CorGraph", "Embedding"]
+        tab_names = ["Days", "Density", "Norm Density", "Cumulative PnL", "Norm PnL", "MV", "Contributors", "Avg Vol", "Straddles", "Assets", "P&L Matrix", "Live Days", "MV Matrix", "Correlation", "CorGraph", "Embedding", "Coverage", "Attribution"]
         tabs = dict(zip(tab_names, st.tabs(tab_names)))
 
         # --- Days Tab ---
@@ -2717,7 +3210,7 @@ else:
         # --- CorGraph Tab ---
         with tabs["CorGraph"]:
             st.subheader("Correlation Network")
-            cg_view_mode = st.radio("View", ["Plotly", "D3 Interactive"], horizontal=True, key="cg_view_mode")
+            cg_view_mode = st.radio("View", ["Plotly", "D3 Interactive", "D3 Animated"], horizontal=True, key="cg_view_mode")
 
             # Controls row 1
             cg_row1 = st.columns(4)
@@ -2748,6 +3241,14 @@ else:
             cg_show_labels = st.checkbox("Show labels", value=False, key="cg_show_labels")
             cg_use_mst = st.checkbox("Ensure connected (MST backbone)", value=True, key="cg_use_mst")
 
+            # Community detection controls
+            cg_row3 = st.columns(2)
+            with cg_row3[0]:
+                cg_detect_communities = st.checkbox("Detect communities", value=False, key="cg_communities")
+            with cg_row3[1]:
+                cg_color_by_community = st.checkbox("Color by community", value=False, key="cg_color_comm",
+                                                    disabled=not cg_detect_communities)
+
             # Partial correlation controls (CorGraph)
             cg_partial_fill = "median"
             cg_partial_estimator = "ledoitwolf"
@@ -2770,6 +3271,23 @@ else:
                 st.caption("Sign correlation: how often two assets are on the same side of their median")
             elif cg_method == "partial":
                 st.caption("Partial correlation: correlation after controlling for all other assets")
+
+            # Animation controls (only if D3 Animated)
+            anim_window = 60
+            anim_step = 5
+            anim_speed = 500
+            anim_max_assets = 80
+            if cg_view_mode == "D3 Animated":
+                st.markdown("**Animation Settings**")
+                anim_row = st.columns(4)
+                with anim_row[0]:
+                    anim_window = st.slider("Window (days)", 30, 120, 60, step=10, key="anim_window")
+                with anim_row[1]:
+                    anim_step = st.slider("Step (days)", 1, 20, 5, step=1, key="anim_step")
+                with anim_row[2]:
+                    anim_speed = st.slider("Play speed (ms)", 200, 2000, 500, step=100, key="anim_speed")
+                with anim_row[3]:
+                    anim_max_assets = st.slider("Max assets", 40, 120, 80, step=10, key="anim_max_assets")
 
             # Compute correlation (reuse cached) - now returns coverage too
             with timed_collect("corgraph_corr", timings):
@@ -2889,6 +3407,13 @@ else:
                     with timed_collect("corgraph_layout", timings):
                         cg_G, cg_pos = build_graph_positions(cg_assets, cg_edges, seed=cg_seed)
 
+                    # Detect communities if enabled
+                    cg_node2comm = {}
+                    cg_comms = []
+                    if cg_detect_communities:
+                        with timed_collect("corgraph_communities", timings):
+                            cg_node2comm, cg_comms = detect_communities(cg_G, seed=cg_seed)
+
                     # Build node metadata from cached asset metrics
                     cg_node_meta = {}
                     if 'asset_df' in dir() and asset_df is not None:
@@ -2925,14 +3450,18 @@ else:
                                 cg_G, cg_pos, cg_assets,
                                 node_meta=cg_node_meta,
                                 focus_node=cg_focus_node,
-                                show_labels=cg_show_labels
+                                show_labels=cg_show_labels,
+                                node2comm=cg_node2comm,
+                                color_by_community=cg_color_by_community
                             )
                             st.plotly_chart(cg_fig, use_container_width=True, config={"displaylogo": False})
-                    else:
+
+                    elif cg_view_mode == "D3 Interactive":
                         # D3 Interactive view
                         with timed_collect("corgraph_d3_build", timings):
                             d3_nodes, d3_links = build_d3_graph_data(
-                                cg_G, cg_assets, cg_node_meta, cg_mst_edges_set
+                                cg_G, cg_assets, cg_node_meta, cg_mst_edges_set,
+                                node2comm=cg_node2comm if cg_detect_communities else None
                             )
 
                         # Hard cap warning for D3
@@ -2945,10 +3474,98 @@ else:
                                     height=700,
                                     focus_asset=cg_focus_asset if cg_focus_asset != "None" else None,
                                     show_labels=cg_show_labels,
+                                    color_by_community=cg_color_by_community
                                 )
                                 components.html(d3_html, height=720, scrolling=False)
 
                             st.caption("Drag nodes to reposition. Scroll to zoom. Drag background to pan.")
+
+                    elif cg_view_mode == "D3 Animated":
+                        # D3 Animated view - time-evolving correlation network
+                        # Limit assets for animation
+                        if cg_asset_mode == "Top N" and cg_top_n is not None:
+                            n_anim_assets = min(cg_top_n, anim_max_assets)
+                        else:
+                            n_anim_assets = min(len(cg_assets), anim_max_assets)
+
+                        anim_assets = cg_assets[:n_anim_assets]
+
+                        # Compute frames
+                        with timed_collect("compute_corr_frames", timings):
+                            anim_frames = compute_corr_frames(
+                                filter_key=filter_key,
+                                assets=tuple(anim_assets),
+                                method=cg_method,
+                                min_overlap=cg_min_overlap,
+                                window_days=anim_window,
+                                step_days=anim_step,
+                                top_pct=cg_top_pct,
+                                sign=cg_sign,
+                                max_edges_per_node=cg_max_edges,
+                                partial_fill=cg_partial_fill if cg_method == "partial" else "median",
+                                partial_estimator=cg_partial_estimator if cg_method == "partial" else "ledoitwolf",
+                                partial_standardize=cg_partial_standardize if cg_method == "partial" else True,
+                                partial_mask=cg_partial_mask if cg_method == "partial" else True,
+                            )
+
+                        if not anim_frames:
+                            st.warning("No frames generated. Check date range and window size.")
+                        else:
+                            st.caption(f"Generated {len(anim_frames)} frames for {len(anim_assets)} assets")
+
+                            # Build nodes with fixed x,y from existing layout (cg_pos)
+                            # Scale positions to pixel coordinates
+                            if cg_pos:
+                                xs = [p[0] for p in cg_pos.values()]
+                                ys = [p[1] for p in cg_pos.values()]
+                                x_min, x_max = min(xs), max(xs)
+                                y_min, y_max = min(ys), max(ys)
+                            else:
+                                x_min, x_max, y_min, y_max = 0, 1, 0, 1
+
+                            margin = 50
+                            anim_width = 900
+                            anim_height = 700
+
+                            def scale_pos(p):
+                                x = margin + (p[0] - x_min) / (x_max - x_min + 1e-9) * (anim_width - 2*margin)
+                                y = margin + (p[1] - y_min) / (y_max - y_min + 1e-9) * (anim_height - 2*margin)
+                                return (x, y)
+
+                            # Map integer node IDs to asset names for position/degree lookup
+                            pos_by_asset = {cg_assets[i]: cg_pos[i] for i in cg_pos.keys()}
+                            deg_by_asset = {cg_assets[i]: cg_G.degree(i) for i in cg_G.nodes()}
+
+                            # Build nodes for animated assets
+                            anim_nodes = []
+                            for asset in anim_assets:
+                                if asset in pos_by_asset:
+                                    px, py = scale_pos(pos_by_asset[asset])
+                                    deg = deg_by_asset.get(asset, 0)
+                                    cov = int(cg_coverage.get(asset, 0)) if hasattr(cg_coverage, 'get') else int(cg_coverage[asset]) if asset in cg_coverage.index else 0
+                                    anim_nodes.append({
+                                        "id": asset,
+                                        "x": px,
+                                        "y": py,
+                                        "degree": deg,
+                                        "coverage": cov,
+                                    })
+
+                            # Render animated D3
+                            with timed_collect("render_d3_animated", timings):
+                                anim_html = make_d3_animated_html(
+                                    nodes=anim_nodes,
+                                    frames=anim_frames,
+                                    height=700,
+                                    show_labels=cg_show_labels,
+                                    play_speed_ms=anim_speed,
+                                )
+                                components.html(anim_html, height=780, scrolling=False)
+
+                            # Frame statistics
+                            total_edges = sum(len(f["edges"]) for f in anim_frames)
+                            avg_edges = total_edges / len(anim_frames) if anim_frames else 0
+                            st.caption(f"Avg edges/frame: {avg_edges:.0f} | Total edge updates: {total_edges:,}")
 
                     # Summary stats
                     cg_c1, cg_c2, cg_c3, cg_c4, cg_c5 = st.columns(5)
@@ -2958,6 +3575,19 @@ else:
                     cg_c4.metric("Components", f"{nx.number_connected_components(cg_G):,}")
                     cg_avg_deg = sum(d for _, d in cg_G.degree()) / max(cg_G.number_of_nodes(), 1)
                     cg_c5.metric("Avg degree", f"{cg_avg_deg:.1f}")
+
+                    # Community summary panel
+                    if cg_detect_communities and cg_comms:
+                        with st.expander(f"Community Summary ({len(cg_comms)} communities)", expanded=True):
+                            comm_df = community_summary(cg_comms, cg_assets, cg_node_meta)
+                            st.dataframe(
+                                comm_df.style.format({
+                                    "mean_daily_pnl": "{:.6f}",
+                                    "mean_pnl_ratio": "{:.3f}"
+                                }),
+                                width="stretch",
+                                hide_index=True
+                            )
 
         # --- Embedding Tab ---
         with tabs["Embedding"]:
@@ -3095,6 +3725,199 @@ else:
                 spread_y = float(np.std(coords[:, 1]))
                 c2.metric("Spread (x)", f"{spread_x:.3f}")
                 c3.metric("Spread (y)", f"{spread_y:.3f}")
+
+        # --- Coverage Tab ---
+        with tabs["Coverage"]:
+            st.subheader("Coverage & Overlap Explorer")
+
+            with timed_collect("coverage_compute", timings):
+                cov_dfX, cov_all_assets = compute_asset_daily_matrix(filter_key)
+
+            if cov_dfX.empty:
+                st.warning("No data for coverage analysis.")
+            else:
+                coverage = cov_dfX.notna().sum().sort_values(ascending=False)
+
+                # Coverage histogram
+                st.write("**Coverage Distribution**")
+                fig = go.Figure()
+                fig.add_trace(go.Histogram(x=coverage.values, nbinsx=50, marker_color="#2962FF"))
+                fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10),
+                                  xaxis_title="Days with data", yaxis_title="Assets")
+                st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+                # Stats
+                cov_c1, cov_c2, cov_c3, cov_c4 = st.columns(4)
+                cov_c1.metric("Assets", f"{len(coverage):,}")
+                cov_c2.metric("Median coverage", f"{int(coverage.median())}")
+                cov_c3.metric("Min", f"{int(coverage.min())}")
+                cov_c4.metric("Max", f"{int(coverage.max())}")
+
+                # Sparse assets table
+                st.write("**Low Coverage Assets**")
+                cov_threshold = st.slider("Coverage threshold", 0, int(coverage.max()), 30, step=5, key="cov_thresh")
+                sparse = coverage[coverage < cov_threshold]
+                if len(sparse) > 0:
+                    sparse_df = pd.DataFrame({"asset": sparse.index, "days": sparse.values})
+                    st.dataframe(sparse_df, use_container_width=True, height=200)
+                    st.caption(f"{len(sparse)} assets below {cov_threshold} days")
+                else:
+                    st.success(f"All assets have >= {cov_threshold} days coverage")
+
+                # Overlap matrix for top N
+                st.divider()
+                st.write("**Pairwise Overlap (Top N by coverage)**")
+                ov_top_n = st.slider("Assets for overlap", 20, min(200, len(coverage)), 60, step=10, key="ov_top_n")
+
+                top_assets = coverage.head(ov_top_n).index.tolist()
+                dfX_sub = cov_dfX[top_assets]
+                notna_sub = np.asarray(dfX_sub.notna(), dtype=np.int32)
+                overlap_sub = notna_sub.T @ notna_sub
+
+                # Render as heatmap
+                fig = go.Figure(data=go.Heatmap(
+                    z=overlap_sub,
+                    x=top_assets,
+                    y=top_assets,
+                    colorscale="Blues",
+                    colorbar=dict(title="Overlap days"),
+                ))
+                fig.update_layout(
+                    height=max(400, 6 * ov_top_n),
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    xaxis=dict(showticklabels=ov_top_n <= 40, tickfont=dict(size=7)),
+                    yaxis=dict(showticklabels=ov_top_n <= 40, tickfont=dict(size=7), autorange="reversed"),
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+                # Overlap stats
+                mask = np.triu(np.ones_like(overlap_sub, dtype=bool), k=1)
+                ov_vals = overlap_sub[mask]
+                ov_c1, ov_c2, ov_c3 = st.columns(3)
+                ov_c1.metric("Min overlap", f"{int(ov_vals.min())}")
+                ov_c2.metric("Median overlap", f"{int(np.median(ov_vals))}")
+                ov_c3.metric("Max overlap", f"{int(ov_vals.max())}")
+
+        # --- Attribution Tab ---
+        with tabs["Attribution"]:
+            st.subheader("P&L Attribution by Asset")
+
+            # Date range selector
+            dmin, dmax = pop_df.index.min().date(), pop_df.index.max().date()
+
+            attr_col1, attr_col2 = st.columns(2)
+            with attr_col1:
+                attr_start = st.date_input("Start", value=dmin, min_value=dmin, max_value=dmax, key="attr_start")
+            with attr_col2:
+                attr_end = st.date_input("End", value=dmax, min_value=dmin, max_value=dmax, key="attr_end")
+
+            if attr_start > attr_end:
+                attr_start, attr_end = attr_end, attr_start
+
+            # Options
+            attr_opt1, attr_opt2, attr_opt3 = st.columns(3)
+            with attr_opt1:
+                attr_top_k = st.slider("Top K contributors", 5, 50, 15, key="attr_top_k")
+            with attr_opt2:
+                attr_show_normalized = st.checkbox("Show normalized", value=False, key="attr_norm")
+            with attr_opt3:
+                attr_show_negative = st.checkbox("Show losers", value=True, key="attr_neg")
+
+            with timed_collect("attribution_compute", timings):
+                attr_dfX, attr_assets = compute_asset_daily_matrix(filter_key)
+
+            if attr_dfX.empty:
+                st.warning("No data for attribution.")
+            else:
+                # Build date mask
+                attr_dates = attr_dfX.index
+                date_mask = (attr_dates.date >= attr_start) & (attr_dates.date <= attr_end)
+
+                if not date_mask.any():
+                    st.warning("No data in selected date range.")
+                else:
+                    # Sum P&L per asset in window (using normalized daily pnl)
+                    attr_window = attr_dfX.loc[date_mask]
+                    window_pnl = attr_window.sum(axis=0, skipna=True)
+
+                    # Build attribution dataframe
+                    attr_df = pd.DataFrame({
+                        "asset": window_pnl.index,
+                        "pnl": window_pnl.values,
+                    })
+
+                    attr_df = attr_df.sort_values("pnl", ascending=False)
+
+                    # Separate winners and losers
+                    winners = attr_df[attr_df["pnl"] > 0].head(attr_top_k)
+                    losers = attr_df[attr_df["pnl"] < 0].tail(attr_top_k).iloc[::-1]
+
+                    # Waterfall data
+                    wf_labels = []
+                    wf_values = []
+                    wf_measures = []
+
+                    for _, row in winners.iterrows():
+                        wf_labels.append(row["asset"])
+                        wf_values.append(row["pnl"])
+                        wf_measures.append("relative")
+
+                    if attr_show_negative:
+                        if len(winners) > 0 and len(losers) > 0:
+                            wf_labels.append("")
+                            wf_values.append(0)
+                            wf_measures.append("relative")
+
+                        for _, row in losers.iterrows():
+                            wf_labels.append(row["asset"])
+                            wf_values.append(row["pnl"])
+                            wf_measures.append("relative")
+
+                    # Total
+                    total_pnl = window_pnl.sum()
+                    wf_labels.append("Total")
+                    wf_values.append(total_pnl)
+                    wf_measures.append("total")
+
+                    # Render waterfall
+                    st.write("**P&L Waterfall**")
+                    fig = go.Figure(go.Waterfall(
+                        name="",
+                        orientation="v",
+                        measure=wf_measures,
+                        x=wf_labels,
+                        y=wf_values,
+                        connector={"line": {"width": 1}},
+                        increasing={"marker": {"color": "#26a69a"}},
+                        decreasing={"marker": {"color": "#ef5350"}},
+                        totals={"marker": {"color": "#2962FF"}},
+                    ))
+                    fig.update_layout(
+                        height=500,
+                        margin=dict(l=10, r=10, t=40, b=100),
+                        title=f"P&L Attribution: {attr_start} to {attr_end}",
+                        xaxis=dict(tickangle=45, tickfont=dict(size=9)),
+                        yaxis_title="Normalized P&L",
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+                    # Summary metrics
+                    winner_pnl = winners["pnl"].sum() if len(winners) > 0 else 0
+                    loser_pnl = losers["pnl"].sum() if len(losers) > 0 else 0
+
+                    attr_m1, attr_m2, attr_m3, attr_m4 = st.columns(4)
+                    attr_m1.metric("Total P&L", f"{total_pnl:.4f}")
+                    attr_m2.metric(f"Top {len(winners)} winners", f"{winner_pnl:.4f}")
+                    attr_m3.metric(f"Top {len(losers)} losers", f"{loser_pnl:.4f}")
+                    attr_m4.metric("Other", f"{total_pnl - winner_pnl - loser_pnl:.4f}")
+
+                    # Table
+                    st.divider()
+                    st.write("**Top Contributors**")
+                    display_df = attr_df.head(attr_top_k * 2).copy()
+                    display_df["pnl"] = display_df["pnl"].map(lambda x: f"{x:.4f}")
+                    st.dataframe(display_df, use_container_width=True, height=300)
 
         # Record and render timings
         record_timings(timings)
