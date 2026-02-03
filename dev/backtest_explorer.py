@@ -518,8 +518,11 @@ def compute_population_daily_for_asset(filter_key, asset_name: str) -> pd.DataFr
 
 
 @st.cache_data
-def compute_asset_daily_matrix(filter_key):
-    """Build normalized daily pnl matrix [dates × assets] for correlation."""
+def compute_asset_daily_matrix(filter_key, series_source: str = "norm_pnl"):
+    """Build daily matrix [dates × assets] for correlation.
+
+    series_source: "norm_pnl" (pnl/daily_vol), "pnl", or "daily_vol"
+    """
     straddles, valuations, _, _, _ = load_data()
     idx = get_filtered_indices_cached(filter_key)
 
@@ -554,10 +557,15 @@ def compute_asset_daily_matrix(filter_key):
         pnl, vol, dte, have_dte, grid_size, n_assets
     )
 
-    # Normalize: daily_vol = vol_sum / 16, then pnl / daily_vol
+    # Build X based on series_source
     with np.errstate(divide='ignore', invalid='ignore'):
         daily_vol = vol_sum / 16.0
-        X = pnl_sum / daily_vol
+        if series_source == "pnl":
+            X = pnl_sum.copy()
+        elif series_source == "daily_vol":
+            X = daily_vol.copy()
+        else:  # "norm_pnl" (default)
+            X = pnl_sum / daily_vol
         X[~np.isfinite(X)] = np.nan
 
     # Build DataFrame with date index
@@ -574,14 +582,88 @@ def compute_asset_daily_matrix(filter_key):
 
 
 @st.cache_data
+def compute_asset_daily_matrices(filter_key):
+    """Build all three daily matrices [dates × assets] aligned on same index.
+
+    Returns:
+        df_pnl: daily pnl_sum
+        df_dvol: daily vol (vol_sum / 16)
+        df_norm: normalized pnl (pnl_sum / daily_vol)
+        asset_names: array of asset names
+    """
+    straddles, valuations, _, _, _ = load_data()
+    idx = get_filtered_indices_cached(filter_key)
+
+    if idx.size == 0:
+        empty = pd.DataFrame()
+        return empty, empty, empty, np.array([])
+
+    # Prep arrays
+    out0s = straddles["out0"][idx].astype(np.int32)
+    lens = straddles["length"][idx].astype(np.int32)
+    starts = straddles["month_start_epoch"][idx].astype(np.int32)
+
+    # Factorize assets
+    asset_str_all, _ = get_asset_strings(straddles)
+    asset_str_sel = asset_str_all[idx]
+    asset_codes, asset_names = pd.factorize(asset_str_sel, sort=True)
+    asset_ids = asset_codes.astype(np.int32)
+    n_assets = len(asset_names)
+
+    # Grid bounds
+    d0, d1 = int(starts.min()), int((starts + lens - 1).max())
+    grid_size = d1 - d0 + 1
+
+    # Valuations
+    pnl = valuations["pnl"]
+    vol = valuations["vol"]
+    have_dte = "days_to_expiry" in valuations
+    dte = valuations["days_to_expiry"] if have_dte else np.empty(1, dtype=np.int32)
+
+    # Run kernel
+    pnl_sum, vol_sum = _aggregate_daily_by_asset(
+        out0s, lens, starts, asset_ids, d0,
+        pnl, vol, dte, have_dte, grid_size, n_assets
+    )
+
+    # Build all three matrices
+    with np.errstate(divide='ignore', invalid='ignore'):
+        daily_vol = vol_sum / 16.0
+        norm_pnl = pnl_sum / daily_vol
+
+    # Set non-finite to NaN
+    pnl_sum[~np.isfinite(pnl_sum)] = np.nan
+    daily_vol[~np.isfinite(daily_vol)] = np.nan
+    norm_pnl[~np.isfinite(norm_pnl)] = np.nan
+
+    # Build date index
+    base = np.datetime64('1970-01-01', 'D')
+    dates = pd.DatetimeIndex(base + np.arange(d0, d1 + 1))
+
+    # Filter rows where at least one asset has data (using norm_pnl as reference)
+    row_mask = np.any(np.isfinite(norm_pnl), axis=1)
+    pnl_sum = pnl_sum[row_mask]
+    daily_vol = daily_vol[row_mask]
+    norm_pnl = norm_pnl[row_mask]
+    dates = dates[row_mask]
+
+    df_pnl = pd.DataFrame(pnl_sum, index=dates, columns=asset_names)
+    df_dvol = pd.DataFrame(daily_vol, index=dates, columns=asset_names)
+    df_norm = pd.DataFrame(norm_pnl, index=dates, columns=asset_names)
+
+    return df_pnl, df_dvol, df_norm, np.asarray(asset_names)
+
+
+@st.cache_data
 def compute_corr_and_overlap(filter_key, corr_method: str, min_overlap: int,
                              partial_fill: str = "median", partial_estimator: str = "ledoitwolf",
-                             partial_standardize: bool = True, partial_mask: bool = True):
+                             partial_standardize: bool = True, partial_mask: bool = True,
+                             series_source: str = "norm_pnl"):
     """Compute correlation matrix, overlap counts, and coverage (cached for reuse).
 
     Supports pearson, spearman, sign, and partial correlation methods.
     """
-    dfX, _ = compute_asset_daily_matrix(filter_key)
+    dfX, _ = compute_asset_daily_matrix(filter_key, series_source=series_source)
     if dfX.empty:
         return pd.DataFrame(), np.zeros((0, 0), dtype=np.int32), np.array([]), pd.Series(dtype=np.int32), {}
 
@@ -924,7 +1006,8 @@ def top_correlated_assets(filter_key, anchor: str, n: int,
                           partial_fill: str = "median",
                           partial_estimator: str = "ledoitwolf",
                           partial_standardize: bool = True,
-                          partial_mask: bool = True) -> tuple[list[str], pd.DataFrame]:
+                          partial_mask: bool = True,
+                          series_source: str = "norm_pnl") -> tuple[list[str], pd.DataFrame]:
     """Find top N assets most correlated with anchor asset.
 
     Returns: (list of asset names including anchor, DataFrame with corr/overlap)
@@ -935,6 +1018,7 @@ def top_correlated_assets(filter_key, anchor: str, n: int,
         partial_estimator=partial_estimator,
         partial_standardize=partial_standardize,
         partial_mask=partial_mask,
+        series_source=series_source,
     )
     if corr.empty or anchor not in corr.columns:
         return [anchor], pd.DataFrame()
@@ -1343,17 +1427,28 @@ def compute_corr_frames_dense(
     step_days: int = 5,
     partial_estimator: str = "ledoitwolf",
     partial_standardize: bool = True,
+    series_source: str = "norm_pnl",
 ):
     """Compute correlation weights for fixed edges over rolling windows (dense).
 
     Each window uses adaptive row selection: keeps top 80% of rows by data completeness.
     This differs from static CorGraph (build_common_matrix) which uses strict dropna.
     The adaptive approach avoids losing too many observations in volatile windows.
-    Returns list of frame dicts with: t0, t1, edge_corr (list[float]), node_pulse.
+    Returns list of frame dicts with: t0, t1, edge_corr (list[float]), node_stats.
 
     Note: Node XY positions come from keyframes (compute_layout_keyframes), not here.
     """
-    dfX, _ = compute_asset_daily_matrix(filter_key)
+    # Get all three matrices for node stats
+    df_pnl, df_dvol, df_norm, _ = compute_asset_daily_matrices(filter_key)
+
+    # Select which matrix to use for correlation
+    if series_source == "pnl":
+        dfX = df_pnl
+    elif series_source == "daily_vol":
+        dfX = df_dvol
+    else:
+        dfX = df_norm
+
     assets_list = list(assets)
 
     # CRITICAL: Enforce exact asset set + order. Do NOT silently drop assets.
@@ -1364,7 +1459,11 @@ def compute_corr_frames_dense(
     if len(assets_list) < 2:
         return []
 
-    dfX = dfX[assets_list]  # exact order, exact set
+    # Align all three matrices to the same assets (exact order)
+    dfX = dfX[assets_list]
+    df_pnl_aligned = df_pnl[assets_list] if not df_pnl.empty else dfX
+    df_dvol_aligned = df_dvol[assets_list] if not df_dvol.empty else dfX
+    df_norm_aligned = df_norm[assets_list] if not df_norm.empty else dfX
     dates = dfX.index
     X = dfX.to_numpy(np.float64)
     n = len(assets_list)
@@ -1389,10 +1488,16 @@ def compute_corr_frames_dense(
         row_ok = cnt >= thr
         common_window = window_df.loc[row_ok]
 
+        # Get window slices for all three series (using same date range)
+        window_dates = dates[start:end]
+        pnl_window = df_pnl_aligned.loc[df_pnl_aligned.index.isin(window_dates)]
+        dvol_window = df_dvol_aligned.loc[df_dvol_aligned.index.isin(window_dates)]
+        norm_window = df_norm_aligned.loc[df_norm_aligned.index.isin(window_dates)]
+
         if common_window.shape[0] < 2:
             # Not enough common data in this window - use zeros
             edge_corr = [0.0 for _ in edge_list]
-            node_pulse = {a: 0.0 for a in assets_list}
+            node_stats = {a: {"pnl": 0.0, "dvol": 0.0, "norm": 0.0} for a in assets_list}
         else:
             # Critical: ensure column order matches assets_list (node order)
             assert list(common_window.columns) == assets_list
@@ -1417,17 +1522,23 @@ def compute_corr_frames_dense(
                 c = C[i, j]
                 edge_corr.append(float(c) if np.isfinite(c) else 0.0)
 
-            # Node pulse: rolling std
-            Xc = common_window.to_numpy()
-            node_vol = np.nanstd(Xc, axis=0)
-            node_pulse = {assets_list[i]: float(node_vol[i]) if np.isfinite(node_vol[i]) else 0.0
-                          for i in range(n)}
+            # Node stats: window means for all three series
+            node_stats = {}
+            for i, asset in enumerate(assets_list):
+                pnl_mean = float(pnl_window[asset].mean()) if asset in pnl_window.columns else 0.0
+                dvol_mean = float(dvol_window[asset].mean()) if asset in dvol_window.columns else 0.0
+                norm_mean = float(norm_window[asset].mean()) if asset in norm_window.columns else 0.0
+                node_stats[asset] = {
+                    "pnl": pnl_mean if np.isfinite(pnl_mean) else 0.0,
+                    "dvol": dvol_mean if np.isfinite(dvol_mean) else 0.0,
+                    "norm": norm_mean if np.isfinite(norm_mean) else 0.0,
+                }
 
         frames.append({
             "t0": dates[start].strftime("%Y-%m-%d"),
             "t1": dates[end-1].strftime("%Y-%m-%d"),
             "edge_corr": edge_corr,
-            "node_pulse": node_pulse,
+            "node_stats": node_stats,
         })
 
     return frames
@@ -1459,9 +1570,18 @@ def compute_corgraph_state(filter_key: Any, cfg: dict, timings: dict) -> CorGrap
 
     Returns None if no data or < 2 common rows.
     """
-    # 1. Get normalized daily PnL matrix
+    # 1. Get all three daily matrices for node stats
+    series_source = cfg.get("series_source", "norm_pnl")
     with timed_collect("corgraph_dfX", timings):
-        dfX, _ = compute_asset_daily_matrix(filter_key)
+        df_pnl, df_dvol, df_norm, _ = compute_asset_daily_matrices(filter_key)
+
+    # Select which matrix to use for correlation based on series_source
+    if series_source == "pnl":
+        dfX = df_pnl
+    elif series_source == "daily_vol":
+        dfX = df_dvol
+    else:
+        dfX = df_norm
 
     if dfX.empty:
         return None
@@ -1475,7 +1595,7 @@ def compute_corgraph_state(filter_key: Any, cfg: dict, timings: dict) -> CorGrap
     else:
         display_assets = col_counts.head(cfg["top_n"]).index.tolist()
 
-    # 3. Build dense common-rows matrix
+    # 3. Build dense common-rows matrix (for the selected series_source)
     with timed_collect("corgraph_common", timings):
         common_df = build_common_matrix(dfX, display_assets)
 
@@ -1486,6 +1606,13 @@ def compute_corgraph_state(filter_key: Any, cfg: dict, timings: dict) -> CorGrap
     # 3b. Rebuild asset list from common_df.columns (may be subset if some assets missing from dfX)
     display_assets = list(common_df.columns)
     asset_index = {a: i for i, a in enumerate(display_assets)}
+
+    # 3c. Build common matrices for all three series (for node stats)
+    # Use the same common rows as the main correlation matrix
+    common_rows = common_df.index
+    common_pnl = df_pnl.loc[common_rows, display_assets] if not df_pnl.empty else common_df
+    common_dvol = df_dvol.loc[common_rows, display_assets] if not df_dvol.empty else common_df
+    common_norm = df_norm.loc[common_rows, display_assets] if not df_norm.empty else common_df
 
     # 4. Compute correlation on dense matrix
     with timed_collect("corgraph_corr", timings):
@@ -1551,25 +1678,28 @@ def compute_corgraph_state(filter_key: Any, cfg: dict, timings: dict) -> CorGrap
     # 9. Build graph + layout
     with timed_collect("corgraph_graph", timings):
 
-        # Build graph
+        # Build graph with name attribute for Plotly hover
         G = nx.Graph()
-        G.add_nodes_from(range(len(display_assets)))
+        for i, asset in enumerate(display_assets):
+            G.add_node(i, name=asset)
         for edge in all_edges:
             i, j, c = edge[:3]
             G.add_edge(i, j, weight=float(abs(c)), corr=float(c))
 
-        # Node metadata - compute PnL stats from dense matrix
+        # Node metadata - compute stats from all three series
         node_meta = {}
         for n in G.nodes():
             asset = display_assets[n]
-            col = common_df[asset]
-            mean_pnl = col.mean()
-            std_pnl = col.std()
+            # Get means from each of the three series
+            mean_pnl = float(common_pnl[asset].mean()) if asset in common_pnl.columns else 0.0
+            mean_dvol = float(common_dvol[asset].mean()) if asset in common_dvol.columns else 0.0
+            mean_norm = float(common_norm[asset].mean()) if asset in common_norm.columns else 0.0
             node_meta[n] = {
                 "degree": G.degree(n),
                 "asset": asset,
-                "mean_daily_pnl": float(mean_pnl),
-                "pnl_over_daily_vol": float(mean_pnl / std_pnl) if std_pnl > 0 else 0.0,
+                "mean_daily_pnl": mean_pnl,
+                "mean_daily_vol": mean_dvol,
+                "mean_norm_pnl": mean_norm,
             }
 
     # 9. Layout
@@ -1614,6 +1744,15 @@ def render_corgraph_controls() -> dict:
     Returns dict with all control values.
     """
     cfg = {}
+
+    # Series source (applies to all CorGraph views)
+    cfg["series_source"] = st.selectbox(
+        "Series",
+        ["norm_pnl", "pnl", "daily_vol"],
+        format_func=lambda x: {"norm_pnl": "Normalized PnL", "pnl": "PnL", "daily_vol": "Daily Vol"}[x],
+        key="cg_series_source",
+        help="Time series used for correlations"
+    )
 
     # Row 1: Method + Top %
     c1, c2 = st.columns(2)
@@ -1803,6 +1942,7 @@ def render_corgraph_d3_animated_view(filter_key: Any, state: CorGraphState, cfg:
                 step_days=cfg["anim_step"],
                 partial_estimator=cfg["partial_estimator"],
                 partial_standardize=cfg["partial_standardize"],
+                series_source=cfg.get("series_source", "norm_pnl"),
             )
     except Exception as e:
         st.error(f"Animation frame computation failed: {type(e).__name__}")
@@ -1946,7 +2086,8 @@ def compute_embedding(filter_key, method: str, corr_method: str, corr_min_period
                       perplexity: int = 30, n_neighbors: int = 15, min_dist: float = 0.1,
                       seed: int = 42,
                       partial_fill: str = "median", partial_estimator: str = "ledoitwolf",
-                      partial_standardize: bool = True, partial_mask: bool = True):
+                      partial_standardize: bool = True, partial_mask: bool = True,
+                      series_source: str = "norm_pnl"):
     """Compute 2D embedding from correlation distance matrix.
 
     Args:
@@ -1962,6 +2103,7 @@ def compute_embedding(filter_key, method: str, corr_method: str, corr_min_period
         partial_estimator=partial_estimator,
         partial_standardize=partial_standardize,
         partial_mask=partial_mask,
+        series_source=series_source,
     )
 
     if corr_full.empty:
@@ -2186,7 +2328,8 @@ def render_corr_graph_plotly(G: nx.Graph, pos: dict, assets: list,
         if node_meta and n in node_meta:
             m = node_meta[n]
             hover_parts.append(f"mean daily pnl: {m.get('mean_daily_pnl', float('nan')):.6f}")
-            hover_parts.append(f"pnl/daily vol: {m.get('pnl_over_daily_vol', float('nan')):.3f}")
+            hover_parts.append(f"mean daily vol: {m.get('mean_daily_vol', float('nan')):.6f}")
+            hover_parts.append(f"mean pnl/dvol: {m.get('mean_norm_pnl', float('nan')):.3f}")
         node_hover.append("<br>".join(hover_parts))
 
         # Color: highlight focus node and neighbors, or by community
@@ -2450,7 +2593,8 @@ node.on("mouseover", (event, d) => {{
     let html = `<b>${{d.id}}</b><br>Degree: ${{d.degree}}`;
     if (d.coverage !== undefined) html += `<br>Coverage: ${{d.coverage}}`;
     if (d.mean_daily_pnl !== undefined) html += `<br>Mean daily PnL: ${{d.mean_daily_pnl.toFixed(6)}}`;
-    if (d.pnl_over_daily_vol !== undefined) html += `<br>PnL/Vol: ${{d.pnl_over_daily_vol.toFixed(3)}}`;
+    if (d.mean_daily_vol !== undefined) html += `<br>Mean daily vol: ${{d.mean_daily_vol.toFixed(6)}}`;
+    if (d.mean_norm_pnl !== undefined) html += `<br>Mean PnL/dVol: ${{d.mean_norm_pnl.toFixed(3)}}`;
     tooltip.style("display", "block").html(html);
 }})
 .on("mousemove", (event) => {{
@@ -2504,7 +2648,7 @@ function drag(simulation) {{
 def make_d3_animated_html(
     nodes: list,           # [{"id": str, "x": float, "y": float, "degree": int}, ...]
     edge_list: list,       # [{"source": str, "target": str}, ...]
-    frames: list,          # [{edge_corr: [...], node_pulse: {...}, t0: str, t1: str}, ...]
+    frames: list,          # [{edge_corr: [...], node_stats: {asset: {pnl, dvol, norm}}, t0: str, t1: str}, ...]
     height: int = 700,
     show_labels: bool = False,
     play_speed_ms: int = 500,
@@ -2565,7 +2709,7 @@ def make_d3_animated_html(
     <button id="playPause">Play</button>
     <input type="range" id="frameSlider" min="0" max="0" value="0" style="flex:1;max-width:400px;">
     <label style="display:flex;align-items:center;gap:6px;">
-      <input type="checkbox" id="frameRelink">
+      <input type="checkbox" id="frameRelink" checked>
       FrameRelink
     </label>
     <span class="frame-info" id="frameInfo">Loading...</span>
@@ -2876,11 +3020,12 @@ if (frames.length === 0) {{
       nodes.forEach(n => {{ n.vx = 0; n.vy = 0; }});
     }}
 
-    // Update node sizes from pulse
-    const maxPulse = Math.max(...Object.values(frame.node_pulse), 0.001);
+    // Update node sizes based on abs(norm) from node_stats
+    const normVals = Object.values(frame.node_stats).map(s => Math.abs(s.norm || 0));
+    const maxNorm = Math.max(...normVals, 0.001);
     nodeSelection.attr("r", d => {{
-      const pulse = frame.node_pulse[d.id] || 0;
-      return baseRadius(d) * (1 + 0.4 * pulse / maxPulse);
+      const stats = frame.node_stats[d.id] || {{norm: 0}};
+      return baseRadius(d) * (1 + 0.4 * Math.abs(stats.norm) / maxNorm);
     }});
 
     // Handle frozen vs normal mode
@@ -2900,9 +3045,12 @@ if (frames.length === 0) {{
 
   function showTooltip(event, d) {{
     const frame = frames[currentFrame];
-    const pulse = frame.node_pulse[d.id] || 0;
+    const stats = frame.node_stats[d.id] || {{pnl: 0, dvol: 0, norm: 0}};
     document.getElementById("tooltip").innerHTML =
-      `<strong>${{d.id}}</strong><br>Degree: ${{d.degree || 0}}<br>Pulse: ${{pulse.toFixed(4)}}`;
+      `<strong>${{d.id}}</strong><br>Degree: ${{d.degree || 0}}<br>` +
+      `PnL: ${{stats.pnl.toFixed(6)}}<br>` +
+      `Vol: ${{stats.dvol.toFixed(6)}}<br>` +
+      `PnL/Vol: ${{stats.norm.toFixed(3)}}`;
     document.getElementById("tooltip").style.display = "block";
     document.getElementById("tooltip").style.left = (event.clientX + 10) + "px";
     document.getElementById("tooltip").style.top = (event.clientY + 10) + "px";
@@ -2924,12 +3072,14 @@ if (frames.length === 0) {{
 
     // Meta info
     const frame = frames[currentFrame];
-    const pulse = frame.node_pulse[id] ?? 0;
+    const stats = frame.node_stats[id] || {{pnl: 0, dvol: 0, norm: 0}};
     const deg = adj.get(id)?.length ?? 0;
 
     document.getElementById("selMeta").innerHTML =
       `<div><b>${{id}}</b></div>` +
-      `<div>degree: ${{deg}}, pulse: ${{Number(pulse).toFixed(4)}}</div>` +
+      `<div>degree: ${{deg}}</div>` +
+      `<div>PnL: ${{stats.pnl.toFixed(6)}}, Vol: ${{stats.dvol.toFixed(6)}}</div>` +
+      `<div>PnL/Vol: ${{stats.norm.toFixed(3)}}</div>` +
       `<div>frame: ${{frame.t0}} → ${{frame.t1}}</div>` +
       `<div>X: ${{(node?.x ?? 0).toFixed(1)}}, Y: ${{(node?.y ?? 0).toFixed(1)}}</div>` +
       `<div>dX: ${{(node?.vx ?? 0).toFixed(2)}}, dY: ${{(node?.vy ?? 0).toFixed(2)}}</div>`;
@@ -4908,10 +5058,13 @@ else:
                 # Overlap stats
                 mask = np.triu(np.ones_like(overlap_sub, dtype=bool), k=1)
                 ov_vals = overlap_sub[mask]
-                ov_c1, ov_c2, ov_c3 = st.columns(3)
-                ov_c1.metric("Min overlap", f"{int(ov_vals.min())}")
-                ov_c2.metric("Median overlap", f"{int(np.median(ov_vals))}")
-                ov_c3.metric("Max overlap", f"{int(ov_vals.max())}")
+                if ov_vals.size == 0:
+                    st.caption("Need at least 2 assets to compute pairwise overlap stats.")
+                else:
+                    ov_c1, ov_c2, ov_c3 = st.columns(3)
+                    ov_c1.metric("Min overlap", f"{int(ov_vals.min())}")
+                    ov_c2.metric("Median overlap", f"{int(np.median(ov_vals))}")
+                    ov_c3.metric("Max overlap", f"{int(ov_vals.max())}")
 
                 # Common coverage tradeoff plot
                 st.divider()
