@@ -2,7 +2,9 @@
 import re
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -529,8 +531,9 @@ def compute_asset_daily_matrix(filter_key):
     lens = straddles["length"][idx].astype(np.int32)
     starts = straddles["month_start_epoch"][idx].astype(np.int32)
 
-    # Factorize assets for selected straddles only
-    asset_str_sel = np.asarray([str(straddles["asset"][i]) for i in idx], dtype=object)
+    # Factorize assets for selected straddles only (use precomputed asset_str)
+    asset_str_all, _ = get_asset_strings(straddles)
+    asset_str_sel = asset_str_all[idx]
     asset_codes, asset_names = pd.factorize(asset_str_sel, sort=True)
     asset_ids = asset_codes.astype(np.int32)
     n_assets = len(asset_names)
@@ -705,6 +708,91 @@ def compute_corr_frames(
     return frames
 
 
+@st.cache_data
+def compute_corr_frames_v2(
+    filter_key,
+    assets: tuple,
+    edge_list: tuple,  # Fixed edges: ((i,j), ...)
+    method: str,
+    min_overlap: int,
+    window_days: int = 60,
+    step_days: int = 5,
+    partial_fill: str = "median",
+    partial_estimator: str = "ledoitwolf",
+    partial_standardize: bool = True,
+    partial_mask: bool = True,
+):
+    """Compute correlation weights for fixed edges over rolling windows.
+
+    For living force-directed network: returns weights for a fixed edge universe
+    (edges don't appear/disappear, they fade based on correlation strength).
+
+    Returns list of frame dicts with:
+      t0, t1: date range strings
+      edge_corr: list of (corr, overlap) aligned with edge_list
+      node_pulse: dict of asset -> volatility pulse
+    """
+    dfX, _ = compute_asset_daily_matrix(filter_key)
+    assets_list = list(assets)
+    dfX = dfX[[a for a in assets_list if a in dfX.columns]]
+    if dfX.empty or len(dfX.columns) < 2:
+        return []
+
+    assets_list = list(dfX.columns)
+    dates = dfX.index
+    X = dfX.to_numpy(np.float64)
+    M = np.isfinite(X).astype(np.int32)
+    n = len(assets_list)
+    edge_list = list(edge_list)
+
+    frames = []
+    w = window_days
+    s = step_days
+
+    for start in range(0, len(dates) - w + 1, s):
+        end = start + w
+        Xw = X[start:end]
+        Mw = M[start:end]
+
+        dfW = pd.DataFrame(Xw, columns=assets_list)
+
+        # Compute correlation
+        if method in ("pearson", "spearman"):
+            C = dfW.corr(method=method, min_periods=min_overlap).to_numpy()
+            overlap = Mw.T @ Mw
+        elif method == "sign":
+            C, overlap, _ = compute_sign_corr(dfW, min_overlap)
+        else:  # partial
+            C, overlap, _ = compute_partial_corr(
+                dfW, min_overlap, partial_fill, partial_estimator,
+                partial_standardize, partial_mask
+            )
+
+        # Extract correlations for fixed edges
+        edge_corr = []
+        for i, j in edge_list:
+            c = C[i, j]
+            o = int(overlap[i, j])
+            if np.isfinite(c) and o >= min_overlap:
+                edge_corr.append((float(c), o))
+            else:
+                edge_corr.append((0.0, 0))  # Weight 0 = faded out
+
+        # Node pulse: rolling std
+        node_vol = np.nanstd(Xw, axis=0)
+        node_pulse = {assets_list[i]: float(node_vol[i]) if np.isfinite(node_vol[i]) else 0.0
+                      for i in range(n)}
+
+        frames.append({
+            "t0": dates[start].strftime("%Y-%m-%d"),
+            "t1": dates[end-1].strftime("%Y-%m-%d"),
+            "edge_corr": edge_corr,
+            "node_pulse": node_pulse,
+        })
+
+    return frames
+
+
 def compute_sign_corr(dfX: pd.DataFrame, min_overlap: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute sign correlation matrix.
 
@@ -776,11 +864,9 @@ def compute_partial_corr(
     # Handle all-NaN columns: fill_vals will be NaN, replace with 0
     fill_vals = np.nan_to_num(fill_vals, nan=0.0)
 
-    # Replace NaNs with fill values
-    X_filled = X.copy()
-    for j in range(n_assets):
-        mask = ~np.isfinite(X_filled[:, j])
-        X_filled[mask, j] = fill_vals[j]
+    # Replace NaNs with fill values (vectorized)
+    nan_mask = ~np.isfinite(X)
+    X_filled = np.where(nan_mask, fill_vals[np.newaxis, :], X)
 
     # Final safety check: ensure no NaNs remain
     X_filled = np.nan_to_num(X_filled, nan=0.0)
@@ -801,13 +887,17 @@ def compute_partial_corr(
         cov = np.cov(X_filled, rowvar=False, bias=False)
         cov += 1e-3 * np.eye(n_assets)  # Ridge regularization
 
-    # Invert to precision matrix
+    # Invert to precision matrix (robust with double fallback)
     try:
         precision = np.linalg.inv(cov)
     except np.linalg.LinAlgError:
-        # Fallback: add more regularization
-        cov += 1e-2 * np.eye(n_assets)
-        precision = np.linalg.inv(cov)
+        # Regularize more and try again
+        cov2 = cov + 1e-2 * np.eye(n_assets)
+        try:
+            precision = np.linalg.inv(cov2)
+        except np.linalg.LinAlgError:
+            # Last resort: pseudo-inverse (always works)
+            precision = np.linalg.pinv(cov2)
 
     # Convert to partial correlation
     # pcorr_{ij} = -Omega_{ij} / sqrt(Omega_{ii} * Omega_{jj})
@@ -959,6 +1049,838 @@ def mst_edges_from_corr(corr_mat: np.ndarray, overlap_mat: np.ndarray, mode: str
         o = int(overlap_mat[i, j])
         edges.append((int(i), int(j), c, o))
     return edges
+
+
+def build_edge_universe(corr_df: pd.DataFrame, overlap: np.ndarray,
+                        min_overlap: int, top_m: int = 10, use_mst: bool = True) -> tuple[list, list]:
+    """Build fixed edge universe from full-period correlation.
+
+    For animated network: precompute candidate edges that stay constant across all frames.
+    Per node: keep top M neighbors by |corr|, plus MST backbone for connectivity.
+
+    Returns: (assets, edge_list) where edge_list is [(i,j), ...] sorted pairs
+    """
+    assets = list(corr_df.columns)
+    C = corr_df.values
+    n = len(assets)
+
+    # Per-node top M by abs corr
+    keep = set()
+    for i in range(n):
+        candidates = []
+        for j in range(n):
+            if i == j:
+                continue
+            if overlap[i, j] < min_overlap:
+                continue
+            c = C[i, j]
+            if not np.isfinite(c):
+                continue
+            candidates.append((abs(c), i, j))
+        candidates.sort(reverse=True)
+        for _, a, b in candidates[:top_m]:
+            keep.add((min(a, b), max(a, b)))
+
+    # Add MST edges for connectivity
+    if use_mst:
+        mst = mst_edges_from_corr(C, overlap)
+        for i, j, *_ in mst:
+            keep.add((min(i, j), max(i, j)))
+
+    edge_list = sorted(list(keep))
+    return assets, edge_list
+
+
+# ============================================================================
+# Coverage Tradeoff Helper
+# ============================================================================
+@st.cache_data(show_spinner=False)
+def compute_common_coverage_tradeoff(dfX: pd.DataFrame) -> pd.DataFrame:
+    """
+    Greedy curve: at each step drop the asset whose removal increases
+    common-row coverage the most.
+
+    Returns a DataFrame with columns:
+      n_assets, common_rows, coverage_pct, dropped
+    """
+    if dfX is None or dfX.empty or dfX.shape[1] < 1:
+        return pd.DataFrame(columns=["n_assets", "common_rows", "coverage_pct", "dropped"])
+
+    assets = list(dfX.columns)
+    missing = (~np.asarray(dfX.notna(), dtype=np.bool_)).astype(np.uint8)  # (T, N) 0/1
+    T, N = missing.shape
+    if N == 0 or T == 0:
+        return pd.DataFrame(columns=["n_assets", "common_rows", "coverage_pct", "dropped"])
+
+    active = np.ones(N, dtype=np.bool_)
+    miss_count = missing.sum(axis=1).astype(np.int32)  # (T,)
+    common_rows = int((miss_count == 0).sum())
+
+    rows = []
+    rows.append({
+        "n_assets": int(active.sum()),
+        "common_rows": common_rows,
+        "coverage_pct": 100.0 * common_rows / max(T, 1),
+        "dropped": "",
+    })
+
+    # Greedy removals until 1 asset left (or already 100% coverage)
+    while active.sum() > 1:
+        if common_rows == T:
+            break  # Already dense for all remaining assets
+
+        rows_miss1 = (miss_count == 1)
+        if not np.any(rows_miss1):
+            # No rows with exactly one missing - drop asset with most missing overall
+            miss_per_asset = missing[:, active].sum(axis=0).astype(np.int32)
+            idx_active = np.flatnonzero(active)
+            drop_local = int(np.argmax(miss_per_asset))
+            drop_idx = int(idx_active[drop_local])
+        else:
+            # Count which asset is responsible for most single-miss rows
+            miss1_missing_counts = missing[rows_miss1][:, active].sum(axis=0).astype(np.int32)
+            idx_active = np.flatnonzero(active)
+            drop_local = int(np.argmax(miss1_missing_counts))
+            drop_idx = int(idx_active[drop_local])
+
+        # Apply drop
+        active[drop_idx] = False
+        miss_count = miss_count - missing[:, drop_idx].astype(np.int32)
+        common_rows = int((miss_count == 0).sum())
+
+        rows.append({
+            "n_assets": int(active.sum()),
+            "common_rows": common_rows,
+            "coverage_pct": 100.0 * common_rows / max(T, 1),
+            "dropped": assets[drop_idx],
+        })
+
+    return pd.DataFrame(rows)
+
+
+# Single source of truth for link strength exponent — used by both NetworkX and D3
+WEIGHT_POWER = 1.6
+
+
+# ============================================================================
+# CorGraph Dense Matrix Helpers
+# ============================================================================
+def build_common_matrix(dfX: pd.DataFrame, assets: list[str]) -> pd.DataFrame:
+    """Build dense matrix keeping only rows where ALL assets have data.
+
+    Used by static CorGraph (compute_corgraph_state) for a single correlation snapshot.
+    Uses strict dropna(how="any") - all assets must have data for a row to be included.
+
+    Note: The animation path (compute_corr_frames_dense) uses adaptive 80% completeness
+    per window to avoid losing too many observations in volatile windows. This is an
+    intentional design divergence - static graph wants consistency, animation wants
+    responsiveness to local data availability.
+
+    Returns empty DataFrame if < 2 columns available.
+    """
+    cols = [a for a in assets if a in dfX.columns]
+    if len(cols) < 2:
+        return pd.DataFrame()
+    return dfX[cols].dropna(axis=0, how="any")
+
+
+def compute_sign_corr_dense(common_df: pd.DataFrame) -> np.ndarray:
+    """Compute sign correlation on dense matrix (no NaNs).
+
+    Sign correlation: s_i = sign(x_i - median_i), then corr = mean(s_i * s_j).
+    """
+    X = common_df.to_numpy(np.float64)
+    med = np.median(X, axis=0)
+    S = np.where(X >= med, 1, -1).astype(np.int32)
+    C = (S.T @ S).astype(np.float64) / X.shape[0]
+    np.fill_diagonal(C, 1.0)
+    return C
+
+
+def compute_partial_corr_dense(common_df: pd.DataFrame,
+                               estimator: str = "ledoitwolf",
+                               standardize: bool = True) -> np.ndarray:
+    """Compute partial correlation on dense matrix (no NaNs).
+
+    Partial correlation: rho_{ij|rest} = -Omega_{ij} / sqrt(Omega_ii * Omega_jj)
+    where Omega = Sigma^{-1} (precision matrix).
+    """
+    from sklearn.covariance import LedoitWolf, OAS
+
+    X = common_df.to_numpy(np.float64)  # no NaNs
+    n_assets = X.shape[1]
+
+    if standardize:
+        mu = X.mean(axis=0)
+        std = X.std(axis=0)
+        std[std < 1e-12] = 1.0
+        X = (X - mu) / std
+
+    if estimator == "ledoitwolf":
+        cov = LedoitWolf().fit(X).covariance_
+    elif estimator == "oas":
+        cov = OAS().fit(X).covariance_
+    else:  # ridge
+        cov = np.cov(X, rowvar=False, bias=False)
+        cov += 1e-3 * np.eye(n_assets)
+
+    # Robust inversion: always add ridge regularization, use pinv as fallback
+    cov_reg = cov + 1e-2 * np.eye(n_assets)
+    try:
+        precision = np.linalg.inv(cov_reg)
+    except np.linalg.LinAlgError:
+        precision = np.linalg.pinv(cov_reg)
+
+    diag = np.diag(precision)
+    d = np.sqrt(np.abs(diag))
+    d[d < 1e-12] = 1e-12
+    pcorr = -precision / np.outer(d, d)
+    np.fill_diagonal(pcorr, 1.0)
+    return np.clip(pcorr, -1.0, 1.0)
+
+
+def corr_to_edges_dense(corr: pd.DataFrame,
+                        min_abs_corr: float,
+                        sign: str = "both",
+                        max_edges_per_node: int | None = None) -> tuple[list, list]:
+    """Convert dense correlation matrix to edge list (no overlap filtering).
+
+    Returns: (assets, edges) where edges are 3-tuples (i, j, corr).
+    """
+    assets = list(corr.columns)
+    n = len(assets)
+    C = corr.values
+
+    edges = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            c = C[i, j]
+            if not np.isfinite(c):
+                continue
+            if abs(c) < min_abs_corr:
+                continue
+            if sign == "pos" and c < 0:
+                continue
+            if sign == "neg" and c > 0:
+                continue
+            edges.append((i, j, float(c)))
+
+    # Prune to max edges per node
+    if max_edges_per_node is not None:
+        edges.sort(key=lambda e: abs(e[2]), reverse=True)
+        deg = np.zeros(n, dtype=np.int32)
+        kept = []
+        for i, j, c in edges:
+            if deg[i] >= max_edges_per_node or deg[j] >= max_edges_per_node:
+                continue
+            kept.append((i, j, c))
+            deg[i] += 1
+            deg[j] += 1
+        edges = kept
+
+    return assets, edges
+
+
+def mst_edges_from_corr_dense(corr_mat: np.ndarray) -> list[tuple]:
+    """Compute MST edges from dense correlation matrix.
+
+    Returns: [(i, j, corr), ...] - no overlap in tuples.
+    """
+    C = corr_mat.copy()
+    C[~np.isfinite(C)] = 0.0
+    D = 1.0 - np.abs(C)
+    np.fill_diagonal(D, 0.0)
+    D = np.clip(D, 0.0, 2.0)
+
+    mst = minimum_spanning_tree(D).tocoo()
+    edges = []
+    for i, j, _w in zip(mst.row, mst.col, mst.data):
+        c = float(C[i, j])  # Use original correlation, not distance weight
+        edges.append((int(i), int(j), c))
+    return edges
+
+
+def build_edge_universe_dense(corr_df: pd.DataFrame, top_m: int = 10, use_mst: bool = True) -> tuple[list, list]:
+    """Build fixed edge universe from dense correlation matrix.
+
+    Returns: (assets, edge_list) where edge_list is [(i,j), ...] sorted pairs.
+    """
+    assets = list(corr_df.columns)
+    C = corr_df.values
+    n = len(assets)
+
+    # Per-node top M by abs corr
+    keep = set()
+    for i in range(n):
+        candidates = []
+        for j in range(n):
+            if i == j:
+                continue
+            c = C[i, j]
+            if not np.isfinite(c):
+                continue
+            candidates.append((abs(c), i, j))
+        candidates.sort(reverse=True)
+        for _, a, b in candidates[:top_m]:
+            keep.add((min(a, b), max(a, b)))
+
+    # Add MST edges
+    if use_mst:
+        mst = mst_edges_from_corr_dense(C)
+        for i, j, _ in mst:
+            keep.add((min(i, j), max(i, j)))
+
+    return assets, sorted(list(keep))
+
+
+@st.cache_data
+def compute_corr_frames_dense(
+    filter_key,
+    assets: tuple,
+    edge_list: tuple,
+    method: str,
+    window_days: int = 60,
+    step_days: int = 5,
+    partial_estimator: str = "ledoitwolf",
+    partial_standardize: bool = True,
+):
+    """Compute correlation weights for fixed edges over rolling windows (dense).
+
+    Each window uses adaptive row selection: keeps top 80% of rows by data completeness.
+    This differs from static CorGraph (build_common_matrix) which uses strict dropna.
+    The adaptive approach avoids losing too many observations in volatile windows.
+    Returns list of frame dicts with: t0, t1, edge_corr (list[float]), node_pulse.
+
+    Note: Node XY positions come from keyframes (compute_layout_keyframes), not here.
+    """
+    dfX, _ = compute_asset_daily_matrix(filter_key)
+    assets_list = list(assets)
+
+    # CRITICAL: Enforce exact asset set + order. Do NOT silently drop assets.
+    # If any assets are missing, return empty to trigger loud Python-side error.
+    missing = [a for a in assets_list if a not in dfX.columns]
+    if missing:
+        return []
+    if len(assets_list) < 2:
+        return []
+
+    dfX = dfX[assets_list]  # exact order, exact set
+    dates = dfX.index
+    X = dfX.to_numpy(np.float64)
+    n = len(assets_list)
+    edge_list = list(edge_list)
+
+    frames = []
+    w = window_days
+    s = step_days
+
+    for start in range(0, len(dates) - w + 1, s):
+        end = start + w
+        Xw = X[start:end]
+
+        # Adaptive row selection: keep top 80% of rows by completeness
+        # (instead of strict dropna which selects same stable rows each window)
+        window_df = pd.DataFrame(Xw, columns=assets_list)
+        mask = np.isfinite(Xw)
+        cnt = mask.sum(axis=1)
+        q = 0.80
+        k = max(5, int(q * len(cnt)))
+        thr = np.partition(cnt, len(cnt) - k)[len(cnt) - k] if len(cnt) > k else 0
+        row_ok = cnt >= thr
+        common_window = window_df.loc[row_ok]
+
+        if common_window.shape[0] < 2:
+            # Not enough common data in this window - use zeros
+            edge_corr = [0.0 for _ in edge_list]
+            node_pulse = {a: 0.0 for a in assets_list}
+        else:
+            # Critical: ensure column order matches assets_list (node order)
+            assert list(common_window.columns) == assets_list
+
+            # Compute correlation on dense window
+            if method in ("pearson", "spearman"):
+                C = common_window.corr(method=method).to_numpy()
+            elif method == "sign":
+                C = compute_sign_corr_dense(common_window)
+            else:  # partial
+                # LedoitWolf requires strictly dense data (no NaNs)
+                partial_window = common_window.dropna(axis=0, how="any")
+                if partial_window.shape[0] < 2:
+                    # Not enough data after dropna
+                    C = np.zeros((len(assets_list), len(assets_list)))
+                else:
+                    C = compute_partial_corr_dense(partial_window, partial_estimator, partial_standardize)
+
+            # Extract correlations for fixed edges - flat list of floats
+            edge_corr = []
+            for i, j in edge_list:
+                c = C[i, j]
+                edge_corr.append(float(c) if np.isfinite(c) else 0.0)
+
+            # Node pulse: rolling std
+            Xc = common_window.to_numpy()
+            node_vol = np.nanstd(Xc, axis=0)
+            node_pulse = {assets_list[i]: float(node_vol[i]) if np.isfinite(node_vol[i]) else 0.0
+                          for i in range(n)}
+
+        frames.append({
+            "t0": dates[start].strftime("%Y-%m-%d"),
+            "t1": dates[end-1].strftime("%Y-%m-%d"),
+            "edge_corr": edge_corr,
+            "node_pulse": node_pulse,
+        })
+
+    return frames
+
+
+# ============================================================================
+# CorGraph State and UI Helpers (for two-column layout with subtabs)
+# ============================================================================
+@dataclass
+class CorGraphState:
+    """Computed state for CorGraph visualization (dense matrix approach)."""
+    assets: list[str]           # Display asset list
+    asset_index: dict[str, int] # {asset_name: index} for O(1) lookup
+    corr_sub: pd.DataFrame      # Correlation matrix (dense)
+    n_common: int               # Number of common rows (replaces overlap)
+    threshold: float            # Computed |corr| threshold
+    edges: list[tuple]          # [(i, j, corr), ...] - no overlap in tuple
+    G: nx.Graph                 # NetworkX graph
+    pos: dict                   # {node_id: (x, y)}
+    node_meta: dict             # {node_id: {degree, asset, ...}}
+    mst_edge_set: set | None    # MST edges: {(min(i,j), max(i,j)), ...}
+    node2comm: dict | None      # {node_id: community_id}
+    comms: list | None          # List of community sets
+    n_display_assets: int       # Total assets available for slider range
+
+
+def compute_corgraph_state(filter_key: Any, cfg: dict, timings: dict) -> CorGraphState | None:
+    """Compute all CorGraph state from config using dense common-rows matrix.
+
+    Returns None if no data or < 2 common rows.
+    """
+    # 1. Get normalized daily PnL matrix
+    with timed_collect("corgraph_dfX", timings):
+        dfX, _ = compute_asset_daily_matrix(filter_key)
+
+    if dfX.empty:
+        return None
+
+    # 2. Select display assets (Top N by non-NaN counts, or All)
+    col_counts = dfX.notna().sum().sort_values(ascending=False)
+    n_display_assets = len(col_counts)
+
+    if cfg["asset_mode"] == "All":
+        display_assets = list(col_counts.index)
+    else:
+        display_assets = col_counts.head(cfg["top_n"]).index.tolist()
+
+    # 3. Build dense common-rows matrix
+    with timed_collect("corgraph_common", timings):
+        common_df = build_common_matrix(dfX, display_assets)
+
+    n_common = common_df.shape[0]
+    if n_common < 2:
+        return None  # Error case - not enough common data
+
+    # 3b. Rebuild asset list from common_df.columns (may be subset if some assets missing from dfX)
+    display_assets = list(common_df.columns)
+    asset_index = {a: i for i, a in enumerate(display_assets)}
+
+    # 4. Compute correlation on dense matrix
+    with timed_collect("corgraph_corr", timings):
+        if cfg["method"] in ("pearson", "spearman"):
+            corr_sub = common_df.corr(method=cfg["method"])
+        elif cfg["method"] == "sign":
+            C = compute_sign_corr_dense(common_df)
+            corr_sub = pd.DataFrame(C, index=common_df.columns, columns=common_df.columns)
+        else:  # partial
+            C = compute_partial_corr_dense(
+                common_df,
+                estimator=cfg["partial_estimator"],
+                standardize=cfg["partial_standardize"],
+            )
+            corr_sub = pd.DataFrame(C, index=common_df.columns, columns=common_df.columns)
+
+    # 5. Compute threshold + edges (conditional on edge_mode)
+    use_threshold = cfg["edge_mode"] in ("Threshold", "Threshold + MST")
+    use_mst = cfg["edge_mode"] in ("Threshold + MST", "MST only")
+
+    # Compute threshold only if needed
+    if use_threshold:
+        C = corr_sub.values
+        mask = np.triu(np.ones_like(C, dtype=bool), k=1)
+        finite = np.isfinite(C) & mask
+        absvals = np.abs(C[finite])
+        threshold = float(np.percentile(absvals, 100 - cfg["top_pct"])) if absvals.size else 0.0
+    else:
+        threshold = float("nan")  # MST-only mode
+
+    # 6. Compute threshold edges only if needed
+    edges = []
+    if use_threshold:
+        with timed_collect("corgraph_edges", timings):
+            _, edges = corr_to_edges_dense(
+                corr_sub,
+                min_abs_corr=threshold,
+                sign=cfg["sign"],
+                max_edges_per_node=cfg["max_edges"],
+            )
+
+    # 7. Build MST if requested
+    mst_edge_set = None
+    mst_edges_list = []
+    if use_mst:
+        with timed_collect("corgraph_mst", timings):
+            mst_edges_list = mst_edges_from_corr_dense(corr_sub.values)
+            mst_edge_set = {(min(i, j), max(i, j)) for i, j, _ in mst_edges_list}
+
+    # 8. Build final edge set based on mode
+    if cfg["edge_mode"] == "Threshold":
+        all_edges = list(edges)
+        mst_edge_set = None  # No MST styling in threshold-only mode
+    elif cfg["edge_mode"] == "MST only":
+        all_edges = [(i, j, c) for (i, j, c) in mst_edges_list]
+    else:  # "Threshold + MST"
+        all_edges = list(edges)
+        edge_set = {(min(e[0], e[1]), max(e[0], e[1])) for e in edges}
+        for i, j, c in mst_edges_list:
+            if (min(i, j), max(i, j)) not in edge_set:
+                all_edges.append((i, j, c))
+
+    # 9. Build graph + layout
+    with timed_collect("corgraph_graph", timings):
+
+        # Build graph
+        G = nx.Graph()
+        G.add_nodes_from(range(len(display_assets)))
+        for edge in all_edges:
+            i, j, c = edge[:3]
+            G.add_edge(i, j, weight=float(abs(c)), corr=float(c))
+
+        # Node metadata - compute PnL stats from dense matrix
+        node_meta = {}
+        for n in G.nodes():
+            asset = display_assets[n]
+            col = common_df[asset]
+            mean_pnl = col.mean()
+            std_pnl = col.std()
+            node_meta[n] = {
+                "degree": G.degree(n),
+                "asset": asset,
+                "mean_daily_pnl": float(mean_pnl),
+                "pnl_over_daily_vol": float(mean_pnl / std_pnl) if std_pnl > 0 else 0.0,
+            }
+
+    # 9. Layout
+    with timed_collect("corgraph_layout", timings):
+        if G.number_of_nodes() > 0:
+            pos = nx.spring_layout(G, seed=cfg["seed"], k=1.5/np.sqrt(max(G.number_of_nodes(), 1)))
+        else:
+            pos = {}
+
+    # 10. Communities (only on connected nodes to avoid weird isolate "communities")
+    node2comm, comms = None, None
+    if cfg["detect_communities"] and G.number_of_nodes() > 2:
+        with timed_collect("corgraph_communities", timings):
+            try:
+                H = G.subgraph([n for n in G.nodes() if G.degree(n) > 0]).copy()
+                if H.number_of_nodes() >= 3 and H.number_of_edges() > 0:
+                    comms = list(nx.community.greedy_modularity_communities(H))
+                    node2comm = {n: i for i, comm in enumerate(comms) for n in comm}
+            except Exception:
+                pass
+
+    return CorGraphState(
+        assets=display_assets,
+        asset_index=asset_index,
+        corr_sub=corr_sub,
+        n_common=n_common,
+        threshold=threshold,
+        edges=all_edges,
+        G=G,
+        pos=pos,
+        node_meta=node_meta,
+        mst_edge_set=mst_edge_set,
+        node2comm=node2comm,
+        comms=comms,
+        n_display_assets=n_display_assets,
+    )
+
+
+def render_corgraph_controls() -> dict:
+    """Render CorGraph controls (simplified - no overlap options).
+
+    Returns dict with all control values.
+    """
+    cfg = {}
+
+    # Row 1: Method + Top %
+    c1, c2 = st.columns(2)
+    cfg["method"] = c1.selectbox("Method", ["pearson", "spearman", "sign", "partial"], key="cg_method")
+    cfg["top_pct"] = c2.slider("Top %", 1, 50, 10, step=1, key="cg_top_pct")
+
+    # Row 2: Edges/node (moved up since min_overlap is gone)
+    cfg["max_edges"] = st.slider("Edges/node", 3, 30, 10, key="cg_max_edges")
+
+    # Row 3: Sign
+    cfg["sign"] = st.radio("Sign", ["both", "pos", "neg"], horizontal=True, key="cg_sign")
+
+    # Row 4: Checkboxes + Seed
+    c1, c2, c3 = st.columns(3)
+    cfg["show_labels"] = c1.checkbox("Labels", key="cg_labels")
+    cfg["edge_mode"] = c2.selectbox(
+        "Edges",
+        ["Threshold", "Threshold + MST", "MST only"],
+        index=1,  # default to "Threshold + MST"
+        key="cg_edge_mode",
+    )
+    cfg["seed"] = c3.number_input("Seed", 1, 999, 42, key="cg_seed")
+
+    # Row 5: Focus asset - uses session_state for last-known assets
+    # Include current focus in options even if stale (avoids session_state modification crash)
+    connected_assets = st.session_state.get("cg_connected_assets", [])
+    cur = st.session_state.get("cg_focus", "None")
+
+    opts = ["None"] + list(connected_assets)
+    if cur not in opts:
+        opts.append(cur)  # Keep stale selection so Streamlit doesn't crash
+
+    cfg["focus_asset"] = st.selectbox("Focus", opts, key="cg_focus", disabled=len(connected_assets) == 0)
+
+    # Asset Selection expander
+    with st.expander("Asset Selection", expanded=False):
+        # Get total asset count from session_state (last-known, like focus selector)
+        total_assets = st.session_state.get("cg_total_assets", 100)  # Default 100 until computed
+
+        cfg["asset_mode"] = st.radio("Mode", ["All", "Top N"], horizontal=True, key="cg_asset_mode")
+
+        # Slider always visible, "All" just sets to max
+        if cfg["asset_mode"] == "All":
+            cfg["top_n"] = total_assets
+            st.slider("N", 2, max(2, total_assets), total_assets, step=1, key="cg_top_n_display", disabled=True)
+        else:
+            default_n = min(60, total_assets) if total_assets > 2 else 2
+            cfg["top_n"] = st.slider("N", 2, max(2, total_assets), default_n, step=1, key="cg_top_n")
+
+    # Community Detection expander
+    with st.expander("Community Detection", expanded=False):
+        cfg["detect_communities"] = st.checkbox("Detect communities", key="cg_communities")
+        cfg["color_by_community"] = st.checkbox(
+            "Color by community", key="cg_color_comm",
+            disabled=not cfg["detect_communities"]
+        )
+
+    # Partial Options expander (simplified - no mask option, no NaN fill needed for dense matrix)
+    if cfg["method"] == "partial":
+        with st.expander("Partial Options", expanded=True):
+            cfg["partial_estimator"] = st.selectbox("Estimator", ["ledoitwolf", "oas", "ridge"], key="cg_partial_est")
+            cfg["partial_standardize"] = st.checkbox("Standardize", value=True, key="cg_partial_std")
+    else:
+        cfg["partial_estimator"] = "ledoitwolf"
+        cfg["partial_standardize"] = True
+
+    # Animation expander (always visible, note it only affects D3 Living)
+    with st.expander("Animation (D3 Living only)", expanded=False):
+        st.caption("These settings only affect the D3 Living tab")
+        cfg["anim_window"] = st.slider("Window (days)", 30, 120, 60, step=10, key="anim_window")
+        cfg["anim_step"] = st.slider("Step (days)", 1, 20, 5, key="anim_step")
+        cfg["anim_speed"] = st.slider("Speed (ms)", 200, 2000, 500, step=100, key="anim_speed")
+        cfg["anim_max_assets"] = st.slider("Max assets", 40, 120, 80, step=10, key="anim_max_assets")
+        cfg["anim_universe_m"] = st.slider("Edges/node", 4, 20, 10, step=2, key="anim_universe_m")
+
+        # D3 physics controls
+        st.divider()
+        st.caption("D3 physics")
+        cfg["anim_charge"] = st.slider("Charge", -500, 0, -180, step=20, key="anim_charge",
+            help="More negative = more repulsion between nodes.")
+        cfg["anim_collide"] = st.slider("Collide radius", 0, 30, 10, step=1, key="anim_collide",
+            help="Node collision radius.")
+        cfg["anim_reheat_alpha"] = st.slider("Reheat alpha", 0.3, 0.9, 0.7, step=0.05, key="anim_reheat_alpha",
+            help="How much to reheat simulation on frame change. Higher = more responsive, but can overshoot.")
+
+    return cfg
+
+
+def render_corgraph_metrics_strip(state: CorGraphState):
+    """Render compact metrics strip above visualization."""
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Nodes", f"{state.G.number_of_nodes():,}")
+    c2.metric("Edges", f"{state.G.number_of_edges():,}")
+    thr_text = "n/a" if not np.isfinite(state.threshold) else f"{state.threshold:.3f}"
+    c3.metric("Threshold", thr_text)
+    c4.metric("Common rows", f"{state.n_common:,}")
+    avg_deg = sum(d for _, d in state.G.degree()) / max(state.G.number_of_nodes(), 1)
+    c5.metric("Avg deg", f"{avg_deg:.1f}")
+
+
+def render_corgraph_plotly_view(state: CorGraphState, cfg: dict):
+    """Render Plotly correlation graph."""
+    focus_node = state.asset_index.get(cfg["focus_asset"]) if cfg["focus_asset"] != "None" else None
+
+    fig = render_corr_graph_plotly(
+        state.G, state.pos, state.assets,
+        node_meta=state.node_meta,
+        focus_node=focus_node,
+        show_labels=cfg["show_labels"],
+        node2comm=state.node2comm,
+        color_by_community=cfg["color_by_community"]
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+
+def render_corgraph_d3_interactive_view(state: CorGraphState, cfg: dict):
+    """Render D3 Interactive force graph."""
+    d3_nodes, d3_links = build_d3_graph_data(
+        state.G, state.assets, state.node_meta, state.mst_edge_set,
+        node2comm=state.node2comm if cfg["detect_communities"] else None
+    )
+
+    if len(d3_links) > 4000:
+        st.error(f"Too many edges ({len(d3_links):,}). Reduce edges/node.")
+        return
+
+    html = make_d3_force_html(
+        d3_nodes, d3_links,
+        height=650,
+        focus_asset=cfg["focus_asset"] if cfg["focus_asset"] != "None" else None,
+        show_labels=cfg["show_labels"],
+        color_by_community=cfg["color_by_community"]
+    )
+    components.html(html, height=670, scrolling=False)
+    st.caption("Drag nodes • Scroll to zoom • Drag background to pan")
+
+
+def render_corgraph_d3_animated_view(filter_key: Any, state: CorGraphState, cfg: dict, timings: dict):
+    """Render D3 Living animated network (pure D3 force-simulation, slider-driven).
+
+    Builds edge universe from state.corr_sub (NOT from pruned graph edges).
+    Layout is entirely D3-driven - no Python keyframe computation.
+    """
+    import zlib  # For stable deterministic hash
+
+    # Use animation-specific asset limit
+    anim_assets = state.assets[:cfg["anim_max_assets"]]
+    n_anim = len(anim_assets)
+
+    if n_anim < 3:
+        st.warning("Not enough assets for animation.")
+        return
+
+    # Build edge universe from dense correlation
+    anim_corr = state.corr_sub.loc[anim_assets, anim_assets]
+
+    with timed_collect("build_edge_universe", timings):
+        if cfg["edge_mode"] == "MST only":
+            # MST-only: just compute MST on anim_corr (ignore top_m)
+            mst_edges = mst_edges_from_corr_dense(anim_corr.values)
+            edge_universe = sorted({(min(i, j), max(i, j)) for (i, j, _) in mst_edges})
+        else:
+            # Threshold or Threshold+MST: use build_edge_universe_dense
+            use_mst = cfg["edge_mode"] == "Threshold + MST"
+            _, edge_universe = build_edge_universe_dense(
+                anim_corr,
+                top_m=cfg["anim_universe_m"],
+                use_mst=use_mst,
+            )
+
+    # Guard for empty edge universe
+    if len(edge_universe) == 0:
+        st.warning("Edge universe is empty. Try increasing 'Edges/node' in Animation settings.")
+        return
+
+    st.caption(f"{n_anim} assets, {len(edge_universe)} edges in universe, {state.n_common} common rows")
+
+    # Compute frame correlations (no keyframes needed - D3 is the only layout engine)
+    try:
+        with timed_collect("compute_corr_frames_dense", timings):
+            anim_frames = compute_corr_frames_dense(
+                filter_key=filter_key,
+                assets=tuple(anim_assets),
+                edge_list=tuple(edge_universe),
+                method=cfg["method"],
+                window_days=cfg["anim_window"],
+                step_days=cfg["anim_step"],
+                partial_estimator=cfg["partial_estimator"],
+                partial_standardize=cfg["partial_standardize"],
+            )
+    except Exception as e:
+        st.error(f"Animation frame computation failed: {type(e).__name__}")
+        st.exception(e)
+        return
+
+    if not anim_frames:
+        st.warning("No frames generated.")
+        return
+
+    st.caption(f"frames={len(anim_frames)}")
+
+    # Build nodes with DETERMINISTIC initial positions from state.pos
+    # (Critical: iframe reloads on any Streamlit rerun)
+    pos_by_asset = {state.assets[i]: state.pos[i] for i in state.pos.keys() if i < len(state.assets)}
+
+    # Scale positions to pixel coordinates
+    if pos_by_asset:
+        xs = [p[0] for p in pos_by_asset.values()]
+        ys = [p[1] for p in pos_by_asset.values()]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+    else:
+        x_min, x_max, y_min, y_max = 0, 1, 0, 1
+
+    margin = 80
+    anim_width = 900
+    anim_height = 650
+
+    def scale_pos(p):
+        x = margin + (p[0] - x_min) / (x_max - x_min + 1e-9) * (anim_width - 2*margin)
+        y = margin + (p[1] - y_min) / (y_max - y_min + 1e-9) * (anim_height - 2*margin)
+        return (x, y)
+
+    def stable_hash_pos(asset: str) -> tuple[float, float]:
+        """Deterministic fallback position using stable hash (not Python's salted hash)."""
+        h = zlib.adler32(asset.encode("utf-8"))
+        px = anim_width / 2 + (h % 200 - 100)
+        py = anim_height / 2 + ((h // 200) % 200 - 100)
+        return px, py
+
+    anim_nodes = []
+    for i, asset in enumerate(anim_assets):
+        deg = sum(1 for a, b in edge_universe if a == i or b == i)
+
+        # Initial position from full-period layout (if available), else stable fallback
+        if asset in pos_by_asset:
+            px, py = scale_pos(pos_by_asset[asset])
+        else:
+            px, py = stable_hash_pos(asset)
+
+        anim_nodes.append({
+            "id": asset,
+            "x": px,
+            "y": py,
+            "degree": deg,
+        })
+
+    # Build edge list for D3 (CRITICAL: maintain index alignment with frames)
+    d3_edges = [{"source": anim_assets[i], "target": anim_assets[j]} for i, j in edge_universe]
+
+    # Render living force-directed network (pure D3, no keyframes)
+    with timed_collect("render_d3_animated", timings):
+        html = make_d3_animated_html(
+            nodes=anim_nodes,
+            edge_list=d3_edges,
+            frames=anim_frames,
+            height=650,
+            show_labels=cfg["show_labels"],
+            play_speed_ms=cfg["anim_speed"],
+            charge=cfg["anim_charge"],
+            collide=cfg["anim_collide"],
+            reheat_alpha=cfg["anim_reheat_alpha"],
+            weight_power=WEIGHT_POWER,
+        )
+        components.html(html, height=720, scrolling=False)
+
+    st.caption(f"Frames: {len(anim_frames)} | Edges: {len(edge_universe)}")
 
 
 def detect_communities(G: nx.Graph, seed: int = 42) -> tuple[dict, list]:
@@ -1339,7 +2261,6 @@ def build_d3_graph_data(G: nx.Graph, assets: list, node_meta: dict,
     links = []
     for u, v, data in G.edges(data=True):
         corr = data.get("corr", 0)
-        overlap = data.get("overlap", 0)
         # Normalize edge key for MST lookup
         edge_key = (min(u, v), max(u, v))
         is_mst = mst_edge_set is not None and edge_key in mst_edge_set
@@ -1348,7 +2269,6 @@ def build_d3_graph_data(G: nx.Graph, assets: list, node_meta: dict,
             "target": assets[v],
             "corr": float(corr),
             "strength": abs(float(corr)),
-            "overlap": int(overlap),
             "mst": is_mst,
         })
 
@@ -1582,20 +2502,28 @@ function drag(simulation) {{
 
 
 def make_d3_animated_html(
-    nodes: list,
-    frames: list,
+    nodes: list,           # [{"id": str, "x": float, "y": float, "degree": int}, ...]
+    edge_list: list,       # [{"source": str, "target": str}, ...]
+    frames: list,          # [{edge_corr: [...], node_pulse: {...}, t0: str, t1: str}, ...]
     height: int = 700,
     show_labels: bool = False,
     play_speed_ms: int = 500,
+    charge: int = -180,
+    collide: int = 10,
+    reheat_alpha: float = 0.7,
+    weight_power: float = 1.6,
 ) -> str:
-    """Generate D3 HTML for animated correlation network.
+    """Generate D3 HTML for living force-directed correlation network.
 
-    nodes: list of dicts with id, x, y, degree, coverage, etc.
-    frames: list of frame dicts from compute_corr_frames
+    Pure slider-driven: D3 is the ONLY layout engine. No keyframes, no target positions.
+    - Slider changes edge weights (correlations)
+    - Simulation reheats and settles naturally
+    - Edge strength/distance drive layout entirely
     """
     import json
 
     nodes_json = json.dumps(nodes)
+    edges_json = json.dumps(edge_list)
     frames_json = json.dumps(frames)
 
     html = f'''
@@ -1606,38 +2534,180 @@ def make_d3_animated_html(
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   body {{ margin: 0; font-family: -apple-system, sans-serif; }}
-  .controls {{ padding: 10px; background: #f5f5f5; display: flex; align-items: center; gap: 15px; }}
+  .controls {{ padding: 10px; background: #f5f5f5; display: flex; flex-direction: column; gap: 8px; }}
   .controls button {{ padding: 8px 16px; font-size: 14px; cursor: pointer; }}
   .controls input[type="range"] {{ width: 300px; }}
-  .frame-info {{ font-size: 14px; color: #333; min-width: 280px; }}
+  .frame-info {{ font-size: 14px; color: #333; min-width: 200px; }}
   .link {{ fill: none; }}
-  .link.positive {{ stroke: #2ca02c; }}
-  .link.negative {{ stroke: #d62728; }}
-  .node {{ stroke: #fff; stroke-width: 1.5px; cursor: pointer; }}
+  .node {{ stroke: #fff; stroke-width: 1.5px; cursor: grab; }}
+  .node:active {{ cursor: grabbing; }}
   .node-label {{ font-size: 9px; text-anchor: middle; pointer-events: none; }}
   .tooltip {{ position: absolute; background: rgba(0,0,0,0.8); color: white;
               padding: 8px 12px; border-radius: 4px; font-size: 12px; pointer-events: none; }}
+  .wrap {{ display:flex; width:100%; height: {height}px; }}
+  #graph {{ flex: 1 1 auto; min-width: 0; }}
+  #side {{ width: 280px; border-left: 1px solid #ddd; background:#fff; padding:10px; overflow-y:auto; flex-shrink:0; }}
+  .side-title {{ font-size:12px; font-weight:600; color:#444; margin:6px 0; }}
+  .side-meta {{ font-size:12px; color:#333; margin-bottom:8px; }}
+  .side-list {{ font-size:12px; }}
+  .side-row {{ display:flex; gap:8px; padding:3px 0; border-bottom:1px solid #f0f0f0; }}
+  .side-row .lhs {{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .side-row .rhs {{ width:50px; text-align:right; font-variant-numeric: tabular-nums; white-space:nowrap; }}
+  .side-row.pos {{ color: #26a69a; }}
+  .side-row.neg {{ color: #ef5350; }}
+  .side-row.side-header {{ color:#666; border-bottom:2px solid #ddd; }}
 </style>
 </head>
 <body>
 <div class="controls">
-  <button id="playPause">Play</button>
-  <input type="range" id="frameSlider" min="0" max="0" value="0">
-  <span class="frame-info" id="frameInfo">Loading...</span>
-  <label><input type="checkbox" id="showLabels" {"checked" if show_labels else ""}> Labels</label>
+  <!-- Line 1: Play and slider -->
+  <div style="display:flex;align-items:center;gap:15px;width:100%;">
+    <button id="playPause">Play</button>
+    <input type="range" id="frameSlider" min="0" max="0" value="0" style="flex:1;max-width:400px;">
+    <label style="display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="frameRelink">
+      FrameRelink
+    </label>
+    <span class="frame-info" id="frameInfo">Loading...</span>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="freeze">
+      Freeze
+    </label>
+  </div>
+  <!-- Line 2: Buttons -->
+  <div style="display:flex;align-items:center;gap:10px;width:100%;">
+    <button id="relayout">Re-layout</button>
+    <button id="kickBtn">Kick</button>
+    <button id="noSpeed">NoSpeed</button>
+    <button id="heatUp">Heat up</button>
+    <button id="relink">Re-link</button>
+  </div>
+  <!-- Line 3: All sliders -->
+  <div style="display:flex;align-items:center;gap:15px;width:100%;flex-wrap:wrap;">
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">Kick</span>
+      <input type="range" id="kickStrength" min="0" max="500" step="1" value="2" style="width:140px;">
+      <span id="kickVal" style="font-size:12px;color:#555;min-width:40px;text-align:right;">2</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">Smooth</span>
+      <input type="range" id="corrSmooth" min="0.0" max="1.0" step="0.01" value="0.08" style="width:100px;">
+      <span id="corrSmoothVal" style="font-size:12px;color:#555;min-width:36px;text-align:right;">0.08</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">αDecay</span>
+      <input type="range" id="alphaDecay" min="0" max="0.1" step="0.001" value="0.02" style="width:100px;">
+      <span id="alphaDecayVal" style="font-size:12px;color:#555;min-width:44px;text-align:right;">0.020</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">αMin</span>
+      <input type="range" id="alphaMin" min="0.0001" max="0.02" step="0.0001" value="0.001" style="width:100px;">
+      <span id="alphaMinVal" style="font-size:12px;color:#555;min-width:50px;text-align:right;">0.0010</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">αTarget</span>
+      <input type="range" id="alphaTarget" min="0.0" max="1.0" step="0.01" value="0.0" style="width:100px;">
+      <span id="alphaTargetVal" style="font-size:12px;color:#555;min-width:36px;text-align:right;">0.00</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">lenMin</span>
+      <input type="range" id="lengthMin" min="5" max="200" step="1" value="40" style="width:80px;">
+      <span id="lengthMinVal" style="font-size:12px;color:#555;min-width:30px;text-align:right;">40</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">lenSlope</span>
+      <input type="range" id="lengthSlope" min="0" max="800" step="5" value="260" style="width:80px;">
+      <span id="lengthSlopeVal" style="font-size:12px;color:#555;min-width:30px;text-align:right;">260</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">strMin</span>
+      <input type="range" id="strengthMin" min="0" max="0.2" step="0.005" value="0.02" style="width:80px;">
+      <span id="strengthMinVal" style="font-size:12px;color:#555;min-width:36px;text-align:right;">0.020</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">strSlope</span>
+      <input type="range" id="strengthSlope" min="0" max="1.0" step="0.01" value="0.23" style="width:80px;">
+      <span id="strengthSlopeVal" style="font-size:12px;color:#555;min-width:36px;text-align:right;">0.23</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:12px;color:#555;">strPow</span>
+      <input type="range" id="strengthPower" min="0.2" max="4.0" step="0.1" value="1.6" style="width:80px;">
+      <span id="strengthPowerVal" style="font-size:12px;color:#555;min-width:30px;text-align:right;">1.6</span>
+    </label>
+  </div>
 </div>
-<div id="graph"></div>
+<div class="wrap">
+  <div id="graph"></div>
+  <div id="side">
+    <div class="side-title">Selection</div>
+    <div id="selMeta" class="side-meta">Click a node…</div>
+    <div class="side-title">Correlations (neighbors)</div>
+    <div id="corrList" class="side-list"></div>
+  </div>
+</div>
 <div class="tooltip" id="tooltip" style="display:none;"></div>
 
 <script>
 const nodes = {nodes_json};
+const edges = {edges_json};
 const frames = {frames_json};
 const playSpeedMs = {play_speed_ms};
+const reheatAlpha = {reheat_alpha};
+const showLabels = {"true" if show_labels else "false"};
+
+// Physics params (injected from Python — single source of truth)
+const WEIGHT_POWER = {weight_power};
+const CHARGE = {charge};
+const COLLIDE = {collide};
+
+// Link physics parameters (live-adjustable via sliders)
+let lengthMin = 40;
+let lengthSlope = 260;
+let strengthMin = 0.02;
+let strengthSlope = 0.23;
+let strengthPower = WEIGHT_POWER;
+
+// Safe correlation clamping: handles NaN, out-of-range
+function abs01(x) {{
+  if (!Number.isFinite(x)) return 0;
+  const a = Math.abs(x);
+  return Math.max(0, Math.min(1, a));
+}}
+
+// Build links with index alignment (CRITICAL: frames[idx].edge_corr[i] corresponds to links[i])
+const links = edges.map((e, i) => ({{
+  source: e.source,
+  target: e.target,
+  index: i,
+  corr: 0,
+  targetCorr: 0,
+}}));
+
+// Build adjacency: id -> array of link indices (for side panel)
+const adj = new Map();
+for (const n of nodes) adj.set(n.id, []);
+for (let i = 0; i < links.length; i++) {{
+  const s = links[i].source;
+  const t = links[i].target;
+  adj.get(s).push(i);
+  adj.get(t).push(i);
+}}
+
+// Helper: get node id from source/target (handles D3 object mutation)
+function nid(x) {{ return (typeof x === "object") ? x.id : x; }}
+
+// Sanity check: verify frame/edge alignment at startup
+if (frames.length > 0 && frames[0].edge_corr.length !== edges.length) {{
+  document.getElementById("frameInfo").innerHTML =
+    `<span style="color:red;font-weight:bold">ERROR: edge_corr.length (${{frames[0].edge_corr.length}}) ≠ edges.length (${{edges.length}})</span>`;
+}}
 
 if (frames.length === 0) {{
   document.getElementById('frameInfo').textContent = 'No frames available';
 }} else {{
-  const width = window.innerWidth;
+  // Use container bbox width instead of window.innerWidth (iframe-safe)
+  const bbox = document.getElementById("graph").getBoundingClientRect();
+  const width = (bbox.width > 10) ? bbox.width : window.innerWidth;
   const height = {height};
 
   const svg = d3.select("#graph")
@@ -1652,45 +2722,136 @@ if (frames.length === 0) {{
     .scaleExtent([0.1, 4])
     .on("zoom", (event) => g.attr("transform", event.transform)));
 
-  // Create node map for fast lookup
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
-
   // Links group (below nodes)
   const linkGroup = g.append("g").attr("class", "links");
-
-  // Nodes group
   const nodeGroup = g.append("g").attr("class", "nodes");
 
-  // Draw nodes (fixed positions)
-  const nodeSelection = nodeGroup.selectAll(".node")
+  // Draw links (persistent - never removed)
+  const linkSelection = linkGroup.selectAll("line")
+    .data(links)
+    .join("line")
+    .attr("class", "link")
+    .attr("stroke", "#ccc")
+    .attr("stroke-width", 1)
+    .attr("opacity", 0);
+
+  // Base radius function
+  function baseRadius(d) {{
+    return 6 + Math.sqrt(d.degree || 1) * 1.5;
+  }}
+
+  // Draw nodes
+  const nodeSelection = nodeGroup.selectAll("circle")
     .data(nodes)
     .join("circle")
     .attr("class", "node")
-    .attr("cx", d => d.x)
-    .attr("cy", d => d.y)
-    .attr("r", d => 4 + Math.sqrt(d.degree || 1) * 2)
+    .attr("r", baseRadius)
     .attr("fill", "#1f77b4")
     .on("mouseover", showTooltip)
-    .on("mouseout", hideTooltip);
+    .on("mouseout", hideTooltip)
+    .on("click", (event, d) => selectNode(d.id));
 
-  // Labels
-  const labelSelection = nodeGroup.selectAll(".node-label")
+  // Labels (controlled by sidebar setting)
+  const labelSelection = nodeGroup.selectAll("text")
     .data(nodes)
     .join("text")
     .attr("class", "node-label")
-    .attr("x", d => d.x)
-    .attr("y", d => d.y - 10)
+    .attr("dy", -12)
     .text(d => d.id)
-    .style("display", document.getElementById("showLabels").checked ? "block" : "none");
+    .style("display", showLabels ? "block" : "none");
 
-  document.getElementById("showLabels").addEventListener("change", (e) => {{
-    labelSelection.style("display", e.target.checked ? "block" : "none");
-  }});
+  // Link physics helper functions (use live slider parameters)
+  function linkRestLen(c) {{
+    const a = abs01(c);
+    return lengthMin + lengthSlope * (1 - a);
+  }}
+
+  function linkStrength(c) {{
+    const a = abs01(c);
+    return strengthMin + strengthSlope * Math.pow(a, strengthPower);
+  }}
+
+  // Force simulation - NO forceX/forceY targets (pure D3)
+  const linkForce = d3.forceLink(links)
+    .id(d => d.id)
+    .distance(d => linkRestLen(d.corr))
+    .strength(d => linkStrength(d.corr));
+
+  const simulation = d3.forceSimulation(nodes)
+    .force("link", linkForce)
+    .force("charge", d3.forceManyBody().strength(CHARGE))
+    .force("center", d3.forceCenter(width / 2, height / 2))
+    .force("collide", d3.forceCollide(COLLIDE))
+    .alphaDecay(0.02)
+    .on("tick", tick);
+
+  // Attach drag
+  nodeSelection.call(drag(simulation));
+
+  // One-shot render for frozen mode (updates visuals without physics)
+  function renderEdgesAndNodes() {{
+    linkSelection
+      .attr("x1", d => d.source.x)
+      .attr("y1", d => d.source.y)
+      .attr("x2", d => d.target.x)
+      .attr("y2", d => d.target.y)
+      .attr("stroke", d => d.corr >= 0 ? "#26a69a" : "#ef5350")
+      .attr("stroke-width", d => 1 + 3 * abs01(d.corr))
+      .attr("opacity", d => {{
+        const a = abs01(d.corr);
+        return a < 0.05 ? 0 : Math.pow((a - 0.05) / 0.95, 1.3) * 0.8;
+      }});
+  }}
+
+  function tick() {{
+    // Per-tick smoothing of edge weights toward target (controlled by Smooth slider)
+    links.forEach(d => {{
+      d.corr += corrSmooth * (d.targetCorr - d.corr);
+      // Snap when close enough to ensure exact convergence
+      if (Math.abs(d.targetCorr - d.corr) < 1e-4) d.corr = d.targetCorr;
+    }});
+
+    // Update link visuals
+    linkSelection
+      .attr("x1", d => d.source.x)
+      .attr("y1", d => d.source.y)
+      .attr("x2", d => d.target.x)
+      .attr("y2", d => d.target.y)
+      .attr("stroke", d => d.corr >= 0 ? "#26a69a" : "#ef5350")
+      .attr("stroke-width", d => 1 + 3 * abs01(d.corr))
+      .attr("opacity", d => {{
+        const a = abs01(d.corr);
+        return a < 0.05 ? 0 : Math.pow((a - 0.05) / 0.95, 1.3) * 0.8;
+      }});
+
+    nodeSelection
+      .attr("cx", d => d.x)
+      .attr("cy", d => d.y);
+
+    labelSelection
+      .attr("x", d => d.x)
+      .attr("y", d => d.y);
+
+    // Refresh side panel with live position/velocity data
+    refreshSidePanel();
+  }}
 
   // Animation state
   let currentFrame = 0;
   let playing = false;
   let playInterval = null;
+  let selectedId = null;
+  let corrSmooth = 0.08;  // correlation smoothing factor (controlled by Smooth slider)
+
+  // Throttled side panel refresh (max 10x/sec during ticks)
+  let lastSideRefresh = 0;
+  function refreshSidePanel() {{
+    if (!selectedId) return;
+    const now = performance.now();
+    if (now - lastSideRefresh < 100) return;
+    lastSideRefresh = now;
+    selectNode(selectedId);
+  }}
 
   const slider = document.getElementById("frameSlider");
   slider.max = frames.length - 1;
@@ -1698,62 +2859,297 @@ if (frames.length === 0) {{
   function updateFrame(idx) {{
     currentFrame = idx;
     const frame = frames[idx];
-
-    // Update info
-    document.getElementById("frameInfo").textContent =
-      `${{frame.t0}} → ${{frame.t1}} | Threshold: |corr| ≥ ${{frame.threshold.toFixed(3)}} | Edges: ${{frame.edges.length}}`;
     slider.value = idx;
 
-    // Update links
-    const links = linkGroup.selectAll(".link")
-      .data(frame.edges, d => d.source + "|" + d.target);
+    // Update info display
+    document.getElementById("frameInfo").textContent = `${{frame.t0}} → ${{frame.t1}}`;
 
-    links.exit().remove();
+    // Update target correlations (index-aligned!)
+    frame.edge_corr.forEach((c, i) => {{
+      links[i].targetCorr = c;
+    }});
 
-    links.enter()
-      .append("line")
-      .attr("class", d => "link " + (d.corr >= 0 ? "positive" : "negative"))
-      .attr("x1", d => nodeMap.get(d.source)?.x || 0)
-      .attr("y1", d => nodeMap.get(d.source)?.y || 0)
-      .attr("x2", d => nodeMap.get(d.target)?.x || 0)
-      .attr("y2", d => nodeMap.get(d.target)?.y || 0)
-      .attr("stroke-width", d => 1 + d.strength * 3)
-      .attr("opacity", d => 0.3 + d.strength * 0.5);
+    // If FrameRelink is checked, immediately snap corr and reinitialize link force
+    if (document.getElementById("frameRelink").checked) {{
+      links.forEach(d => {{ d.corr = d.targetCorr; }});
+      linkForce.links(links);
+      nodes.forEach(n => {{ n.vx = 0; n.vy = 0; }});
+    }}
 
-    links
-      .attr("class", d => "link " + (d.corr >= 0 ? "positive" : "negative"))
-      .attr("x1", d => nodeMap.get(d.source)?.x || 0)
-      .attr("y1", d => nodeMap.get(d.source)?.y || 0)
-      .attr("x2", d => nodeMap.get(d.target)?.x || 0)
-      .attr("y2", d => nodeMap.get(d.target)?.y || 0)
-      .attr("stroke-width", d => 1 + d.strength * 3)
-      .attr("opacity", d => 0.3 + d.strength * 0.5);
+    // Update node sizes from pulse
+    const maxPulse = Math.max(...Object.values(frame.node_pulse), 0.001);
+    nodeSelection.attr("r", d => {{
+      const pulse = frame.node_pulse[d.id] || 0;
+      return baseRadius(d) * (1 + 0.4 * pulse / maxPulse);
+    }});
 
-    // Update node sizes based on pulse (volatility)
-    const maxPulse = Math.max(...Object.values(frame.node_meta).map(m => m.pulse || 0), 0.001);
-    nodeSelection
-      .transition()
-      .duration(200)
-      .attr("r", d => {{
-        const pulse = frame.node_meta[d.id]?.pulse || 0;
-        const base = 4 + Math.sqrt(d.degree || 1) * 2;
-        return base * (1 + pulse / maxPulse * 0.5);
-      }});
+    // Handle frozen vs normal mode
+    const frozen = document.getElementById("freeze").checked;
+    if (frozen) {{
+      // Immediately apply corr, render once (no physics)
+      links.forEach(d => {{ d.corr = d.targetCorr; }});
+      renderEdgesAndNodes();
+    }} else {{
+      // Normal: reheat simulation (alphaDecay handles cooling)
+      simulation.alpha(Math.min(reheatAlpha, 0.9)).restart();
+    }}
+
+    // Update side panel if a node is selected
+    if (selectedId) selectNode(selectedId);
   }}
 
   function showTooltip(event, d) {{
     const frame = frames[currentFrame];
-    const meta = frame.node_meta[d.id] || {{}};
+    const pulse = frame.node_pulse[d.id] || 0;
     document.getElementById("tooltip").innerHTML =
-      `<strong>${{d.id}}</strong><br>Degree: ${{d.degree || 0}}<br>Coverage: ${{d.coverage || 0}} days<br>Pulse: ${{(meta.pulse || 0).toFixed(4)}}`;
+      `<strong>${{d.id}}</strong><br>Degree: ${{d.degree || 0}}<br>Pulse: ${{pulse.toFixed(4)}}`;
     document.getElementById("tooltip").style.display = "block";
-    document.getElementById("tooltip").style.left = (event.pageX + 10) + "px";
-    document.getElementById("tooltip").style.top = (event.pageY + 10) + "px";
+    document.getElementById("tooltip").style.left = (event.clientX + 10) + "px";
+    document.getElementById("tooltip").style.top = (event.clientY + 10) + "px";
   }}
 
   function hideTooltip() {{
     document.getElementById("tooltip").style.display = "none";
   }}
+
+  // Side panel: show node info and neighbor correlations
+  function selectNode(id) {{
+    selectedId = id;
+
+    // Highlight selected node in red, others default blue
+    nodeSelection.attr("fill", d => d.id === id ? "#e53935" : "#1f77b4");
+
+    // Find the node object for position/velocity
+    const node = nodes.find(n => n.id === id);
+
+    // Meta info
+    const frame = frames[currentFrame];
+    const pulse = frame.node_pulse[id] ?? 0;
+    const deg = adj.get(id)?.length ?? 0;
+
+    document.getElementById("selMeta").innerHTML =
+      `<div><b>${{id}}</b></div>` +
+      `<div>degree: ${{deg}}, pulse: ${{Number(pulse).toFixed(4)}}</div>` +
+      `<div>frame: ${{frame.t0}} → ${{frame.t1}}</div>` +
+      `<div>X: ${{(node?.x ?? 0).toFixed(1)}}, Y: ${{(node?.y ?? 0).toFixed(1)}}</div>` +
+      `<div>dX: ${{(node?.vx ?? 0).toFixed(2)}}, dY: ${{(node?.vy ?? 0).toFixed(2)}}</div>`;
+
+    // Correlations to neighbors
+    const idxs = adj.get(id) || [];
+    const rows = [];
+
+    for (const li of idxs) {{
+      const L = links[li];
+      const s = nid(L.source);
+      const t = nid(L.target);
+      const other = (s === id) ? t : s;
+      const dx = L.source.x - L.target.x;
+      const dy = L.source.y - L.target.y;
+      rows.push({{ other, cor: L.corr, tcor: L.targetCorr, dist: Math.hypot(dx, dy), abs: Math.abs(L.targetCorr) }});
+    }}
+
+    rows.sort((a, b) => b.abs - a.abs);
+
+    const maxShow = 50;
+    // Header row
+    let html = `<div class="side-row side-header">
+      <div class="lhs"><b>asset</b></div>
+      <div class="rhs"><b>cor</b></div>
+      <div class="rhs"><b>tcor</b></div>
+      <div class="rhs"><b>dist</b></div>
+    </div>`;
+    html += rows.slice(0, maxShow).map(r => {{
+      const cls = r.tcor >= 0 ? "pos" : "neg";
+      return `<div class="side-row ${{cls}}">
+        <div class="lhs">${{r.other}}</div>
+        <div class="rhs">${{r.cor.toFixed(3)}}</div>
+        <div class="rhs">${{r.tcor.toFixed(3)}}</div>
+        <div class="rhs">${{r.dist.toFixed(1)}}</div>
+      </div>`;
+    }}).join("");
+
+    document.getElementById("corrList").innerHTML =
+      html || `<div class="side-meta">No neighbor edges.</div>`;
+  }}
+
+  // Drag behavior
+  function drag(sim) {{
+    return d3.drag()
+      .on("start", (event, d) => {{
+        if (!event.active) sim.alphaTarget(0.3).restart();
+        d.fx = d.x; d.fy = d.y;
+      }})
+      .on("drag", (event, d) => {{
+        d.fx = event.x; d.fy = event.y;
+      }})
+      .on("end", (event, d) => {{
+        if (!event.active) sim.alphaTarget(0);
+        d.fx = null; d.fy = null;
+      }});
+  }}
+
+  // Freeze toggle
+  document.getElementById("freeze").addEventListener("change", (e) => {{
+    if (e.target.checked) {{
+      simulation.alpha(0).stop();
+    }} else {{
+      simulation.alpha(reheatAlpha).restart();
+    }}
+  }});
+
+  // Re-layout button (randomize + restart)
+  document.getElementById("relayout").addEventListener("click", () => {{
+    nodes.forEach(d => {{
+      d.x = width/2 + (Math.random() - 0.5) * 400;
+      d.y = height/2 + (Math.random() - 0.5) * 300;
+    }});
+    document.getElementById("freeze").checked = false;
+    simulation.alpha(1).restart();
+  }});
+
+  // Heat up button (inject energy without changing positions)
+  document.getElementById("heatUp").addEventListener("click", () => {{
+    document.getElementById("freeze").checked = false;
+    simulation.alpha(1).restart();
+  }});
+
+  // Kick strength UI
+  const kickStrengthEl = document.getElementById("kickStrength");
+  const kickValEl = document.getElementById("kickVal");
+
+  // Keep the numeric label in sync
+  kickValEl.textContent = Number(kickStrengthEl.value).toFixed(0);
+  kickStrengthEl.addEventListener("input", () => {{
+    kickValEl.textContent = Number(kickStrengthEl.value).toFixed(0);
+  }});
+
+  // Kick (velocity-only, strength from slider, scaled by canvas + node count)
+  document.getElementById("kickBtn").addEventListener("click", () => {{
+    document.getElementById("freeze").checked = false;
+
+    const kUser = Number(kickStrengthEl.value) || 0; // 0..500
+    // Scale so it feels similar across sizes / N
+    const amp = kUser * 0.02 * Math.min(width, height) / Math.sqrt(nodes.length);
+
+    for (const n of nodes) {{
+      n.vx = (n.vx || 0) + (Math.random() - 0.5) * amp;
+      n.vy = (n.vy || 0) + (Math.random() - 0.5) * amp;
+    }}
+
+    simulation.alpha(1).restart();
+  }});
+
+  // Re-link (reinitialize link force internals for debugging)
+  document.getElementById("relink").addEventListener("click", () => {{
+    // Force immediate corr application
+    links.forEach(d => {{ d.corr = d.targetCorr; }});
+
+    // Recompute link force internals
+    linkForce.links(links);
+
+    // Remove inertia from earlier states
+    nodes.forEach(n => {{ n.vx = 0; n.vy = 0; }});
+
+    // Reheat
+    document.getElementById("freeze").checked = false;
+    simulation.alpha(0.9).restart();
+  }});
+
+  // NoSpeed (zero all velocities)
+  document.getElementById("noSpeed").addEventListener("click", () => {{
+    nodes.forEach(n => {{ n.vx = 0; n.vy = 0; }});
+  }});
+
+  // --- Alpha controls ---
+  const alphaDecayEl = document.getElementById("alphaDecay");
+  const alphaMinEl   = document.getElementById("alphaMin");
+  const alphaTargetEl= document.getElementById("alphaTarget");
+
+  const alphaDecayValEl  = document.getElementById("alphaDecayVal");
+  const alphaMinValEl    = document.getElementById("alphaMinVal");
+  const alphaTargetValEl = document.getElementById("alphaTargetVal");
+
+  function syncAlphaUI() {{
+    alphaDecayValEl.textContent  = Number(alphaDecayEl.value).toFixed(3);
+    alphaMinValEl.textContent    = Number(alphaMinEl.value).toFixed(4);
+    alphaTargetValEl.textContent = Number(alphaTargetEl.value).toFixed(2);
+  }}
+  syncAlphaUI();
+
+  // Apply initial values
+  simulation.alphaDecay(Number(alphaDecayEl.value));
+  simulation.alphaMin(Number(alphaMinEl.value));
+  simulation.alphaTarget(Number(alphaTargetEl.value));
+
+  alphaDecayEl.addEventListener("input", () => {{
+    syncAlphaUI();
+    simulation.alphaDecay(Number(alphaDecayEl.value));
+    if (!document.getElementById("freeze").checked) simulation.alpha(Math.max(simulation.alpha(), 0.05)).restart();
+  }});
+
+  alphaMinEl.addEventListener("input", () => {{
+    syncAlphaUI();
+    simulation.alphaMin(Number(alphaMinEl.value));
+    if (!document.getElementById("freeze").checked) simulation.alpha(Math.max(simulation.alpha(), 0.05)).restart();
+  }});
+
+  alphaTargetEl.addEventListener("input", () => {{
+    syncAlphaUI();
+    simulation.alphaTarget(Number(alphaTargetEl.value));
+    if (!document.getElementById("freeze").checked) simulation.alpha(Math.max(simulation.alpha(), 0.05)).restart();
+  }});
+
+  // Corr smoothing UI (JS-only, no Streamlit reruns)
+  const corrSmoothEl = document.getElementById("corrSmooth");
+  const corrSmoothValEl = document.getElementById("corrSmoothVal");
+
+  function syncCorrSmoothUI() {{
+    corrSmooth = Number(corrSmoothEl.value);
+    if (!Number.isFinite(corrSmooth)) corrSmooth = 0.08;
+    corrSmoothValEl.textContent = corrSmooth.toFixed(2);
+  }}
+  syncCorrSmoothUI();
+
+  corrSmoothEl.addEventListener("input", () => {{
+    syncCorrSmoothUI();
+    if (!document.getElementById("freeze").checked) {{
+      simulation.alpha(Math.max(simulation.alpha(), 0.05)).restart();
+    }}
+  }});
+
+  // Link physics sliders (lenMin, lenSlope, strMin, strSlope, strPow)
+  const lengthMinEl = document.getElementById("lengthMin");
+  const lengthSlopeEl = document.getElementById("lengthSlope");
+  const strengthMinEl = document.getElementById("strengthMin");
+  const strengthSlopeEl = document.getElementById("strengthSlope");
+  const strengthPowerEl = document.getElementById("strengthPower");
+
+  function updateLinkParams() {{
+    lengthMin = Number(lengthMinEl.value);
+    lengthSlope = Number(lengthSlopeEl.value);
+    strengthMin = Number(strengthMinEl.value);
+    strengthSlope = Number(strengthSlopeEl.value);
+    strengthPower = Number(strengthPowerEl.value);
+
+    document.getElementById("lengthMinVal").textContent = lengthMin.toFixed(0);
+    document.getElementById("lengthSlopeVal").textContent = lengthSlope.toFixed(0);
+    document.getElementById("strengthMinVal").textContent = strengthMin.toFixed(3);
+    document.getElementById("strengthSlopeVal").textContent = strengthSlope.toFixed(2);
+    document.getElementById("strengthPowerVal").textContent = strengthPower.toFixed(1);
+
+    // Reinitialize link force and reheat
+    linkForce.links(links);
+    const frozen = document.getElementById("freeze").checked;
+    if (frozen) {{
+      renderEdgesAndNodes();
+    }} else {{
+      simulation.alpha(0.3).restart();
+    }}
+  }}
+
+  [lengthMinEl, lengthSlopeEl, strengthMinEl, strengthSlopeEl, strengthPowerEl].forEach(el => {{
+    el.addEventListener("input", updateLinkParams);
+  }});
 
   // Play/Pause
   document.getElementById("playPause").addEventListener("click", () => {{
@@ -1761,22 +3157,26 @@ if (frames.length === 0) {{
     document.getElementById("playPause").textContent = playing ? "Pause" : "Play";
     if (playing) {{
       playInterval = setInterval(() => {{
-        currentFrame = (currentFrame + 1) % frames.length;
-        updateFrame(currentFrame);
+        const next = (currentFrame + 1) % frames.length;
+        updateFrame(next);
       }}, playSpeedMs);
     }} else {{
       clearInterval(playInterval);
     }}
   }});
 
-  // Slider
+  // Slider with debounce
+  let debounceTimer = null;
   slider.addEventListener("input", (e) => {{
     if (playing) {{
       playing = false;
       document.getElementById("playPause").textContent = "Play";
       clearInterval(playInterval);
     }}
-    updateFrame(parseInt(e.target.value));
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {{
+      updateFrame(parseInt(e.target.value));
+    }}, 50);
   }});
 
   // Initial render
@@ -1929,6 +3329,20 @@ def render_matrix_view(mat_df, year_range, title, fmt, cmap, radio_key):
     else:
         st.dataframe(mat_df.style.format(f"{{:{fmt}}}").background_gradient(cmap=cmap, axis=None), width="content")
     st.caption(f"{title} | Years: {y0}-{y1}")
+
+
+@st.fragment
+def render_low_coverage_table(coverage: pd.Series):
+    """Fragment for low coverage table - only reruns this section on threshold change."""
+    st.write("**Low Coverage Assets**")
+    cov_threshold = st.slider("Coverage threshold", 0, int(coverage.max()), 30, step=5, key="cov_thresh")
+    sparse = coverage[coverage < cov_threshold]
+    if len(sparse) > 0:
+        sparse_df = pd.DataFrame({"asset": sparse.index, "days": sparse.values})
+        st.dataframe(sparse_df, use_container_width=True, height=200)
+        st.caption(f"{len(sparse)} assets below {cov_threshold} days")
+    else:
+        st.success(f"All assets have >= {cov_threshold} days coverage")
 
 
 # ============================================================================
@@ -3210,384 +4624,91 @@ else:
         # --- CorGraph Tab ---
         with tabs["CorGraph"]:
             st.subheader("Correlation Network")
-            cg_view_mode = st.radio("View", ["Plotly", "D3 Interactive", "D3 Animated"], horizontal=True, key="cg_view_mode")
 
-            # Controls row 1
-            cg_row1 = st.columns(4)
-            with cg_row1[0]:
-                cg_method = st.selectbox("Method", ["pearson", "spearman", "sign", "partial"], key="cg_method")
-            with cg_row1[1]:
-                cg_min_overlap = st.slider("Min overlap", 5, 250, 10, step=5, key="cg_min_overlap")
-            with cg_row1[2]:
-                cg_top_pct = st.slider("Top % corr", 1, 50, 10, step=1, key="cg_top_pct")
-            with cg_row1[3]:
-                cg_sign = st.radio("Sign", ["both", "pos", "neg"], horizontal=True, key="cg_sign")
+            # Two columns: viz (75%) | controls (25%)
+            viz_col, ctrl_col = st.columns([3, 1], gap="large")
 
-            # Controls row 2
-            cg_row2 = st.columns(4)
-            with cg_row2[0]:
-                cg_max_edges = st.slider("Max edges/node", 3, 30, 10, key="cg_max_edges")
-            with cg_row2[1]:
-                cg_asset_mode = st.radio("Assets", ["All", "Top N"], horizontal=True, key="cg_asset_mode")
-            with cg_row2[2]:
-                if cg_asset_mode == "Top N":
-                    cg_top_n = st.slider("N", 20, 200, 60, step=10, key="cg_top_n")
+            # ========== RIGHT COLUMN: Controls ==========
+            with ctrl_col:
+                cfg = render_corgraph_controls()
+
+            # ========== LEFT COLUMN: Tabs + Visualization ==========
+            with viz_col:
+                # Compute state once (shared across all views)
+                state = compute_corgraph_state(filter_key, cfg, timings)
+
+                if state is None:
+                    st.warning("No correlation data available.")
                 else:
-                    cg_top_n = None
-                    st.caption("All assets")
-            with cg_row2[3]:
-                cg_seed = st.number_input("Layout seed", 1, 999, 42, key="cg_seed")
+                    # Update session_state with connected assets for focus selector (set for dedup, sorted for stability)
+                    connected = sorted({state.assets[n] for n in state.G.nodes() if state.G.degree(n) > 0})
+                    st.session_state["cg_connected_assets"] = connected
 
-            cg_show_labels = st.checkbox("Show labels", value=False, key="cg_show_labels")
-            cg_use_mst = st.checkbox("Ensure connected (MST backbone)", value=True, key="cg_use_mst")
+                    # Store total asset count for slider range
+                    st.session_state["cg_total_assets"] = state.n_display_assets
 
-            # Community detection controls
-            cg_row3 = st.columns(2)
-            with cg_row3[0]:
-                cg_detect_communities = st.checkbox("Detect communities", value=False, key="cg_communities")
-            with cg_row3[1]:
-                cg_color_by_community = st.checkbox("Color by community", value=False, key="cg_color_comm",
-                                                    disabled=not cg_detect_communities)
+                    # Warn user if focus is stale (asset no longer in graph)
+                    if cfg["focus_asset"] not in (["None"] + connected):
+                        st.caption(f"Focus '{cfg['focus_asset']}' not in current graph; choose again.")
 
-            # Partial correlation controls (CorGraph)
-            cg_partial_fill = "median"
-            cg_partial_estimator = "ledoitwolf"
-            cg_partial_standardize = True
-            cg_partial_mask = True
+                    # Edge count warnings
+                    if len(state.edges) > MAX_EDGES_HARD_CAP:
+                        st.warning(f"Too many edges ({len(state.edges):,}). Raise threshold or lower max edges/node.")
+                    elif len(state.edges) == 0:
+                        st.warning("No edges passed filters. Try lowering Top % threshold.")
+                    else:
+                        if len(state.edges) > 1500:
+                            st.info(f"Many edges ({len(state.edges):,}). Plot may be slow.")
 
-            if cg_method == "partial":
-                cg_partial_row = st.columns(4)
-                with cg_partial_row[0]:
-                    cg_partial_fill = st.selectbox("NaN fill", ["median", "mean", "zero"], key="cg_partial_fill")
-                with cg_partial_row[1]:
-                    cg_partial_estimator = st.selectbox("Estimator", ["ledoitwolf", "oas", "ridge"], key="cg_partial_estimator")
-                with cg_partial_row[2]:
-                    cg_partial_standardize = st.checkbox("Standardize", value=True, key="cg_partial_std")
-                with cg_partial_row[3]:
-                    cg_partial_mask = st.checkbox("Mask low overlap", value=True, key="cg_partial_mask")
+                        # View tabs
+                        view_tabs = st.tabs(["Plotly", "D3 Interactive", "D3 Living"])
 
-            # Method caption
-            if cg_method == "sign":
-                st.caption("Sign correlation: how often two assets are on the same side of their median")
-            elif cg_method == "partial":
-                st.caption("Partial correlation: correlation after controlling for all other assets")
+                        # ----- Plotly Tab -----
+                        with view_tabs[0]:
+                            render_corgraph_metrics_strip(state)
+                            with timed_collect("corgraph_render", timings):
+                                render_corgraph_plotly_view(state, cfg)
 
-            # Animation controls (only if D3 Animated)
-            anim_window = 60
-            anim_step = 5
-            anim_speed = 500
-            anim_max_assets = 80
-            if cg_view_mode == "D3 Animated":
-                st.markdown("**Animation Settings**")
-                anim_row = st.columns(4)
-                with anim_row[0]:
-                    anim_window = st.slider("Window (days)", 30, 120, 60, step=10, key="anim_window")
-                with anim_row[1]:
-                    anim_step = st.slider("Step (days)", 1, 20, 5, step=1, key="anim_step")
-                with anim_row[2]:
-                    anim_speed = st.slider("Play speed (ms)", 200, 2000, 500, step=100, key="anim_speed")
-                with anim_row[3]:
-                    anim_max_assets = st.slider("Max assets", 40, 120, 80, step=10, key="anim_max_assets")
+                            with st.expander("Edge Stats", expanded=False):
+                                # Edge statistics as dataframe
+                                # Note: state.edges includes MST edges merged in, so mean |corr| may be lower than threshold
+                                corrs = [e[2] for e in state.edges]
+                                n_mst = len(state.mst_edge_set) if state.mst_edge_set else 0
+                                n_thresh = len(state.edges) - n_mst  # Approximate (MST may overlap)
+                                edge_stats = pd.DataFrame({
+                                    "Metric": ["Final edges", "Thresholded", "MST added", "Mean |corr|", "Common rows"],
+                                    "Value": [
+                                        len(state.edges),
+                                        f"~{n_thresh}",
+                                        n_mst,
+                                        f"{np.mean(np.abs(corrs)):.3f}" if corrs else "N/A",
+                                        state.n_common,
+                                    ]
+                                })
+                                st.dataframe(edge_stats, hide_index=True, use_container_width=True)
 
-            # Compute correlation (reuse cached) - now returns coverage too
-            with timed_collect("corgraph_corr", timings):
-                cg_corr_full, cg_overlap_full, cg_all_assets, cg_coverage, cg_debug = compute_corr_and_overlap(
-                    filter_key, cg_method, cg_min_overlap,
-                    partial_fill=cg_partial_fill,
-                    partial_estimator=cg_partial_estimator,
-                    partial_standardize=cg_partial_standardize,
-                    partial_mask=cg_partial_mask,
-                )
+                            if cfg["detect_communities"] and state.comms:
+                                with st.expander(f"Communities ({len(state.comms)})", expanded=False):
+                                    comm_df = community_summary(state.comms, state.assets, state.node_meta)
+                                    st.dataframe(comm_df, hide_index=True)
 
-            if cg_corr_full.empty:
-                st.warning("No correlation data available.")
-            else:
-                # Subset to top N assets by COVERAGE (days with data), not corr non-NaN count
-                if cg_asset_mode == "Top N" and cg_top_n is not None:
-                    cg_display_assets = cg_coverage.sort_values(ascending=False).head(cg_top_n).index.tolist()
-                    st.caption(f"Showing top {len(cg_display_assets)} assets by data coverage")
-                else:
-                    cg_display_assets = list(cg_corr_full.columns)
-                    st.caption(f"Showing all {len(cg_display_assets)} assets")
-
-                # Subset correlation/overlap
-                cg_col_index = {a: i for i, a in enumerate(cg_corr_full.columns)}
-                cg_asset_idx = [cg_col_index[a] for a in cg_display_assets]
-                cg_corr_sub = cg_corr_full.loc[cg_display_assets, cg_display_assets]
-                cg_overlap_sub = cg_overlap_full[np.ix_(cg_asset_idx, cg_asset_idx)]
-
-                # Compute threshold from quantile (top X% means 100-X percentile)
-                C = cg_corr_sub.values
-                mask = np.triu(np.ones_like(C, dtype=bool), k=1)
-                finite = np.isfinite(C) & mask
-                absvals = np.abs(C[finite])
-                if absvals.size > 0:
-                    cg_threshold = float(np.percentile(absvals, 100 - cg_top_pct))
-                else:
-                    cg_threshold = 0.0
-                st.caption(f"Top {cg_top_pct}% threshold: |corr| >= {cg_threshold:.3f}")
-
-                # Debug stats (show in expander)
-                with st.expander("Edge Filter Stats", expanded=False):
-
-                    O = cg_overlap_sub
-                    Ovals = O[mask]
-
-                    # Data source info
-                    st.write(f"**Data source:**")
-                    st.write(f"- Assets displayed: {len(cg_display_assets)}")
-                    st.write(f"- Full corr shape: {cg_corr_full.shape}")
-                    st.write(f"- Full overlap shape: {cg_overlap_full.shape}")
-                    st.write(f"- Full overlap range: min={int(cg_overlap_full.min())}, max={int(cg_overlap_full.max())}")
-                    st.write(f"- Coverage range: min={int(cg_coverage.min())}, max={int(cg_coverage.max())}")
-
-                    # Debug info from computation
-                    if cg_debug:
-                        st.write(f"**Debug (from compute):**")
-                        for k, v in cg_debug.items():
-                            st.write(f"- {k}: {v}")
-
-                    st.write(f"**Subset stats:**")
-                    st.write(f"- Finite off-diagonal pairs: {int(finite.sum()):,}")
-                    if absvals.size:
-                        st.write(f"- Max |corr|: {float(absvals.max()):.3f}")
-                        st.write(f"- Threshold (top {cg_top_pct}%): |corr| >= {cg_threshold:.3f}")
-                        st.write(f"- Pairs above threshold: {int((absvals >= cg_threshold).sum()):,}")
-                    st.write(f"- Overlap days: min={int(np.min(Ovals))}, median={float(np.median(Ovals)):.0f}, max={int(np.max(Ovals))}")
-                    st.write(f"- Pairs overlap >= {cg_min_overlap}: {int((Ovals >= cg_min_overlap).sum()):,}")
-
-                # Build edge list
-                with timed_collect("corgraph_edges", timings):
-                    cg_assets, cg_edges = corr_to_edges(
-                        cg_corr_sub, cg_overlap_sub,
-                        min_abs_corr=cg_threshold,
-                        min_overlap=cg_min_overlap,
-                        sign=cg_sign,
-                        max_edges_per_node=cg_max_edges
-                    )
-
-                # Optionally add MST backbone for connectivity
-                cg_mst_edges_set = set()  # Track which edges are from MST (for dashed styling)
-                if cg_use_mst:
-                    with timed_collect("corgraph_mst", timings):
-                        mst_edges = mst_edges_from_corr(cg_corr_sub.values, cg_overlap_sub)
-
-                        # First, mark ALL MST edges (even if they already exist in threshold edges)
-                        # This ensures MST backbone is always styled consistently
-                        for i, j, c, o in mst_edges:
-                            a, b = (i, j) if i < j else (j, i)
-                            cg_mst_edges_set.add((a, b))
-
-                        # Merge: keep unique undirected pairs
-                        seen = set()
-                        merged = []
-                        for i, j, c, o in cg_edges:
-                            a, b = (i, j) if i < j else (j, i)
-                            seen.add((a, b))
-                            merged.append((a, b, c, o))
-                        for i, j, c, o in mst_edges:
-                            a, b = (i, j) if i < j else (j, i)
-                            if (a, b) not in seen:
-                                seen.add((a, b))
-                                merged.append((a, b, c, o))
-                        cg_edges = merged
-                else:
-                    cg_mst_edges_set = None
-
-                # Edge count warning
-                if len(cg_edges) > MAX_EDGES_HARD_CAP:
-                    st.warning(f"Too many edges ({len(cg_edges):,}). Raise threshold or lower max edges/node.")
-                elif len(cg_edges) == 0:
-                    st.warning("No edges passed filters. Try lowering Min overlap or |corr| threshold.")
-                else:
-                    if len(cg_edges) > 1500:
-                        st.info(f"Many edges ({len(cg_edges):,}). Plot may be slow.")
-
-                    # Build graph and layout
-                    with timed_collect("corgraph_layout", timings):
-                        cg_G, cg_pos = build_graph_positions(cg_assets, cg_edges, seed=cg_seed)
-
-                    # Detect communities if enabled
-                    cg_node2comm = {}
-                    cg_comms = []
-                    if cg_detect_communities:
-                        with timed_collect("corgraph_communities", timings):
-                            cg_node2comm, cg_comms = detect_communities(cg_G, seed=cg_seed)
-
-                    # Build node metadata from cached asset metrics
-                    cg_node_meta = {}
-                    if 'asset_df' in dir() and asset_df is not None:
-                        # Use asset_df if available (computed in Assets tab)
-                        meta_lookup = asset_df.set_index("asset")[["mean_daily_pnl", "pnl_over_daily_vol"]].to_dict("index")
-                        for i, a in enumerate(cg_assets):
-                            if a in meta_lookup:
-                                cg_node_meta[i] = meta_lookup[a]
-
-                    # Add coverage to node_meta
-                    for i, a in enumerate(cg_assets):
-                        if i not in cg_node_meta:
-                            cg_node_meta[i] = {}
-                        cg_node_meta[i]["coverage"] = int(cg_coverage.get(a, 0))
-
-                    # Focus asset selector
-                    cg_connected_nodes = [n for n in cg_G.nodes() if cg_G.degree(n) > 0]
-                    cg_connected_assets = [cg_assets[n] for n in cg_connected_nodes]
-
-                    cg_focus_asset = st.selectbox(
-                        "Focus asset (optional)",
-                        ["None"] + sorted(cg_connected_assets),
-                        key="cg_focus"
-                    )
-
-                    cg_focus_node = None
-                    if cg_focus_asset != "None":
-                        cg_focus_node = cg_assets.index(cg_focus_asset)
-
-                    # Render based on view mode
-                    if cg_view_mode == "Plotly":
-                        with timed_collect("corgraph_render", timings):
-                            cg_fig = render_corr_graph_plotly(
-                                cg_G, cg_pos, cg_assets,
-                                node_meta=cg_node_meta,
-                                focus_node=cg_focus_node,
-                                show_labels=cg_show_labels,
-                                node2comm=cg_node2comm,
-                                color_by_community=cg_color_by_community
-                            )
-                            st.plotly_chart(cg_fig, use_container_width=True, config={"displaylogo": False})
-
-                    elif cg_view_mode == "D3 Interactive":
-                        # D3 Interactive view
-                        with timed_collect("corgraph_d3_build", timings):
-                            d3_nodes, d3_links = build_d3_graph_data(
-                                cg_G, cg_assets, cg_node_meta, cg_mst_edges_set,
-                                node2comm=cg_node2comm if cg_detect_communities else None
-                            )
-
-                        # Hard cap warning for D3
-                        if len(d3_links) > 4000:
-                            st.error(f"Too many edges for D3 ({len(d3_links):,}). Use Plotly view or reduce edges.")
-                        else:
+                        # ----- D3 Interactive Tab -----
+                        with view_tabs[1]:
+                            render_corgraph_metrics_strip(state)
                             with timed_collect("corgraph_d3_render", timings):
-                                d3_html = make_d3_force_html(
-                                    d3_nodes, d3_links,
-                                    height=700,
-                                    focus_asset=cg_focus_asset if cg_focus_asset != "None" else None,
-                                    show_labels=cg_show_labels,
-                                    color_by_community=cg_color_by_community
-                                )
-                                components.html(d3_html, height=720, scrolling=False)
+                                render_corgraph_d3_interactive_view(state, cfg)
 
-                            st.caption("Drag nodes to reposition. Scroll to zoom. Drag background to pan.")
-
-                    elif cg_view_mode == "D3 Animated":
-                        # D3 Animated view - time-evolving correlation network
-                        # Limit assets for animation
-                        if cg_asset_mode == "Top N" and cg_top_n is not None:
-                            n_anim_assets = min(cg_top_n, anim_max_assets)
-                        else:
-                            n_anim_assets = min(len(cg_assets), anim_max_assets)
-
-                        anim_assets = cg_assets[:n_anim_assets]
-
-                        # Compute frames
-                        with timed_collect("compute_corr_frames", timings):
-                            anim_frames = compute_corr_frames(
-                                filter_key=filter_key,
-                                assets=tuple(anim_assets),
-                                method=cg_method,
-                                min_overlap=cg_min_overlap,
-                                window_days=anim_window,
-                                step_days=anim_step,
-                                top_pct=cg_top_pct,
-                                sign=cg_sign,
-                                max_edges_per_node=cg_max_edges,
-                                partial_fill=cg_partial_fill if cg_method == "partial" else "median",
-                                partial_estimator=cg_partial_estimator if cg_method == "partial" else "ledoitwolf",
-                                partial_standardize=cg_partial_standardize if cg_method == "partial" else True,
-                                partial_mask=cg_partial_mask if cg_method == "partial" else True,
-                            )
-
-                        if not anim_frames:
-                            st.warning("No frames generated. Check date range and window size.")
-                        else:
-                            st.caption(f"Generated {len(anim_frames)} frames for {len(anim_assets)} assets")
-
-                            # Build nodes with fixed x,y from existing layout (cg_pos)
-                            # Scale positions to pixel coordinates
-                            if cg_pos:
-                                xs = [p[0] for p in cg_pos.values()]
-                                ys = [p[1] for p in cg_pos.values()]
-                                x_min, x_max = min(xs), max(xs)
-                                y_min, y_max = min(ys), max(ys)
+                        # ----- D3 Living Tab -----
+                        with view_tabs[2]:
+                            st.info("This view animates a force-directed layout — may be CPU intensive.")
+                            if st.checkbox("Enable animation", value=False, key="cg_anim_enable"):
+                                render_corgraph_metrics_strip(state)
+                                render_corgraph_d3_animated_view(filter_key, state, cfg, timings)
                             else:
-                                x_min, x_max, y_min, y_max = 0, 1, 0, 1
-
-                            margin = 50
-                            anim_width = 900
-                            anim_height = 700
-
-                            def scale_pos(p):
-                                x = margin + (p[0] - x_min) / (x_max - x_min + 1e-9) * (anim_width - 2*margin)
-                                y = margin + (p[1] - y_min) / (y_max - y_min + 1e-9) * (anim_height - 2*margin)
-                                return (x, y)
-
-                            # Map integer node IDs to asset names for position/degree lookup
-                            pos_by_asset = {cg_assets[i]: cg_pos[i] for i in cg_pos.keys()}
-                            deg_by_asset = {cg_assets[i]: cg_G.degree(i) for i in cg_G.nodes()}
-
-                            # Build nodes for animated assets
-                            anim_nodes = []
-                            for asset in anim_assets:
-                                if asset in pos_by_asset:
-                                    px, py = scale_pos(pos_by_asset[asset])
-                                    deg = deg_by_asset.get(asset, 0)
-                                    cov = int(cg_coverage.get(asset, 0)) if hasattr(cg_coverage, 'get') else int(cg_coverage[asset]) if asset in cg_coverage.index else 0
-                                    anim_nodes.append({
-                                        "id": asset,
-                                        "x": px,
-                                        "y": py,
-                                        "degree": deg,
-                                        "coverage": cov,
-                                    })
-
-                            # Render animated D3
-                            with timed_collect("render_d3_animated", timings):
-                                anim_html = make_d3_animated_html(
-                                    nodes=anim_nodes,
-                                    frames=anim_frames,
-                                    height=700,
-                                    show_labels=cg_show_labels,
-                                    play_speed_ms=anim_speed,
-                                )
-                                components.html(anim_html, height=780, scrolling=False)
-
-                            # Frame statistics
-                            total_edges = sum(len(f["edges"]) for f in anim_frames)
-                            avg_edges = total_edges / len(anim_frames) if anim_frames else 0
-                            st.caption(f"Avg edges/frame: {avg_edges:.0f} | Total edge updates: {total_edges:,}")
-
-                    # Summary stats
-                    cg_c1, cg_c2, cg_c3, cg_c4, cg_c5 = st.columns(5)
-                    cg_c1.metric("Nodes", f"{cg_G.number_of_nodes():,}")
-                    cg_c2.metric("Edges", f"{cg_G.number_of_edges():,}")
-                    cg_c3.metric("Density", f"{nx.density(cg_G):.3f}")
-                    cg_c4.metric("Components", f"{nx.number_connected_components(cg_G):,}")
-                    cg_avg_deg = sum(d for _, d in cg_G.degree()) / max(cg_G.number_of_nodes(), 1)
-                    cg_c5.metric("Avg degree", f"{cg_avg_deg:.1f}")
-
-                    # Community summary panel
-                    if cg_detect_communities and cg_comms:
-                        with st.expander(f"Community Summary ({len(cg_comms)} communities)", expanded=True):
-                            comm_df = community_summary(cg_comms, cg_assets, cg_node_meta)
-                            st.dataframe(
-                                comm_df.style.format({
-                                    "mean_daily_pnl": "{:.6f}",
-                                    "mean_pnl_ratio": "{:.3f}"
-                                }),
-                                width="stretch",
-                                hide_index=True
-                            )
+                                st.caption("Animation disabled. Enable above to start.")
+                                render_corgraph_metrics_strip(state)
+                                # Show static snapshot instead
+                                render_corgraph_d3_interactive_view(state, cfg)
 
         # --- Embedding Tab ---
         with tabs["Embedding"]:
@@ -3753,28 +4874,22 @@ else:
                 cov_c3.metric("Min", f"{int(coverage.min())}")
                 cov_c4.metric("Max", f"{int(coverage.max())}")
 
-                # Sparse assets table
-                st.write("**Low Coverage Assets**")
-                cov_threshold = st.slider("Coverage threshold", 0, int(coverage.max()), 30, step=5, key="cov_thresh")
-                sparse = coverage[coverage < cov_threshold]
-                if len(sparse) > 0:
-                    sparse_df = pd.DataFrame({"asset": sparse.index, "days": sparse.values})
-                    st.dataframe(sparse_df, use_container_width=True, height=200)
-                    st.caption(f"{len(sparse)} assets below {cov_threshold} days")
-                else:
-                    st.success(f"All assets have >= {cov_threshold} days coverage")
+                # Sparse assets table (isolated in fragment - slider won't trigger overlap recompute)
+                render_low_coverage_table(coverage)
 
-                # Overlap matrix for top N
+                # Overlap matrix for all selected assets
                 st.divider()
-                st.write("**Pairwise Overlap (Top N by coverage)**")
-                ov_top_n = st.slider("Assets for overlap", 20, min(200, len(coverage)), 60, step=10, key="ov_top_n")
+                st.write("**Pairwise Overlap (Selected Assets)**")
 
-                top_assets = coverage.head(ov_top_n).index.tolist()
-                dfX_sub = cov_dfX[top_assets]
-                notna_sub = np.asarray(dfX_sub.notna(), dtype=np.int32)
+                # Use all assets from current filter (cov_dfX.columns)
+                top_assets = list(cov_dfX.columns)
+                notna_sub = np.asarray(cov_dfX.notna(), dtype=np.int32)
                 overlap_sub = notna_sub.T @ notna_sub
 
                 # Render as heatmap
+                n = len(top_assets)
+                show_ticks = n <= 40
+
                 fig = go.Figure(data=go.Heatmap(
                     z=overlap_sub,
                     x=top_assets,
@@ -3783,10 +4898,10 @@ else:
                     colorbar=dict(title="Overlap days"),
                 ))
                 fig.update_layout(
-                    height=max(400, 6 * ov_top_n),
+                    height=min(1200, max(450, 6 * n)),
                     margin=dict(l=10, r=10, t=10, b=10),
-                    xaxis=dict(showticklabels=ov_top_n <= 40, tickfont=dict(size=7)),
-                    yaxis=dict(showticklabels=ov_top_n <= 40, tickfont=dict(size=7), autorange="reversed"),
+                    xaxis=dict(showticklabels=show_ticks, tickfont=dict(size=7)),
+                    yaxis=dict(showticklabels=show_ticks, tickfont=dict(size=7), autorange="reversed"),
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
@@ -3797,6 +4912,48 @@ else:
                 ov_c1.metric("Min overlap", f"{int(ov_vals.min())}")
                 ov_c2.metric("Median overlap", f"{int(np.median(ov_vals))}")
                 ov_c3.metric("Max overlap", f"{int(ov_vals.max())}")
+
+                # Common coverage tradeoff plot
+                st.divider()
+                st.write("**Common Coverage vs Assets Removed**")
+
+                trade = compute_common_coverage_tradeoff(cov_dfX)
+
+                if trade.empty:
+                    st.caption("No data available for coverage tradeoff plot.")
+                else:
+                    fig = go.Figure()
+
+                    fig.add_trace(go.Scatter(
+                        x=trade["n_assets"],
+                        y=trade["coverage_pct"],
+                        mode="lines+markers",
+                        name="Greedy best common coverage",
+                        hovertemplate="Assets: %{x}<br>Coverage: %{y:.2f}%<br>Common rows: %{customdata[0]}<br>Dropped: %{customdata[1]}<extra></extra>",
+                        customdata=np.stack([trade["common_rows"].to_numpy(), trade["dropped"].fillna("").to_numpy()], axis=1),
+                    ))
+
+                    # Show single-best-asset ceiling (max individual coverage)
+                    col_cov = cov_dfX.notna().sum(axis=0)
+                    if len(col_cov) > 0:
+                        best_one = 100.0 * float(col_cov.max()) / max(len(cov_dfX), 1)
+                        fig.add_hline(y=best_one, line_dash="dot", annotation_text="Best single asset")
+
+                    fig.update_layout(
+                        height=420,
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        xaxis_title="Number of assets remaining",
+                        yaxis_title="Common coverage (%)",
+                        xaxis=dict(autorange="reversed"),  # left-to-right = kick out more assets
+                        showlegend=False,
+                    )
+
+                    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+                    st.caption(
+                        "Greedy curve: at each step, drops the single asset that most increases the number of dates "
+                        "where *all remaining* assets have data."
+                    )
 
         # --- Attribution Tab ---
         with tabs["Attribution"]:
