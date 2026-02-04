@@ -932,7 +932,7 @@ def run_strategy(input_type: str, signal_names: list[str], rank_mode: str, hedge
 
     stats = compute_stats(hedged_pnl, long_pnl, short_pnl)
 
-    return hedged_pnl, long_pnl, short_pnl, stats, time_ms, total_matrix
+    return hedged_pnl, long_pnl, short_pnl, stats, time_ms, total_matrix, long_matrix, short_matrix
 
 
 # ============================================================================
@@ -1215,6 +1215,15 @@ def main():
     with st.sidebar:
         st.header("Strategy Construction")
 
+        # Asset class filter (empty = all)
+        asset_filter = st.multiselect(
+            "Asset Classes",
+            options=ctx.unique_groups,
+            default=[],
+            format_func=lambda x: x.capitalize(),
+            help="Filter to selected groups (empty = all)"
+        )
+
         # Input type
         INPUT_LABELS = {
             "pnl": "PNL (raw)",
@@ -1258,15 +1267,6 @@ def main():
             help="Hedge strategy to apply"
         )
 
-        # Asset class filter (empty = all)
-        asset_filter = st.multiselect(
-            "Asset Classes",
-            options=ctx.unique_groups,
-            default=[],
-            format_func=lambda x: x.capitalize(),
-            help="Filter to selected groups (empty = all)"
-        )
-
         st.divider()
 
         # Strategy name display
@@ -1279,7 +1279,7 @@ def main():
     col_stats, col_chart = st.columns([1, 3])
 
     # Run strategy with filter
-    pnl, long_pnl, short_pnl, stats, time_ms, total_matrix = run_strategy(
+    pnl, long_pnl, short_pnl, stats, time_ms, total_matrix, long_matrix, short_matrix = run_strategy(
         input_type, selected_signals, rank_mode, hedge,
         ctx, caches, asset_filter=asset_filter
     )
@@ -1287,11 +1287,61 @@ def main():
     # Display stats in col_stats
     with col_stats:
         st.subheader("Statistics")
-        st.metric("Sharpe Ratio", f"{stats.sharpe:.4f}")
-        st.metric("Max Drawdown", f"{stats.max_drawdown:.4f}")
-        st.metric("Long Sharpe", f"{stats.long_sharpe:.4f}")
-        st.metric("Short Sharpe", f"{stats.short_sharpe:.4f}")
-        st.metric("L/S Correlation", f"{stats.ls_correl:.4f}")
+
+        # Display filter: select which asset classes to show results for
+        display_filter = st.multiselect(
+            "Show Results For",
+            options=ctx.unique_groups,
+            default=[],
+            format_func=lambda x: x.capitalize(),
+            help="Filter displayed results (empty = all)"
+        )
+
+        # Apply display filter to matrices and re-apply hedge
+        if display_filter:
+            display_group_ids = [ctx.unique_groups.index(g) for g in display_filter]
+            display_mask = np.isin(ctx.group_ids, display_group_ids)
+            display_total = total_matrix[:, display_mask]
+            display_long = long_matrix[:, display_mask]
+            display_short = short_matrix[:, display_mask]
+
+            # Sum filtered long/short
+            display_long_pnl = np.nansum(display_long, axis=1)
+            display_short_pnl = np.nansum(display_short, axis=1)
+
+            # Re-apply hedge to filtered data
+            hedge_fn = HEDGE_STRATEGIES[hedge]
+            if hedge in ("hg", "gah"):
+                # For group-based hedges, we need filtered group_ids
+                filtered_group_ids = ctx.group_ids[display_mask]
+                # Remap group_ids to be contiguous
+                unique_filtered = np.unique(filtered_group_ids)
+                remap = {old: new for new, old in enumerate(unique_filtered)}
+                remapped_group_ids = np.array([remap[g] for g in filtered_group_ids], dtype=np.int32)
+                n_filtered_groups = len(unique_filtered)
+
+                display_pnl = hedge_fn(
+                    long_matrix=display_long, short_matrix=display_short,
+                    group_ids=remapped_group_ids, n_groups=n_filtered_groups,
+                    long_pnl=display_long_pnl, short_pnl=display_short_pnl
+                )
+            else:
+                display_pnl = hedge_fn(long_pnl=display_long_pnl, short_pnl=display_short_pnl)
+        else:
+            # No display filter - use the already-computed hedged values
+            display_pnl = pnl
+            display_long_pnl = long_pnl
+            display_short_pnl = short_pnl
+            display_total = total_matrix
+
+        # Compute stats for displayed subset
+        display_stats = compute_stats(display_pnl, display_long_pnl, display_short_pnl)
+
+        st.metric("Sharpe Ratio", f"{display_stats.sharpe:.4f}")
+        st.metric("Max Drawdown", f"{display_stats.max_drawdown:.4f}")
+        st.metric("Long Sharpe", f"{display_stats.long_sharpe:.4f}")
+        st.metric("Short Sharpe", f"{display_stats.short_sharpe:.4f}")
+        st.metric("L/S Correlation", f"{display_stats.ls_correl:.4f}")
 
         st.divider()
         st.caption(f"Computed in {time_ms:.1f} ms")
@@ -1307,19 +1357,19 @@ def main():
         )
 
         if chart_view == "Cumulative PnL":
-            fig = plot_cumulative_pnl(pnl, long_pnl, short_pnl, d0)
+            fig = plot_cumulative_pnl(display_pnl, display_long_pnl, display_short_pnl, d0)
             st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
         elif chart_view == "Rolling Correlation":
-            fig_corr = plot_rolling_correlation(long_pnl, short_pnl, d0)
+            fig_corr = plot_rolling_correlation(display_long_pnl, display_short_pnl, d0)
             st.plotly_chart(fig_corr, use_container_width=True, config={"displaylogo": False})
         elif chart_view == "Cross-Sectional Range":
-            fig_range = plot_cross_sectional_range(total_matrix, d0)
+            fig_range = plot_cross_sectional_range(display_total, d0)
             st.plotly_chart(fig_range, use_container_width=True, config={"displaylogo": False})
         elif chart_view == "Cross-Sectional Hit Ratio":
-            fig_hit = plot_cross_sectional_hit_ratio(total_matrix, d0)
+            fig_hit = plot_cross_sectional_hit_ratio(display_total, d0)
             st.plotly_chart(fig_hit, use_container_width=True, config={"displaylogo": False})
         else:  # Cross-Sectional Win/Loss
-            fig_wl = plot_cross_sectional_winloss_ratio(total_matrix, d0)
+            fig_wl = plot_cross_sectional_winloss_ratio(display_total, d0)
             st.plotly_chart(fig_wl, use_container_width=True, config={"displaylogo": False})
 
 
