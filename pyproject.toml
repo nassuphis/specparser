@@ -23,6 +23,7 @@ dependencies = [
     "umap-learn>=0.5",
     "scikit-learn>=1.4",
     "bottleneck>=1.4",
+    "nbconvert>=7.17.0",
 ]
 
 [project.optional-dependencies]

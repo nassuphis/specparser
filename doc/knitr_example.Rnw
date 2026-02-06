@@ -1,0 +1,1108 @@
+\documentclass{article}
+\usepackage[portrait, headheight = 0cm, margin=0.25cm, top = 0.25cm]{geometry} 
+\usepackage{graphicx}
+\usepackage[dvipsnames,table]{xcolor}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{pdfpages}
+\usepackage[export]{adjustbox} 
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{shadings,arrows.meta,positioning,calc,intersections}
+\usepackage{hyperref}
+
+<<,cache=FALSE, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, results="hide">>=
+fns = list.files("figure/*.pdf")
+@
+
+<<,cache=FALSE, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, results="hide">>=
+require(glue)
+require(qpdf)
+nglue<-function(
+  ...,
+  .sep = "",
+  .envir = parent.frame(), 
+  .open = "{", 
+  .close = "}", 
+  .na = "NA", 
+  .transformer = identity_transformer
+){
+  as.character(glue(
+    ...,
+    .sep=.sep,
+    .envir=.envir,
+    .open="@[",
+    .close="]@",
+    .na="NA",
+    .transformer = .transformer
+  ))
+}
+
+make_full_directory<-function(x){
+  os_type<-.Platform$OS.type
+  if(os_type=="windows")return(paste0(gsub("\\\\","/",normalizePath(getwd())),"/",x))
+  paste0(normalizePath(getwd()),"\\",x)
+}
+
+make_pdf_page<-function(
+    fn,
+    pages=1,
+    height="10cm",
+    width="10cm",
+    minipage=TRUE,
+    valign="B"
+){
+   fname<-gsub("\\","/",tempfile(pattern = "pdf",tmpdir=make_full_directory("figure"),fileext=".pdf"),fixed=TRUE)
+   pdf_subset(fn, pages = pages, output = fname)
+   latex<-nglue(
+    if(minipage){"\\begin{minipage}[t][@[height]@][t]{@[width]@}\n"}else(""),
+    "\\includegraphics[height=@[height]@,width=@[width]@,valign=@[valign]@]{@[fname]@}\n",
+    if(minipage){"\\end{minipage}\n"}else{""},
+    .sep="\n",
+    height=height,
+    width=width,
+    fname=fname
+  )
+  latex
+}
+
+
+
+@
+
+
+<<setup_py, include=FALSE>>=
+library(reticulate)
+use_virtualenv("/Users/nicknassuphis/pypolys/.venv", required = TRUE)
+@
+
+<<,  include=FALSE, engine='python'>>=
+import argparse
+import timeit
+import numpy as np
+import pandas as pd
+from numba import njit, prange
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")
+@
+
+
+
+\title{
+\vskip 5mm
+{\bf\huge Chebyshev Representation}
+\vskip 5mm
+{\bf\huge for}
+\vskip 5mm
+{\bf\huge Polynomial Manifolds:}
+\vskip 5mm
+{\bf\huge Benchmarks \& Stability}
+\vskip 1cm
+\begin{center}
+\includegraphics[width=15cm, height=15cm]{myplot1.png}
+\end{center}
+\vskip 1cm
+}
+\author{Wigerich}
+
+\begin{document}
+\maketitle
+
+\newpage
+\tableofcontents
+
+\newpage
+\section{Aberth Solver}
+\subsection{Conversions}
+
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Helpers & Conversion Functions \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit(fastmath=True)
+def _poly_add(p, q):
+    m, n = p.shape[0], q.shape[0]
+    r = np.zeros(max(m, n), dtype=p.dtype)
+    r[:m] += p
+    r[:n] += q
+    return r
+
+@njit(fastmath=True)
+def _poly_sub(p, q):
+    m, n = p.shape[0], q.shape[0]
+    r = np.zeros(max(m, n), dtype=p.dtype)
+    r[:m] += p
+    r[:n] -= q
+    return r
+
+@njit(fastmath=True)
+def _poly_scale(p, s):
+    r = p.copy()
+    r *= s
+    return r
+
+@njit(fastmath=True)
+def _poly_mul_linear(p, alpha, beta):
+    """
+    Multiply p(y) by (beta + alpha*y). Ascending coeffs.
+    """
+    m = p.shape[0]
+    r = np.zeros(m+1, dtype=p.dtype)
+    r[0] = beta * p[0]
+    for j in range(1, m):
+        r[j] = alpha * p[j-1] + beta * p[j]
+    r[m] = alpha * p[m-1]
+    return r
+
+@njit(fastmath=True)    
+def _x_times_cheb(c):
+    """Multiply Chebyshev series c(y) by y: returns d(y)=y*c(y). c,d len n+1."""
+    n = c.shape[0] - 1
+    d = np.zeros_like(c)
+    if n >= 1:
+        d[0] = 0.5 * c[1]
+        d[1] = c[0] + 0.5 * (c[2] if n >= 2 else 0.0)
+        for j in range(2, n):
+            d[j] = 0.5 * (c[j-1] + c[j+1])
+        d[n] = 0.5 * c[n-1]
+    else:  # n == 0
+        d[1-1] = 0.0  # no-op; scalar series times y is 0 in degree-0 truncation
+    return d
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+
+@njit(fastmath=True)
+def power_to_cheb(p):
+    """
+    Convert power basis p(y) = sum_{m=0}^n p[m]*y^m (ascending) to Chebyshev coeffs a_k.
+    Returns a of length n+1 such that p(y) = sum a[k] T_k(y).
+    """
+    n = p.shape[0] - 1
+    a = np.zeros(n+1, dtype=p.dtype)
+    # X = Chebyshev series for y^m; start with m=0 => 1 = T0
+    X = np.zeros(n+1, dtype=p.dtype)
+    X[0] = 1.0 + 0j
+    a += p[0] * X
+    for m in range(1, n+1):
+        X = _x_times_cheb(X)
+        a += p[m] * X
+    return a
+
+@njit(fastmath=True)    
+def cheb_to_power(a):
+    """
+    Convert Chebyshev coeffs a(y) to power basis (ascending). Works by building y^m via
+    the inverse of _x_times_cheb through a recurrence (stable for modest n).
+    """
+    n = a.shape[0] - 1
+    # Build T_k(y) in power basis progressively and accumulate a_k * T_k(y)
+    # T0 = 1 ; T1 = y ; T_{k+1} = 2y T_k - T_{k-1}
+    P_prev = np.zeros(1, dtype=a.dtype)  # T_{-1} (unused placeholder)
+    P0 = np.zeros(1, dtype=a.dtype)      # T0
+    P0[0] = 1.0 + 0j
+    poly = a[0] * P0.copy()
+    if n >= 1:
+        P1 = np.zeros(2, dtype=a.dtype)  # T1 = y
+        P1[1] = 1.0 + 0j
+        # poly += a1*T1
+        poly = _poly_add(poly, _poly_scale(P1, a[1]))
+        for k in range(1, n):
+            # T_{k+1} = 2y T_k - T_{k-1}
+            Pkm1 = P0
+            Pk   = P1
+            Pk_y = _poly_mul_linear(Pk, alpha=1.0, beta=0.0)  # multiply by y
+            Pkp1 = _poly_sub(_poly_scale(Pk_y, 2.0), Pkm1)
+            poly = _poly_add(poly, _poly_scale(Pkp1, a[k+1]))
+            P0, P1 = Pk, Pkp1
+    return poly
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+
+\newpage
+\subsection{Domain Mapping and Evaluation}
+
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Eval Poly & Eval PolyDer \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit(fastmath=True)
+def cheb_eval_y(a, y):
+    """
+    Clenshaw for Chebyshev series sum a[k] T_k(y) at scalar y (complex ok).
+    """
+    n = a.shape[0] - 1
+    b1 = 0.0 + 0j
+    b2 = 0.0 + 0j
+    for k in range(n, -1, -1):
+        b0 = 2.0 * y * b1 - b2 + a[k]
+        b2 = b1
+        b1 = b0
+    return b0 - y * b2
+
+@njit(fastmath=True)    
+def cheb_eval_on_domain(a, x, A, B):
+    """
+    Evaluate Chebyshev series on domain [A,B]. a are coeffs wrt T_k(y), y = affine(x).
+    """
+    y = (2.0 * x - (A + B)) / (B - A)
+    return cheb_eval_y(a, y)
+
+@njit(fastmath=True)
+def cheb_derivative_coeffs_y(a):
+    """
+    Derivative wrt y: if f(y)=sum a_k T_k(y), returns coeffs d such that f'(y)=sum d_k T_k(y).
+    """
+    n = a.shape[0] - 1
+    if n == 0:
+        return np.zeros_like(a)
+    d = np.zeros_like(a)
+    d[n-1] = 2.0 * n * a[n]
+    for k in range(n-2, -1, -1):
+        # d[k] = d[k+2] + 2*(k+1)*a[k+1]
+        d[k] = (d[k+2] if (k+2) <= (n-1) else 0.0) + 2.0 * (k+1) * a[k+1]
+    d[0] *= 0.5
+    return d
+
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+
+@njit(fastmath=True)
+def cheb_eval_deriv_on_domain_pre(a, ap_y, x, A, B):
+    """
+    Evaluate f(x) and f'(x) for Chebyshev coeffs a on domain [A,B], using precomputed ap_y.
+    """
+    y = (2.0*x - (A + B)) / (B - A)
+    fy = cheb_eval_y(a, y)
+    df_dy = cheb_eval_y(ap_y, y)
+    df_dx = (2.0 / (B - A)) * df_dy
+    return fy, df_dx
+
+@njit(fastmath=True)
+def cheb_eval_deriv_batch(a, ap_y, z, A, B, out_p, out_dp):
+    """
+    Compute p(z_j) and p'(z_j) for all j at once, using two Clenshaw recurrences.
+    a: Chebyshev coeffs on [A,B], ap_y: derivative coeffs wrt y.
+    out_p, out_dp: preallocated complex128 arrays len m.
+    """
+    m = z.shape[0]
+    n = a.shape[0] - 1
+    # y mapping
+    y = np.empty(m, dtype=np.complex128)
+    s = 2.0 / (B - A)
+    c = (A + B) / (B - A)
+    for j in range(m):
+        y[j] = s * z[j] - c
+
+    # Clenshaw for p
+    b1 = np.zeros(m, dtype=np.complex128)
+    b2 = np.zeros(m, dtype=np.complex128)
+    # Clenshaw for dp/dy
+    d1 = np.zeros(m, dtype=np.complex128)
+    d2 = np.zeros(m, dtype=np.complex128)
+
+    for k in range(n, -1, -1):
+        ak = a[k]
+        apk = ap_y[k] if k <= n-1 else 0.0j
+
+        for j in range(m):
+            yj = y[j]
+            b0 = 2.0*yj*b1[j] - b2[j] + ak
+            d0 = 2.0*yj*d1[j] - d2[j] + apk
+            b2[j] = b1[j]; b1[j] = b0
+            d2[j] = d1[j]; d1[j] = d0
+
+    for j in range(m):
+        out_p[j]  = b1[j] - y[j]*b2[j]
+        df_dy     = d1[j] - y[j]*d2[j]
+        out_dp[j] = (2.0/(B - A)) * df_dy   # chain rule
+@
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+
+\newpage
+\subsection{Build Chebyshev coeffs on $\left[A,B\right] $ from roots or power coeffs}
+
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Helpers & Wilkinson \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit(fastmath=True)
+def poly_from_roots(roots):
+    """
+    Build ascending power coeffs for p(x)=prod (x - r_i). Complex-safe, no np.convolve.
+    """
+    m = len(roots)
+    c = np.zeros(m+1, dtype=np.complex128)
+    c[0] = 1.0 + 0j
+    deg = 0
+    for r in roots:
+        # multiply by (x - r)
+        d = np.zeros(deg+2, dtype=np.complex128)
+        d[0] = -r * c[0]
+        for j in range(1, deg+1):
+            d[j] = c[j-1] - r * c[j]
+        d[deg+1] = c[deg]
+        c = d
+        deg += 1
+    return c
+
+@njit(fastmath=True)
+def _poly_mul_linear(p, alpha, beta):
+    """
+    Multiply p(y) by (beta + alpha*y). Ascending coeffs.
+    """
+    m = p.shape[0]
+    r = np.zeros(m+1, dtype=p.dtype)
+    r[0] = beta * p[0]
+    for j in range(1, m):
+        r[j] = alpha * p[j-1] + beta * p[j]
+    r[m] = alpha * p[m-1]
+    return r
+
+@njit(fastmath=True)
+def compose_linear(p, alpha, beta):
+    """
+    q(y) = p(alpha*y + beta), where p is ascending power coeffs in x.
+    Correct Horner: start from top coeff, then n multiplies.
+    """
+    n = p.shape[0] - 1
+    q = np.array([p[n]], dtype=p.dtype)  # start with highest coeff
+    for i in range(n-1, -1, -1):
+        q = _poly_mul_linear(q, alpha, beta)  # q <- (beta + alpha*y)*q
+        q[0] += p[i]
+    return q
+
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit(fastmath=True)
+def cheb_from_power_on_domain(p_x, A, B):
+    """
+    Given power coeffs p_x (ascending in x), return Chebyshev coeffs a for domain [A,B].
+    """
+    alpha = 0.5 * (B - A)
+    beta  = 0.5 * (A + B)
+    q_y = compose_linear(p_x, alpha, beta)  # q(y) = p(alpha*y + beta)
+    a = power_to_cheb(q_y)
+    return a
+
+@njit(fastmath=True)    
+def wilkinson_cheb_array(n, pad=0.5):
+    """
+    Chebyshev coeffs (arrays only) for Wilkinson's poly with roots 1..n on [A,B]=[1-pad, n+pad].
+    """
+    roots = np.arange(1, n+1, dtype=np.float64)
+    p_x = poly_from_roots(roots)  # ascending power coeffs in x
+    A, B = 1.0 - pad, n + pad
+    a = cheb_from_power_on_domain(p_x, A, B)
+    return a, A, B
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+
+\newpage
+\subsection{Aberth–Ehrlich in Chebyshev basis (arrays only)}
+
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Aberth & Examples \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit(fastmath=True)
+def cheb_nodes_initial_guess(n, A, B, jitter=1e-12):
+    """
+    Chebyshev nodes on [A,B] with tiny imaginary jitter to break symmetry.
+    Returns complex128 array of length n.
+    """
+    k = np.arange(1, n+1, dtype=np.float64)
+    nodes = 0.5*(A+B) + 0.5*(B-A)*np.cos((2.0*k - 1.0)*np.pi/(2.0*n))
+    z0 = nodes.astype(np.complex128)
+    z0 += 1j*jitter*(1.0 + 0.1*k)
+    return z0
+
+@njit(fastmath=True)
+def aberth_cheb_array(a, A, B, z0, maxiter=200, tol=1e-14, step_cap_factor=0.25, eps=1e-30):
+    n = a.shape[0] - 1
+    if n <= 0:
+        return np.empty(0, dtype=np.complex128), np.int64(0)
+    if z0 is None or len(z0) != n:
+        return np.empty(0, dtype=np.complex128), np.int64(0)
+
+    z = z0.copy()
+    ap_y = cheb_derivative_coeffs_y(a)
+    W = B - A
+    cap = step_cap_factor * W
+
+    # hoisted work arrays
+    pz  = np.empty(n, dtype=np.complex128)
+    dpz = np.empty(n, dtype=np.complex128)
+    S   = np.empty(n, dtype=np.complex128)
+    dz  = np.empty(n, dtype=np.complex128)
+
+    iters = np.int64(0)
+    for t in range(maxiter):
+        iters = np.int64(t+1)
+
+        # batch eval p and p'
+        cheb_eval_deriv_batch(a, ap_y, z, A, B, pz, dpz)
+
+        # tiny-derivative guard
+        for j in range(n):
+            if abs(dpz[j]) < eps * max(1.0, abs(pz[j])):
+                dpz[j] = dpz[j] + eps
+
+        # Newton ratios
+        for j in range(n):
+            pzj = pz[j]; dpzj = dpz[j]
+            pz[j] = pzj / dpzj  # reuse pz as ratio buffer
+
+        # harmonic sums S_j = sum_{k!=j} 1/(z_j - z_k)
+        for j in range(n):
+            zj = z[j]
+            ssum = 0.0 + 0.0j
+            for k in range(n):
+                if k != j:
+                    ssum += 1.0 / (zj - z[k])
+            S[j] = ssum
+
+        # Aberth step with cap
+        for j in range(n):
+            denom = 1.0 - pz[j]*S[j]
+            step = pz[j] / denom
+            mj = abs(step)
+            if mj > cap:
+                step *= (cap / mj)
+            dz[j] = step
+
+        # update
+        for j in range(n):
+            z[j] -= dz[j]
+
+        # relative convergence
+        rel = 0.0
+        for j in range(n):
+            zj = z[j]
+            step_rel = abs(dz[j]) / max(1.0, abs(zj))
+            if step_rel > rel:
+                rel = step_rel
+        if rel < tol:
+            break
+
+    return z, iters
+
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+def show_roots(roots):
+    roots_sorted = sorted(roots, key=lambda z: z.real,reverse=True)
+    df = pd.DataFrame({
+        "Real Part": [round(r.real, 3) for r in roots_sorted],
+        "Imag Part": [round(r.imag, 15) for r in roots_sorted]
+    })
+    print(df.to_string(index=False))
+
+# Example: Wilkinson n=15 on a safely scaled domain
+n = 20
+cp, A, B = wilkinson_cheb_array(n, pad=0.5)
+guess = cheb_nodes_initial_guess(n, A, B)
+cr, niter = aberth_cheb_array(cp, A, B, guess)
+print(f"iterations: {niter}")
+show_roots(cr)
+
+pp = np.poly(np.arange(1, n+1, dtype=np.complex128))
+pr = np.roots(pp)
+show_roots(pr)
+
+tpp=timeit.timeit("np.roots(pp)", globals=globals(), number=100)
+tcp=timeit.timeit("aberth_cheb_array(cp, A, B, guess)", globals=globals(), number=100)
+
+print(f"{tcp/tpp:.2f}x slower than np.roots")
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\newpage
+\section{Poly Manifold benchmarks}
+\subsection{Tile Scanners, Pertubators}
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Chebyshev & np.roots \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def tile_job(cf, A, B, s_start, s_end, t_start, t_end, n_points, perturb):
+    degree = cf.shape[0] - 1
+    steps  = int(np.sqrt(n_points))   # assume perfect square
+    s_step = (s_end - s_start) / steps
+    t_step = (t_end - t_start) / steps
+    out = np.empty((n_points * degree, 4), dtype=np.float64)
+    guess = cheb_nodes_initial_guess(degree, A, B)
+    prev_guess = guess.copy()
+    idx = 0
+    i = 0
+    j = 0
+    dj = 1
+    tot_niter = 0
+    for k in range(n_points):
+        s = s_start + i * s_step
+        t = t_start + j * t_step
+        local_cf = perturb(cf, s, t)                     # must be @njit
+        roots, niter = aberth_cheb_array(local_cf, A, B, guess)
+        tot_niter += niter
+        for r in range(degree):
+            z = roots[r]
+            out[idx, 0] = z.real
+            out[idx, 1] = z.imag
+            out[idx, 2] = s
+            out[idx, 3] = t
+            idx += 1
+        guess = roots + (roots - prev_guess)
+        prev_guess = roots.copy()
+        j += dj
+        if j == steps or j < 0:
+            i += 1
+            dj = -dj
+            j += dj
+            guess = roots.copy()
+            prev_guess = guess.copy()
+    return out, tot_niter
+
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_1(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= np.exp(1j * PI2 * t)
+    perturbed_cf[-3]  *= np.exp(1j * PI2 * s * t)
+    perturbed_cf[-6]  *= np.exp(1j * PI2 * (s - t))
+    perturbed_cf[-10]  *= np.exp(1j * PI2 * (s + t))
+    perturbed_cf[0] *= s * np.exp(1j * PI2 * t)
+    return perturbed_cf
+
+@njit
+def perturb_1_np(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[1]  *= np.exp(1j * PI2 * t)
+    perturbed_cf[2]  *= np.exp(1j * PI2 * s * t)
+    perturbed_cf[5]  *= np.exp(1j * PI2 * (s - t))
+    perturbed_cf[9]  *= np.exp(1j * PI2 * (s + t))
+    perturbed_cf[-1] *= s * np.exp(1j * PI2 * t)
+    return perturbed_cf
+
+def tile_job_np(cf_desc, s_start, s_end, t_start, t_end, n_points, perturb):
+    degree = len(cf_desc) - 1
+    steps  = int(np.sqrt(n_points))
+    if steps * steps != n_points:
+        raise ValueError("n_points must be a perfect square")
+    s_step = (s_end - s_start) / steps
+    t_step = (t_end - t_start) / steps
+    out = np.empty((n_points * degree, 4), dtype=np.float64)
+    idx = 0
+    for i in range(steps):
+        s = s_start + i * s_step
+        for j in range(steps):
+            t = t_start + j * t_step
+            local_cf = perturb(cf_desc, s, t)   # must be descending power-basis coeffs
+            roots = np.roots(local_cf)
+            for z in roots:
+                out[idx, 0] = z.real
+                out[idx, 1] = z.imag
+                out[idx, 2] = s
+                out[idx, 3] = t
+                idx += 1
+    return out
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\newpage
+\subsection{Benchmarks, Results}
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Output & Tests \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+def plot_manifold_old(mat, title, path):
+    re, im = mat[:, 0], mat[:, 1]
+    fig, ax = plt.subplots()
+    ax.scatter(re, im, s=0.5, marker=".", linewidths=0, alpha=0.6)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Re(z)")
+    ax.set_ylabel("Im(z)")
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(path, dpi=500, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_manifold(mat, title, path):
+    re, im = mat[:, 0], mat[:, 1]
+
+    # square figure
+    fig, ax = plt.subplots(figsize=(6, 6), constrained_layout=True)
+
+    ax.scatter(re, im, s=0.5, marker=".", linewidths=0, alpha=0.6)
+
+    # make data ranges square around the center
+    xmin, xmax = re.min(), re.max()
+    ymin, ymax = im.min(), im.max()
+    cx, cy = (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
+    span = max(xmax - xmin, ymax - ymin)
+    pad = 0.05 * span
+    half = span / 2.0 + pad
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+
+    # enforce 1:1 aspect
+    ax.set_aspect('equal', adjustable='box')
+    try:
+        ax.set_box_aspect(1)  # mpl >= 3.3; keeps axes box square
+    except Exception:
+        pass
+
+    ax.set_xlabel("Re(z)")
+    ax.set_ylabel("Im(z)")
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+
+    # save as a square image; avoid tight bbox if you want exact pixels
+    fig.savefig(path, dpi=500)
+    plt.close(fig)
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+cp, A, B = wilkinson_cheb_array(n, pad=0.5)
+pp = np.poly(np.arange(1, n+1, dtype=np.complex128)).astype(np.complex128)
+side = int(256)
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_1)
+print(f"{niter} avg:{niter/side/side}")
+vpr = tile_job_np(pp,0.0,1.0,0.0,1.0,side*side,perturb_1_np)
+plot_manifold(vcr, "Aberth (Chebyshev)", "manifold_cheb.png")
+plot_manifold(vpr, "np.roots", "manifold_numpy.png")
+sjcp=f"tile_job(cp,A,B,0.0,1.0,0.0,1.0,{side*side},perturb_1)"
+tjcp=timeit.timeit(sjcp,globals=globals(), number=3)
+sjpp=f"tile_job_np(pp,0.0,1.0,0.0,1.0,{side*side},perturb_1_np)"
+tjpp=timeit.timeit(sjpp, globals=globals(), number=3)
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{cc}
+\includegraphics[width=10cm, height=10cm]{manifold_cheb.png}    
+&
+\includegraphics[width=10cm, height=10cm]{manifold_numpy.png}  
+\end{tabular}    
+\end{center}
+
+\begin{center}
+\begin{itemize}
+    \item scan square of \Sexpr{py["side"]} $\times$ \Sexpr{py["side"]} $=$ \Sexpr{scales::comma(py["side"]*py["side"])} points
+    \item {\tt np.roots} manifold calc time: \Sexpr{round(py["tjpp"],2)} seconds
+    \item scanning with warm start calc time: \Sexpr{round(py["tjcp"],2)} seconds
+    \item speedup : \Sexpr{round(py["tjpp"]/py["tjcp"],2)}
+\end{itemize}
+\end{center}
+
+\newpage
+\section{Pertubators}
+\subsection{Pert2, Pert3}
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Pert2 & Pert3 \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_2(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  += np.exp(1j * PI2 * t)
+    perturbed_cf[-3]  += np.exp(1j * PI2 * s * t)
+    perturbed_cf[-6]  += np.exp(1j * PI2 * (s - t))
+    perturbed_cf[-10]  += np.exp(1j * PI2 * (s + t))
+    perturbed_cf[0] *= np.exp(1j * PI2 * (s+t))
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_2)
+print(f"{niter} avg:{niter/side/side}")
+plot_manifold(vcr, "Pertubator 2", "manifold_cheb2.png")
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_3(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= np.exp(1j * PI2 * (s+t))
+    perturbed_cf[-3]  *= np.exp(1j * PI2 * (s-t))
+    perturbed_cf[-6]  *= np.exp(1j * PI2 * (s*s - t*t))
+    perturbed_cf[-10]  *= np.exp(1j * PI2 * (s*s - t*t))
+    perturbed_cf[0] *= np.exp(1j * PI2 * t * s)
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_3)
+print(f"{niter} avg:{niter/side/side}")
+plot_manifold(vcr, "Pertubator 3", "manifold_cheb3.png")
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{cc}
+\includegraphics[width=10cm, height=10cm]{manifold_cheb2.png}    
+&
+\includegraphics[width=10cm, height=10cm]{manifold_cheb3.png}  
+\end{tabular}    
+\end{center}
+
+\newpage
+\subsection{Pert4, Pert5}
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Pert4 & Pert5 \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_4(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= np.exp(1j * PI2 * 11 * t)
+    perturbed_cf[-5]  *= np.exp(1j * PI2 * 13 * s * t)
+    perturbed_cf[-7]  *= np.exp(1j * PI2 * 17 * (s - t))
+    perturbed_cf[-11]  *= np.exp(1j * PI2 * 19 * (s + t))
+    perturbed_cf[0] *= np.exp(1j * PI2 * 23 * (s+t))
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_4)
+print(f"{niter} avg:{niter/side/side}")
+plot_manifold(vcr, "Pertubator 4", "manifold_cheb4.png")
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_5(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= np.exp(1j * PI2 * (s+t))
+    perturbed_cf[-5]  *= np.exp(1j * PI2 * (s-t))
+    perturbed_cf[-7]  *= np.exp(1j * PI2 * (s*s - t*t))
+    perturbed_cf[-11]  *= np.exp(1j * PI2 * (s*s - t*t))
+    perturbed_cf[0] *= np.exp(1j * PI2 * t * s)
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_5)
+print(f"{niter} avg:{niter/side/side}")
+plot_manifold(vcr, "Pertubator 5", "manifold_cheb5.png")
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{cc}
+\includegraphics[width=10cm, height=10cm]{manifold_cheb4.png}    
+&
+\includegraphics[width=10cm, height=10cm]{manifold_cheb5.png}  
+\end{tabular}    
+\end{center}
+
+\newpage
+\subsection{Pert6, Pert7}
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Pert6 & Pert7 \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_6(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= t
+    perturbed_cf[-5]  *= (s + 1j *t )
+    perturbed_cf[-7]  *= (s - 1j *t )
+    perturbed_cf[-11]  *= (s*s*s - 1j *t*t*t )
+    perturbed_cf[0] *= (s+t)
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_6)
+print(f"{niter} avg:{niter/side/side}")
+plot_manifold(vcr, "Pertubator 6", "manifold_cheb6.png")
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_7(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= t*s
+    perturbed_cf[-5]  *= ( s * s * t * t * 1j )
+    perturbed_cf[-7]  *= ( s * t * s - 1j * t * s * t )
+    perturbed_cf[-11] *= ( t * s * t - 1j * s * t * s )
+    perturbed_cf[0] *= ( s * t )
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_7)
+print(f"{niter} avg:{niter/side/side}")
+plot_manifold(vcr, "Pertubator 7", "manifold_cheb7.png")
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{cc}
+\includegraphics[width=10cm, height=10cm]{manifold_cheb6.png}    
+&
+\includegraphics[width=10cm, height=10cm]{manifold_cheb7.png}  
+\end{tabular}    
+\end{center}
+
+
+\newpage
+\subsection{Pert8, Pert9}
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Pert8 & Pert9 \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_8(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= t
+    perturbed_cf[-5]  *= np.cos(s + 1j *t )
+    perturbed_cf[-7]  *= (s - 1j *t ) / (s + 1j *t + 1 )
+    perturbed_cf[-11]  *= (s*s*s - 1j *t*t*t )
+    perturbed_cf[0] *= ( s + 1j * t )
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_8)
+plot_manifold(vcr, "Pertubator 8", "manifold_cheb8.png")
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def perturb_9(cf,s,t):
+    PI2 = 2 * np.pi
+    perturbed_cf = cf.copy()
+    perturbed_cf[-2]  *= t*s
+    perturbed_cf[-5]  *= np.cos( s * s * t * t * 1j )
+    perturbed_cf[-7]  *= ( s * t * s - 1j * t * s * t ) / ( s * t * s + 1j * t * s * t + 1)
+    perturbed_cf[-11] *= ( t * s * t - 1j * s * t * s )
+    perturbed_cf[0] *= ( s * t + (s + t) * 1j )
+    return perturbed_cf
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_9)
+plot_manifold(vcr, "Pertubator 9", "manifold_cheb9.png")
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{cc}
+\includegraphics[width=10cm, height=10cm]{manifold_cheb8.png}    
+&
+\includegraphics[width=10cm, height=10cm]{manifold_cheb9.png}  
+\end{tabular}    
+\end{center}
+
+\newpage
+\subsection{Pert10, Pert11}
+\begin{center}
+\begin{tabular}{c}
+\begin{tabular}{m{10cm}m{10cm}}
+\toprule
+Stetup & Pert10, Pert11 \\
+\midrule
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+def chessboard_roots(n: int) -> np.ndarray:
+    o = (n - 1) / 2.0
+    x = np.arange(n, dtype=np.float64) - o
+    y = np.arange(n, dtype=np.float64) - o
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    return (X + 1j*Y).ravel().astype(np.complex128, copy=False)
+
+def chessboard_to_cheb(n: int, pad: float = 0.5):
+    roots = chessboard_roots(n)          # (n*n,) complex128
+    deg_half = (n - 1) / 2.0
+    A = -deg_half - pad                  # enclose real parts with a little padding
+    B =  deg_half + pad
+    p_x = poly_from_roots(roots)         # ascending power coeffs (complex128)
+    a   = cheb_from_power_on_domain(p_x, A, B)  # Chebyshev coeffs on [A,B]
+    return a, A, B, roots
+
+cp, A, B, roots = chessboard_to_cheb(8)          # degree = 64
+guess = cheb_nodes_initial_guess(len(cp)-1, A, B)
+cr, niter = aberth_cheb_array(cp, A, B, guess)
+@
+\end{minipage}
+&
+\begin{minipage}[m]{10cm}
+<<, engine='python', size="tiny">>=
+@njit
+def _x_times_cheb(c):
+    n = c.shape[0]-1
+    d = np.zeros_like(c)
+    if n >= 1:
+        d[0] = 0.5*c[1]
+        if n >= 2:
+            d[1] = c[0] + 0.5*c[2]
+            for j in range(2, n):
+                d[j] = 0.5*(c[j-1] + c[j+1])
+        else:
+            d[1] = c[0]
+        d[n] = 0.5*c[n-1]
+    return d
+
+@njit
+def perturb_mix(cf, s, t):
+    e1 = 0.06*(2.0*s - 1.0)
+    e2 = 0.04*(2.0*t - 1.0)
+    y   = _x_times_cheb(cf)       # adds odd degrees
+    y2  = _x_times_cheb(y)        # richer coupling
+    return cf + e1*y + e2*y2
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_mix)
+plot_manifold(vcr, "Pertubator 10", "manifold_cheb10.png")
+
+@njit
+def perturb_11(cf,s,t):
+    e1 = 0.06*(2.0*s - 1.0j)
+    e2 = 0.04*(2.0*t - 1.0j)
+    y   = _x_times_cheb(cf)       # adds odd degrees
+    y2  = _x_times_cheb(y)        # richer coupling
+    return cf + e1*y*1j + e2*y2*t
+
+vcr, niter = tile_job(cp,A,B,0.0,1.0,0.0,1.0,side*side,perturb_11)
+plot_manifold(vcr, "Pertubator 11", "manifold_cheb11.png")
+@
+
+\end{minipage}
+\\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{cc}
+\includegraphics[width=10cm, height=10cm]{manifold_cheb10.png}    
+&
+\includegraphics[width=10cm, height=10cm]{manifold_cheb11.png}  
+\end{tabular}    
+\end{center}
+
+
+\end{document}

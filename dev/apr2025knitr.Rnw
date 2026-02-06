@@ -1,0 +1,2007 @@
+\documentclass[11pt]{article}
+\usepackage[portrait, margin=1.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage[dvipsnames,table]{xcolor}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{hyperref}
+\usepackage{amsmath}
+
+\title{\vspace{2cm}\Huge\textbf{P\&L Analysis}\\\vspace{0.5cm}\Large March--May 2025}
+\author{}
+\date{\vspace{1cm}\today}
+
+% Setup reticulate with project virtualenv
+<<setup, include=FALSE>>=
+library(reticulate)
+use_virtualenv("/Users/nicknassuphis/specparser/.venv", required = TRUE)
+library(knitr)
+opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE, results='asis')
+@
+
+% All Python code in one chunk to ensure variable persistence
+<<all_python, engine='python', include=FALSE>>=
+import sys
+import os
+import pandas as pd
+import numpy as np
+import warnings
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# Paths
+PROJECT_ROOT = "/Users/nicknassuphis/specparser"
+FIGURE_DIR = PROJECT_ROOT + "/dev/"
+
+# Load P\&L data
+df = pd.read_parquet(PROJECT_ROOT + "/data/wpnl_20260129.parquet")
+df['date'] = pd.to_datetime(df['date'])
+df.set_index('date', inplace=True)
+n_rows = len(df)
+n_assets = len(df.columns)
+date_min = df.index.min().strftime('%Y-%m-%d')
+date_max = df.index.max().strftime('%Y-%m-%d')
+
+# Filter to Mar, Apr, May 2025
+df_2025 = df['2025-03':'2025-05']
+
+# Sum by month for each asset
+monthly = df_2025.resample('ME').sum()
+
+# Transpose so assets are rows, months are columns
+monthly_t = monthly.T
+monthly_t.columns = ['Mar 2025', 'Apr 2025', 'May 2025']
+
+# Sort by Apr 2025 descending (most negative on top)
+monthly_t = monthly_t.sort_values('Apr 2025', ascending=True)
+
+# Convert to basis points with 2x leverage
+monthly_bps = (monthly_t * 10000 * 2).round(0).astype(int)
+
+# Add totals row (sum raw values first, then round)
+totals = (monthly_t * 10000 * 2).sum().round(0).astype(int)
+totals.name = 'TOTAL'
+result_asset = pd.concat([monthly_bps, totals.to_frame().T])
+
+# Generate LaTeX for 3-column asset table (fits on one page)
+def df_to_threecol(dataframe, caption, label):
+    # Split dataframe into thirds (excluding TOTAL row, add it to last part)
+    df_no_total = dataframe[dataframe.index != 'TOTAL']
+    total_row = dataframe[dataframe.index == 'TOTAL']
+
+    n = len(df_no_total)
+    third1 = (n + 2) // 3
+    third2 = (2 * n + 2) // 3
+    left_df = df_no_total.iloc[:third1]
+    mid_df = df_no_total.iloc[third1:third2]
+    right_df = df_no_total.iloc[third2:]
+
+    def make_table_rows(df, include_total=False, total_df=None):
+        rows = []
+        for idx, row in df.iterrows():
+            name = str(idx).replace('_', r'\_')
+            rows.append(f'{name} & {row["Mar 2025"]} & {row["Apr 2025"]} & {row["May 2025"]} \\\\')
+        if include_total and total_df is not None and len(total_df) > 0:
+            rows.append(r'\midrule')
+            for idx, row in total_df.iterrows():
+                name = str(idx).replace('_', r'\_')
+                rows.append(f'\\textbf{{{name}}} & \\textbf{{{row["Mar 2025"]}}} & \\textbf{{{row["Apr 2025"]}}} & \\textbf{{{row["May 2025"]}}} \\\\')
+        return '\n'.join(rows)
+
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{' + caption + r'}')
+    lines.append(r'\label{' + label + r'}')
+    lines.append(r'\tiny')
+    lines.append(r'\begin{minipage}[t]{0.32\textwidth}')
+    lines.append(r'\begin{tabular}[t]{lrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Asset & Mar & Apr & May \\')
+    lines.append(r'\midrule')
+    lines.append(make_table_rows(left_df))
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{minipage}')
+    lines.append(r'\hfill')
+    lines.append(r'\begin{minipage}[t]{0.32\textwidth}')
+    lines.append(r'\begin{tabular}[t]{lrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Asset & Mar & Apr & May \\')
+    lines.append(r'\midrule')
+    lines.append(make_table_rows(mid_df))
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{minipage}')
+    lines.append(r'\hfill')
+    lines.append(r'\begin{minipage}[t]{0.32\textwidth}')
+    lines.append(r'\begin{tabular}[t]{lrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Asset & Mar & Apr & May \\')
+    lines.append(r'\midrule')
+    lines.append(make_table_rows(right_df, include_total=True, total_df=total_row))
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{minipage}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+asset_table_latex = df_to_threecol(result_asset, r'Monthly P\&L by Asset (bps, 2x leverage)', 'tab:asset')
+
+# Load asset-to-class mapping
+ag = pd.read_parquet(PROJECT_ROOT + "/data/ag.parquet")
+asset_to_class = dict(zip(ag['asset'], ag['group']))
+
+# Map assets to classes and aggregate
+monthly_raw = monthly_t * 10000 * 2
+monthly_raw['class'] = monthly_raw.index.map(asset_to_class)
+
+# Group by class and sum, then round
+by_class = monthly_raw.groupby('class')[['Mar 2025', 'Apr 2025', 'May 2025']].sum().round(0).astype(int)
+by_class = by_class.sort_values('Apr 2025', ascending=True)
+
+# Add totals row (sum raw values across all assets)
+totals_class = monthly_raw[['Mar 2025', 'Apr 2025', 'May 2025']].sum().round(0).astype(int)
+totals_class.name = 'TOTAL'
+result_class = pd.concat([by_class, totals_class.to_frame().T])
+
+# Generate LaTeX for class table
+def df_to_table(dataframe, caption, label):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{' + caption + r'}')
+    lines.append(r'\label{' + label + r'}')
+    lines.append(r'\begin{tabular}{lrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Class & Mar 2025 & Apr 2025 & May 2025 \\')
+    lines.append(r'\midrule')
+
+    for idx, row in dataframe.iterrows():
+        name = str(idx).replace('_', r'\_')
+        if idx == 'TOTAL':
+            lines.append(r'\midrule')
+            lines.append(f'\\textbf{{{name}}} & \\textbf{{{row["Mar 2025"]}}} & \\textbf{{{row["Apr 2025"]}}} & \\textbf{{{row["May 2025"]}}} \\\\')
+        else:
+            lines.append(f'{name} & {row["Mar 2025"]} & {row["Apr 2025"]} & {row["May 2025"]} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+class_table_latex = df_to_table(result_class, r'Monthly P\&L by Asset Class (bps, 2x leverage)', 'tab:class')
+
+# Correlation between Apr and May 2025
+corr = monthly_t['Apr 2025'].corr(monthly_t['May 2025'])
+corr_str = f"{corr:.3f}"
+
+# Compute monthly total P\&L over entire period (in leveraged bps)
+monthly_total = df.resample('ME').sum().sum(axis=1) * 10000 * 2
+
+# Remove zero months (no trading activity)
+monthly_total = monthly_total[monthly_total != 0]
+
+# Get Apr and May 2025 values
+apr_2025 = float(monthly_total['2025-04'].iloc[0])
+may_2025 = float(monthly_total['2025-05'].iloc[0])
+
+# Create histogram
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.hist(monthly_total, bins=50, edgecolor='black', alpha=0.7)
+ax.axvline(apr_2025, color='red', linestyle='--', linewidth=2, label=f'Apr 2025: {apr_2025:.0f} bps')
+ax.axvline(may_2025, color='green', linestyle='--', linewidth=2, label=f'May 2025: {may_2025:.0f} bps')
+ax.set_xlabel('Monthly P&L (bps)')
+ax.set_ylabel('Frequency')
+ax.set_title('Distribution of Monthly P&L (2001-2025)')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'histogram.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Losing months analysis
+threshold = -100
+losing_months = monthly_total[monthly_total < threshold]
+
+# Compute monthly P\&L by asset (full series)
+monthly_by_asset = df.resample('ME').sum() * 10000 * 2
+monthly_total_full = monthly_by_asset.sum(axis=1)
+
+# Helper for cross-sectional correlation
+def xs_corr(x_by_asset, y_by_asset):
+    valid_mask = x_by_asset.notna() & y_by_asset.notna()
+    if valid_mask.sum() > 2:
+        x = x_by_asset[valid_mask].values
+        y = y_by_asset[valid_mask].values
+        if x.std() > 1e-10 and y.std() > 1e-10:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return np.corrcoef(x, y)[0, 1]
+    return np.nan
+
+# Build losing months table
+loss_rows = []
+for date in losing_months.index:
+    month_str = date.strftime('%b%Y')
+    loss = monthly_total.loc[date]
+    pos = monthly_by_asset.index.get_loc(date)
+
+    # Top 3 largest losers
+    loss_month_by_asset = monthly_by_asset.iloc[pos]
+    top3_losses = loss_month_by_asset.nsmallest(3).sum()
+
+    # Forward returns
+    next_1m = monthly_total_full.iloc[pos + 1] if pos + 1 < len(monthly_by_asset) else np.nan
+    next_2m = monthly_total_full.iloc[pos + 1:pos + 3].sum() if pos + 2 < len(monthly_by_asset) else np.nan
+    next_3m = monthly_total_full.iloc[pos + 1:pos + 4].sum() if pos + 3 < len(monthly_by_asset) else np.nan
+    total_3m = loss + next_3m if not np.isnan(next_3m) else np.nan
+
+    # Cross-sectional correlations
+    cor_1m = xs_corr(loss_month_by_asset, monthly_by_asset.iloc[pos + 1]) if pos + 1 < len(monthly_by_asset) else np.nan
+    cor_2m = xs_corr(loss_month_by_asset, monthly_by_asset.iloc[pos + 1:pos + 3].sum()) if pos + 2 < len(monthly_by_asset) else np.nan
+    cor_3m = xs_corr(loss_month_by_asset, monthly_by_asset.iloc[pos + 1:pos + 4].sum()) if pos + 3 < len(monthly_by_asset) else np.nan
+
+    loss_rows.append({
+        'month': month_str,
+        'loss': int(round(loss)),
+        'top3': int(round(top3_losses)),
+        'p1m': int(round(next_1m)) if pd.notna(next_1m) else None,
+        'p2m': int(round(next_2m)) if pd.notna(next_2m) else None,
+        'p3m': int(round(next_3m)) if pd.notna(next_3m) else None,
+        'tot3m': int(round(total_3m)) if pd.notna(total_3m) else None,
+        'c1m': round(cor_1m * 100, 1) if pd.notna(cor_1m) else None,
+        'c2m': round(cor_2m * 100, 1) if pd.notna(cor_2m) else None,
+        'c3m': round(cor_3m * 100, 1) if pd.notna(cor_3m) else None
+    })
+
+loss_table = pd.DataFrame(loss_rows)
+
+# Generate LaTeX for losing months table
+def loss_table_to_latex(dataframe):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Losing Months Analysis (threshold: $-$100 bps)}')
+    lines.append(r'\label{tab:losing}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrrrrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Month & Loss & Top3 & $+$1m & $+$2m & $+$3m & Tot$+$3m & c$+$1m & c$+$2m & c$+$3m \\')
+    lines.append(r'\midrule')
+
+    for _, row in dataframe.iterrows():
+        vals = [
+            row['month'],
+            str(row['loss']),
+            str(row['top3']),
+            str(row['p1m']) if row['p1m'] is not None else '--',
+            str(row['p2m']) if row['p2m'] is not None else '--',
+            str(row['p3m']) if row['p3m'] is not None else '--',
+            str(row['tot3m']) if row['tot3m'] is not None else '--',
+            str(row['c1m']) if row['c1m'] is not None else '--',
+            str(row['c2m']) if row['c2m'] is not None else '--',
+            str(row['c3m']) if row['c3m'] is not None else '--',
+        ]
+        lines.append(' & '.join(vals) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+loss_table_latex = loss_table_to_latex(loss_table)
+
+# Scatter plot: Loss vs +1m
+fig, ax = plt.subplots(figsize=(8, 6))
+x = loss_table['loss'].values
+y = np.array([v if v is not None else np.nan for v in loss_table['p1m'].values])
+
+ax.scatter(x, y, s=50, alpha=0.7)
+
+# Add regression line
+mask = ~np.isnan(y)
+if mask.sum() > 1:
+    z = np.polyfit(x[mask], y[mask], 1)
+    p = np.poly1d(z)
+    x_line = np.linspace(x.min(), x.max(), 100)
+    ax.plot(x_line, p(x_line), 'r--', alpha=0.7, label=f'slope: {z[0]:.2f}')
+
+ax.axhline(0, color='gray', linestyle='-', alpha=0.3)
+ax.axvline(0, color='gray', linestyle='-', alpha=0.3)
+ax.set_xlabel('Loss Month P&L (bps)')
+ax.set_ylabel('+1m P&L (bps)')
+ax.set_title('Losing Months: Loss vs Next Month Recovery')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'scatter_loss.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Winning months scatter
+winning_threshold = 100
+winning_months = monthly_total[monthly_total > winning_threshold]
+
+win_rows = []
+for date in winning_months.index:
+    month_str = date.strftime('%b%Y')
+    gain = monthly_total.loc[date]
+    pos = monthly_by_asset.index.get_loc(date)
+    next_1m = monthly_total_full.iloc[pos + 1] if pos + 1 < len(monthly_by_asset) else np.nan
+    win_rows.append({'month': month_str, 'gain': int(round(gain)), 'p1m': int(round(next_1m)) if pd.notna(next_1m) else None})
+
+win_table = pd.DataFrame(win_rows)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+x = win_table['gain'].values
+y = np.array([v if v is not None else np.nan for v in win_table['p1m'].values])
+
+ax.scatter(x, y, s=50, alpha=0.7, color='green')
+
+mask = ~np.isnan(y)
+if mask.sum() > 1:
+    z = np.polyfit(x[mask], y[mask], 1)
+    p = np.poly1d(z)
+    x_line = np.linspace(x.min(), x.max(), 100)
+    ax.plot(x_line, p(x_line), 'r--', alpha=0.7, label=f'slope: {z[0]:.2f}')
+
+ax.axhline(0, color='gray', linestyle='-', alpha=0.3)
+ax.axvline(0, color='gray', linestyle='-', alpha=0.3)
+ax.set_xlabel('Winning Month P&L (bps)')
+ax.set_ylabel('+1m P&L (bps)')
+ax.set_title('Winning Months (>100 bps): Gain vs Next Month')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'scatter_win.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Conditional Auto-correlation by Asset Class
+# Compute monthly P\&L by asset class over full history
+monthly_by_asset_full = df.resample('ME').sum() * 10000 * 2  # leveraged bps
+
+# Map assets to classes
+asset_classes = pd.Series(asset_to_class)
+
+# Aggregate by class for each month
+monthly_by_class = pd.DataFrame()
+for cls in asset_classes.unique():
+    class_assets = asset_classes[asset_classes == cls].index
+    # Only include assets that exist in our data
+    valid_assets = [a for a in class_assets if a in monthly_by_asset_full.columns]
+    if valid_assets:
+        monthly_by_class[cls] = monthly_by_asset_full[valid_assets].sum(axis=1)
+
+# Remove zero months
+monthly_by_class = monthly_by_class[monthly_by_class.sum(axis=1) != 0]
+
+# Compute conditional autocorrelations
+# Conditioning is on TOTAL portfolio P\&L, not individual class
+
+# Compute total portfolio P\&L per month
+total_portfolio_pnl = monthly_by_class.sum(axis=1)
+total_portfolio_pnl_nz = total_portfolio_pnl[total_portfolio_pnl != 0]
+
+# Compute medians for extreme conditioning
+median_positive = total_portfolio_pnl_nz[total_portfolio_pnl_nz > 0].median()
+median_negative = total_portfolio_pnl_nz[total_portfolio_pnl_nz < 0].median()
+
+def lag1_autocorr_conditional(class_series, total_series, condition=None,
+                               med_pos=None, med_neg=None):
+    """Compute lag-1 autocorrelation for a class, conditional on total portfolio.
+
+    Filters out zero values to avoid pollution from inactive months.
+    """
+    # Align series
+    common_idx = class_series.index.intersection(total_series.index)
+    class_s = class_series.loc[common_idx]
+    total_s = total_series.loc[common_idx]
+
+    # Remove months where class or total is zero
+    nonzero_mask = (class_s != 0) & (total_s != 0)
+    class_s = class_s[nonzero_mask]
+    total_s = total_s[nonzero_mask]
+
+    if len(class_s) < 3:
+        return np.nan
+
+    # Build lag-1 pairs
+    current = class_s.iloc[:-1].values
+    next_val = class_s.iloc[1:].values
+    total_current = total_s.iloc[:-1].values
+
+    if condition == 'positive':
+        mask = total_current > 0
+    elif condition == 'negative':
+        mask = total_current < 0
+    elif condition == 'strong_positive':
+        mask = total_current > med_pos
+    elif condition == 'strong_negative':
+        mask = total_current < med_neg
+    else:
+        mask = np.ones(len(current), dtype=bool)
+
+    if mask.sum() < 3:
+        return np.nan
+
+    x, y = current[mask], next_val[mask]
+    if x.std() < 1e-10 or y.std() < 1e-10:
+        return np.nan
+    return np.corrcoef(x, y)[0, 1]
+
+# Build autocorrelation table
+autocorr_rows = []
+for cls in sorted(monthly_by_class.columns):
+    series = monthly_by_class[cls]
+    autocorr_rows.append({
+        'class': cls,
+        'all': lag1_autocorr_conditional(series, total_portfolio_pnl),
+        'pos': lag1_autocorr_conditional(series, total_portfolio_pnl, 'positive'),
+        'neg': lag1_autocorr_conditional(series, total_portfolio_pnl, 'negative'),
+        'strong_pos': lag1_autocorr_conditional(series, total_portfolio_pnl, 'strong_positive', median_positive, median_negative),
+        'strong_neg': lag1_autocorr_conditional(series, total_portfolio_pnl, 'strong_negative', median_positive, median_negative)
+    })
+
+# Add "All" row for total portfolio
+autocorr_rows.append({
+    'class': 'All',
+    'all': lag1_autocorr_conditional(total_portfolio_pnl, total_portfolio_pnl),
+    'pos': lag1_autocorr_conditional(total_portfolio_pnl, total_portfolio_pnl, 'positive'),
+    'neg': lag1_autocorr_conditional(total_portfolio_pnl, total_portfolio_pnl, 'negative'),
+    'strong_pos': lag1_autocorr_conditional(total_portfolio_pnl, total_portfolio_pnl, 'strong_positive', median_positive, median_negative),
+    'strong_neg': lag1_autocorr_conditional(total_portfolio_pnl, total_portfolio_pnl, 'strong_negative', median_positive, median_negative)
+})
+
+autocorr_df = pd.DataFrame(autocorr_rows)
+
+# Generate LaTeX for autocorrelation table (correlations * 100, 1 decimal)
+def autocorr_table_to_latex(dataframe):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Conditional Auto-correlation by Asset Class}')
+    lines.append(r'\label{tab:autocorr}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Class & All & If $+$ve & If $-$ve & If $>$med$+$ & If $<$med$-$ \\')
+    lines.append(r'\midrule')
+
+    for _, row in dataframe.iterrows():
+        name = str(row['class']).replace('_', r'\_')
+        all_val = f"{row['all'] * 100:.1f}" if pd.notna(row['all']) else '--'
+        pos_val = f"{row['pos'] * 100:.1f}" if pd.notna(row['pos']) else '--'
+        neg_val = f"{row['neg'] * 100:.1f}" if pd.notna(row['neg']) else '--'
+        spos_val = f"{row['strong_pos'] * 100:.1f}" if pd.notna(row['strong_pos']) else '--'
+        sneg_val = f"{row['strong_neg'] * 100:.1f}" if pd.notna(row['strong_neg']) else '--'
+        if row['class'] == 'All':
+            lines.append(r'\midrule')
+            lines.append(f'\\textbf{{{name}}} & \\textbf{{{all_val}}} & \\textbf{{{pos_val}}} & \\textbf{{{neg_val}}} & \\textbf{{{spos_val}}} & \\textbf{{{sneg_val}}} \\\\')
+        else:
+            lines.append(f'{name} & {all_val} & {pos_val} & {neg_val} & {spos_val} & {sneg_val} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+autocorr_table_latex = autocorr_table_to_latex(autocorr_df)
+
+# Conditional Average Monthly P\&L by Asset Class
+# Conditioning is on TOTAL portfolio P\&L (sum across all assets), not individual class
+
+# Compute total portfolio P\&L per month (sum across all classes)
+total_portfolio_pnl = monthly_by_class.sum(axis=1)
+
+# Remove months where total is zero
+nonzero_months = total_portfolio_pnl[total_portfolio_pnl != 0].index
+monthly_by_class_nz = monthly_by_class.loc[nonzero_months]
+total_portfolio_nz = total_portfolio_pnl.loc[nonzero_months]
+
+# Build conditional average table
+avg_rows = []
+for cls in sorted(monthly_by_class_nz.columns):
+    class_pnl = monthly_by_class_nz[cls]
+
+    # Overall average (excluding zero months for this class)
+    class_nonzero = class_pnl[class_pnl != 0]
+    avg_all = class_nonzero.mean() if len(class_nonzero) > 0 else np.nan
+
+    # Get previous month's total portfolio P\&L
+    prev_total = total_portfolio_nz.shift(1)
+
+    # Current class P\&L values (excluding first month which has no previous)
+    valid_idx = class_pnl.index[1:]
+    curr_class = class_pnl.loc[valid_idx]
+    prev_total_aligned = prev_total.loc[valid_idx]
+
+    # Filter out zeros in current class
+    nonzero_mask = curr_class != 0
+    curr_class_nz = curr_class[nonzero_mask]
+    prev_total_nz = prev_total_aligned[nonzero_mask]
+
+    # Average when previous month's TOTAL portfolio was positive
+    pos_mask = prev_total_nz > 0
+    avg_after_pos = curr_class_nz[pos_mask].mean() if pos_mask.sum() > 0 else np.nan
+
+    # Average when previous month's TOTAL portfolio was negative
+    neg_mask = prev_total_nz < 0
+    avg_after_neg = curr_class_nz[neg_mask].mean() if neg_mask.sum() > 0 else np.nan
+
+    # Average when previous month's TOTAL portfolio > median of positives
+    strong_pos_mask = prev_total_nz > median_positive
+    avg_after_strong_pos = curr_class_nz[strong_pos_mask].mean() if strong_pos_mask.sum() > 0 else np.nan
+
+    # Average when previous month's TOTAL portfolio < median of negatives
+    strong_neg_mask = prev_total_nz < median_negative
+    avg_after_strong_neg = curr_class_nz[strong_neg_mask].mean() if strong_neg_mask.sum() > 0 else np.nan
+
+    avg_rows.append({
+        'class': cls,
+        'all': avg_all,
+        'after_pos': avg_after_pos,
+        'after_neg': avg_after_neg,
+        'after_strong_pos': avg_after_strong_pos,
+        'after_strong_neg': avg_after_strong_neg
+    })
+
+# Add "All" row for total portfolio
+total_pnl = total_portfolio_nz
+total_nonzero = total_pnl[total_pnl != 0]
+avg_all_total = total_nonzero.mean() if len(total_nonzero) > 0 else np.nan
+
+prev_total = total_portfolio_nz.shift(1)
+valid_idx = total_pnl.index[1:]
+curr_total = total_pnl.loc[valid_idx]
+prev_total_aligned = prev_total.loc[valid_idx]
+
+nonzero_mask = curr_total != 0
+curr_total_nz = curr_total[nonzero_mask]
+prev_total_nz_avg = prev_total_aligned[nonzero_mask]
+
+pos_mask = prev_total_nz_avg > 0
+avg_after_pos_total = curr_total_nz[pos_mask].mean() if pos_mask.sum() > 0 else np.nan
+
+neg_mask = prev_total_nz_avg < 0
+avg_after_neg_total = curr_total_nz[neg_mask].mean() if neg_mask.sum() > 0 else np.nan
+
+strong_pos_mask = prev_total_nz_avg > median_positive
+avg_after_strong_pos_total = curr_total_nz[strong_pos_mask].mean() if strong_pos_mask.sum() > 0 else np.nan
+
+strong_neg_mask = prev_total_nz_avg < median_negative
+avg_after_strong_neg_total = curr_total_nz[strong_neg_mask].mean() if strong_neg_mask.sum() > 0 else np.nan
+
+avg_rows.append({
+    'class': 'All',
+    'all': avg_all_total,
+    'after_pos': avg_after_pos_total,
+    'after_neg': avg_after_neg_total,
+    'after_strong_pos': avg_after_strong_pos_total,
+    'after_strong_neg': avg_after_strong_neg_total
+})
+
+avg_df = pd.DataFrame(avg_rows)
+
+# Generate LaTeX for conditional average table
+def avg_table_to_latex(dataframe):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Conditional Average Monthly P\&L by Asset Class (bps)}')
+    lines.append(r'\label{tab:condavg}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Class & All & After $+$ve & After $-$ve & After $>$med$+$ & After $<$med$-$ \\')
+    lines.append(r'\midrule')
+
+    for _, row in dataframe.iterrows():
+        name = str(row['class']).replace('_', r'\_')
+        all_val = f"{row['all']:.1f}" if pd.notna(row['all']) else '--'
+        pos_val = f"{row['after_pos']:.1f}" if pd.notna(row['after_pos']) else '--'
+        neg_val = f"{row['after_neg']:.1f}" if pd.notna(row['after_neg']) else '--'
+        spos_val = f"{row['after_strong_pos']:.1f}" if pd.notna(row['after_strong_pos']) else '--'
+        sneg_val = f"{row['after_strong_neg']:.1f}" if pd.notna(row['after_strong_neg']) else '--'
+        if row['class'] == 'All':
+            lines.append(r'\midrule')
+            lines.append(f'\\textbf{{{name}}} & \\textbf{{{all_val}}} & \\textbf{{{pos_val}}} & \\textbf{{{neg_val}}} & \\textbf{{{spos_val}}} & \\textbf{{{sneg_val}}} \\\\')
+        else:
+            lines.append(f'{name} & {all_val} & {pos_val} & {neg_val} & {spos_val} & {sneg_val} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+avg_table_latex = avg_table_to_latex(avg_df)
+
+# Recovery Length Analysis
+# For each loss month, count months until cumulative P&L turns positive
+
+def compute_recovery_months(pnl_series):
+    """Compute recovery months for each loss month in a P&L series.
+
+    Returns list of recovery lengths (in months) for each loss month.
+    None if recovery never happened within the data.
+    """
+    pnl = pnl_series.dropna()
+    pnl = pnl[pnl != 0]  # Remove zero months
+
+    recovery_lengths = []
+
+    for i in range(len(pnl)):
+        if pnl.iloc[i] < 0:  # Loss month
+            # Track cumulative P&L from this point
+            cumsum = pnl.iloc[i]
+            months_to_recover = None
+            for j in range(i + 1, len(pnl)):
+                cumsum += pnl.iloc[j]
+                if cumsum >= 0:
+                    months_to_recover = j - i
+                    break
+            recovery_lengths.append((pnl.iloc[i], months_to_recover))
+
+    return recovery_lengths
+
+def avg_recovery_by_threshold(recovery_data, threshold=0):
+    """Compute average recovery months for losses exceeding threshold."""
+    filtered = [(loss, months) for loss, months in recovery_data
+                if loss < -threshold and months is not None]
+    if len(filtered) == 0:
+        return np.nan, 0
+    return np.mean([m for _, m in filtered]), len(filtered)
+
+# Compute recovery for each asset class
+recovery_by_class = {}
+for cls in sorted(monthly_by_class.columns):
+    recovery_by_class[cls] = compute_recovery_months(monthly_by_class[cls])
+
+# Also compute for total portfolio
+recovery_by_class['All'] = compute_recovery_months(total_portfolio_pnl)
+
+# Build recovery table
+def build_recovery_table(recovery_data, thresholds=[0, 100, 200, 400]):
+    rows = []
+    for cls in sorted([c for c in recovery_data.keys() if c != 'All']):
+        row = {'class': cls}
+        for thresh in thresholds:
+            avg, n = avg_recovery_by_threshold(recovery_data[cls], thresh)
+            row[f't{thresh}'] = avg
+            row[f'n{thresh}'] = n
+        rows.append(row)
+
+    # Add "All" row
+    row = {'class': 'All'}
+    for thresh in thresholds:
+        avg, n = avg_recovery_by_threshold(recovery_data['All'], thresh)
+        row[f't{thresh}'] = avg
+        row[f'n{thresh}'] = n
+    rows.append(row)
+
+    return pd.DataFrame(rows)
+
+recovery_df = build_recovery_table(recovery_by_class)
+
+# Generate LaTeX for recovery table
+def recovery_table_to_latex(dataframe):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Average Months to Recovery by Asset Class}')
+    lines.append(r'\label{tab:recovery}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Class & Any Loss & $>$100 bps & $>$200 bps & $>$400 bps \\')
+    lines.append(r'\midrule')
+
+    for _, row in dataframe.iterrows():
+        name = str(row['class']).replace('_', r'\_')
+        t0 = f"{row['t0']:.1f}" if pd.notna(row['t0']) else '--'
+        t100 = f"{row['t100']:.1f}" if pd.notna(row['t100']) else '--'
+        t200 = f"{row['t200']:.1f}" if pd.notna(row['t200']) else '--'
+        t400 = f"{row['t400']:.1f}" if pd.notna(row['t400']) else '--'
+
+        if row['class'] == 'All':
+            lines.append(r'\midrule')
+            lines.append(f'\\textbf{{{name}}} & \\textbf{{{t0}}} & \\textbf{{{t100}}} & \\textbf{{{t200}}} & \\textbf{{{t400}}} \\\\')
+        else:
+            lines.append(f'{name} & {t0} & {t100} & {t200} & {t400} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+recovery_table_latex = recovery_table_to_latex(recovery_df)
+
+# Also create a table with sample counts
+def recovery_count_table_to_latex(dataframe):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Number of Loss Months by Threshold (sample size)}')
+    lines.append(r'\label{tab:recovery_n}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Class & Any Loss & $>$100 bps & $>$200 bps & $>$400 bps \\')
+    lines.append(r'\midrule')
+
+    for _, row in dataframe.iterrows():
+        name = str(row['class']).replace('_', r'\_')
+        n0 = int(row['n0']) if pd.notna(row['n0']) else 0
+        n100 = int(row['n100']) if pd.notna(row['n100']) else 0
+        n200 = int(row['n200']) if pd.notna(row['n200']) else 0
+        n400 = int(row['n400']) if pd.notna(row['n400']) else 0
+
+        if row['class'] == 'All':
+            lines.append(r'\midrule')
+            lines.append(f'\\textbf{{{name}}} & \\textbf{{{n0}}} & \\textbf{{{n100}}} & \\textbf{{{n200}}} & \\textbf{{{n400}}} \\\\')
+        else:
+            lines.append(f'{name} & {n0} & {n100} & {n200} & {n400} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+recovery_count_latex = recovery_count_table_to_latex(recovery_df)
+
+# Loss Day Characteristics
+# Work with daily data (2x leverage, bps)
+daily_pnl = df * 10000 * 2  # Daily P&L by asset
+
+# Total daily P&L
+daily_total = daily_pnl.sum(axis=1)
+
+# Identify losing days (total P&L < 0, excluding zero days)
+losing_days = daily_total[daily_total < 0].index
+
+# --- Loss Drivers: Fraction of losing assets to cover 80% of loss ---
+def assets_to_cover_loss(row, threshold=0.8):
+    """Return fraction (%) of losing assets needed to cover threshold% of total loss."""
+    # Get only losing assets (negative P&L)
+    losses = row[row < 0].sort_values()  # Most negative first
+    if len(losses) == 0:
+        return np.nan
+
+    total_loss = losses.sum()  # Total loss (negative number)
+    if total_loss == 0:
+        return np.nan
+
+    target = total_loss * threshold  # 80% of total loss
+    cumsum = 0
+    for i, val in enumerate(losses):
+        cumsum += val
+        if cumsum <= target:  # Both are negative, so <= means we've covered enough
+            return (i + 1) / len(losses) * 100  # Return percentage
+    return 100.0  # All assets needed
+
+loss_driver_pcts = []
+for day in losing_days:
+    row = daily_pnl.loc[day]
+    pct = assets_to_cover_loss(row, 0.8)
+    if not np.isnan(pct):
+        loss_driver_pcts.append(pct)
+
+loss_driver_pcts = np.array(loss_driver_pcts)
+
+# Create histogram for loss drivers
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.hist(loss_driver_pcts, bins=50, edgecolor='black', alpha=0.7)
+ax.set_xlabel('Fraction of Losing Assets (%)')
+ax.set_ylabel('Frequency')
+ax.set_title('Fraction of Losing Assets Needed to Cover 80% of Daily Loss')
+ax.axvline(np.mean(loss_driver_pcts), color='red', linestyle='--', linewidth=2,
+           label=f'Mean: {np.mean(loss_driver_pcts):.1f}%')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'loss_drivers.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Summary stats for loss drivers
+loss_driver_mean = np.mean(loss_driver_pcts)
+loss_driver_median = np.median(loss_driver_pcts)
+loss_driver_n = len(loss_driver_pcts)
+
+# --- Loss Intensity: Gain/Loss ratio on losing days ---
+loss_intensity_ratios = []
+for day in losing_days:
+    row = daily_pnl.loc[day]
+    gains = row[row > 0].sum()  # Sum of positive P&L
+    losses = row[row < 0].sum()  # Sum of negative P&L (negative number)
+
+    if losses < 0:  # Only if there are actual losses
+        ratio = gains / abs(losses)  # gain / |loss|
+        loss_intensity_ratios.append(ratio)
+
+loss_intensity_ratios = np.array(loss_intensity_ratios)
+
+# Create histogram for loss intensity
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.hist(loss_intensity_ratios, bins=50, edgecolor='black', alpha=0.7)
+ax.set_xlabel('Gain / Loss Ratio')
+ax.set_ylabel('Frequency')
+ax.set_title('Loss Intensity: Gain as % of Loss on Losing Days')
+ax.axvline(1.0, color='red', linestyle='--', linewidth=1, alpha=0.5, label='Break-even')
+ax.axvline(np.mean(loss_intensity_ratios), color='green', linestyle='--', linewidth=2,
+           label=f'Mean: {np.mean(loss_intensity_ratios):.2f}')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'loss_intensity.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Summary stats for loss intensity
+loss_intensity_mean = np.mean(loss_intensity_ratios)
+loss_intensity_median = np.median(loss_intensity_ratios)
+loss_intensity_n = len(loss_intensity_ratios)
+
+# --- Gain Drivers: Fraction of gaining assets to cover 80% of gain ---
+winning_days = daily_total[daily_total > 0].index
+
+def assets_to_cover_gain(row, threshold=0.8):
+    """Return fraction (%) of gaining assets needed to cover threshold% of total gain."""
+    gains = row[row > 0].sort_values(ascending=False)  # Most positive first
+    if len(gains) == 0:
+        return np.nan
+
+    total_gain = gains.sum()
+    if total_gain == 0:
+        return np.nan
+
+    target = total_gain * threshold  # 80% of total gain
+    cumsum = 0
+    for i, val in enumerate(gains):
+        cumsum += val
+        if cumsum >= target:
+            return (i + 1) / len(gains) * 100  # Return percentage
+    return 100.0  # All assets needed
+
+gain_driver_pcts = []
+for day in winning_days:
+    row = daily_pnl.loc[day]
+    pct = assets_to_cover_gain(row, 0.8)
+    if not np.isnan(pct):
+        gain_driver_pcts.append(pct)
+
+gain_driver_pcts = np.array(gain_driver_pcts)
+
+# Create histogram for gain drivers
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.hist(gain_driver_pcts, bins=50, edgecolor='black', alpha=0.7, color='green')
+ax.set_xlabel('Fraction of Gaining Assets (%)')
+ax.set_ylabel('Frequency')
+ax.set_title('Fraction of Gaining Assets Needed to Cover 80% of Daily Gain')
+ax.axvline(np.mean(gain_driver_pcts), color='darkgreen', linestyle='--', linewidth=2,
+           label=f'Mean: {np.mean(gain_driver_pcts):.1f}%')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'gain_drivers.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Summary stats for gain drivers
+gain_driver_mean = np.mean(gain_driver_pcts)
+gain_driver_median = np.median(gain_driver_pcts)
+gain_driver_n = len(gain_driver_pcts)
+
+# --- Gain Intensity: Loss/Gain ratio on winning days ---
+gain_intensity_ratios = []
+for day in winning_days:
+    row = daily_pnl.loc[day]
+    gains = row[row > 0].sum()
+    losses = row[row < 0].sum()
+
+    if gains > 0:
+        ratio = abs(losses) / gains  # |loss| / gain
+        gain_intensity_ratios.append(ratio)
+
+gain_intensity_ratios = np.array(gain_intensity_ratios)
+
+# Create histogram for gain intensity
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.hist(gain_intensity_ratios, bins=50, edgecolor='black', alpha=0.7, color='green')
+ax.set_xlabel('Loss / Gain Ratio')
+ax.set_ylabel('Frequency')
+ax.set_title('Gain Intensity: Loss as % of Gain on Winning Days')
+ax.axvline(1.0, color='red', linestyle='--', linewidth=1, alpha=0.5, label='Break-even')
+ax.axvline(np.mean(gain_intensity_ratios), color='blue', linestyle='--', linewidth=2,
+           label=f'Mean: {np.mean(gain_intensity_ratios):.2f}')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'gain_intensity.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Summary stats for gain intensity
+gain_intensity_mean = np.mean(gain_intensity_ratios)
+gain_intensity_median = np.median(gain_intensity_ratios)
+gain_intensity_n = len(gain_intensity_ratios)
+
+# --- Monthly breakdown for Mar, Apr, May 2025 ---
+def compute_monthly_stats(month_str):
+    """Compute loss/gain driver and intensity stats for a specific month."""
+    month_data = daily_pnl.loc[month_str]
+    month_total = month_data.sum(axis=1)
+
+    # Losing days
+    losing_days_m = month_total[month_total < 0].index
+    loss_drivers_m = []
+    loss_intensity_m = []
+    loss_total = 0
+    for day in losing_days_m:
+        row = month_data.loc[day]
+        loss_total += month_total.loc[day]
+        n = assets_to_cover_loss(row, 0.8)
+        if not np.isnan(n):
+            loss_drivers_m.append(n)
+        gains = row[row > 0].sum()
+        losses = row[row < 0].sum()
+        if losses < 0:
+            loss_intensity_m.append(gains / abs(losses))
+
+    # Winning days
+    winning_days_m = month_total[month_total > 0].index
+    gain_drivers_m = []
+    gain_intensity_m = []
+    gain_total = 0
+    for day in winning_days_m:
+        row = month_data.loc[day]
+        gain_total += month_total.loc[day]
+        n = assets_to_cover_gain(row, 0.8)
+        if not np.isnan(n):
+            gain_drivers_m.append(n)
+        gains = row[row > 0].sum()
+        losses = row[row < 0].sum()
+        if gains > 0:
+            gain_intensity_m.append(abs(losses) / gains)
+
+    return {
+        'loss_driver_mean': np.mean(loss_drivers_m) if loss_drivers_m else np.nan,
+        'loss_driver_n': len(loss_drivers_m),
+        'loss_intensity_mean': np.mean(loss_intensity_m) if loss_intensity_m else np.nan,
+        'loss_intensity_n': len(loss_intensity_m),
+        'loss_total': loss_total,
+        'gain_driver_mean': np.mean(gain_drivers_m) if gain_drivers_m else np.nan,
+        'gain_driver_n': len(gain_drivers_m),
+        'gain_intensity_mean': np.mean(gain_intensity_m) if gain_intensity_m else np.nan,
+        'gain_intensity_n': len(gain_intensity_m),
+        'gain_total': gain_total,
+    }
+
+stats_mar = compute_monthly_stats('2025-03')
+stats_apr = compute_monthly_stats('2025-04')
+stats_may = compute_monthly_stats('2025-05')
+
+# Compute historical monthly averages for losing/winning day totals
+# Group daily data by month and sum losing/winning days separately
+monthly_loss_totals = []
+monthly_gain_totals = []
+for month_start in daily_pnl.resample('ME').sum().index:
+    month_str = month_start.strftime('%Y-%m')
+    try:
+        month_data = daily_pnl.loc[month_str]
+        month_total = month_data.sum(axis=1)
+        loss_sum = month_total[month_total < 0].sum()
+        gain_sum = month_total[month_total > 0].sum()
+        if loss_sum != 0:
+            monthly_loss_totals.append(loss_sum)
+        if gain_sum != 0:
+            monthly_gain_totals.append(gain_sum)
+    except KeyError:
+        pass
+
+hist_loss_avg = np.mean(monthly_loss_totals) if monthly_loss_totals else np.nan
+hist_gain_avg = np.mean(monthly_gain_totals) if monthly_gain_totals else np.nan
+
+# Create LaTeX table for monthly stats
+def monthly_stats_table_to_latex():
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Loss and Gain Characteristics: Mar--May 2025}')
+    lines.append(r'\label{tab:monthly_chars}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrrrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r' & \multicolumn{4}{c}{Losing Days} & \multicolumn{4}{c}{Winning Days} \\')
+    lines.append(r'\cmidrule(lr){2-5} \cmidrule(lr){6-9}')
+    lines.append(r'Month & Drivers (\%) & Intensity & n & Total & Drivers (\%) & Intensity & n & Total \\')
+    lines.append(r'\midrule')
+
+    for name, stats in [('Mar 2025', stats_mar), ('Apr 2025', stats_apr), ('May 2025', stats_may)]:
+        ld = f"{stats['loss_driver_mean']:.1f}" if pd.notna(stats['loss_driver_mean']) else '--'
+        li = f"{stats['loss_intensity_mean']:.2f}" if pd.notna(stats['loss_intensity_mean']) else '--'
+        ln = stats['loss_intensity_n']
+        lt = f"{int(round(stats['loss_total']))}"
+        gd = f"{stats['gain_driver_mean']:.1f}" if pd.notna(stats['gain_driver_mean']) else '--'
+        gi = f"{stats['gain_intensity_mean']:.2f}" if pd.notna(stats['gain_intensity_mean']) else '--'
+        gn = stats['gain_intensity_n']
+        gt = f"{int(round(stats['gain_total']))}"
+        lines.append(f'{name} & {ld} & {li} & {ln} & {lt} & {gd} & {gi} & {gn} & {gt} \\\\')
+
+    # Add historical average row
+    lines.append(r'\midrule')
+    hist_lt = f"{int(round(hist_loss_avg))}"
+    hist_gt = f"{int(round(hist_gain_avg))}"
+    lines.append(f'Historical Avg & {loss_driver_mean:.1f} & {loss_intensity_mean:.2f} & -- & {hist_lt} & {gain_driver_mean:.1f} & {gain_intensity_mean:.2f} & -- & {hist_gt} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+monthly_stats_latex = monthly_stats_table_to_latex()
+
+# --- Intensity over time ---
+# Compute monthly average loss intensity and gain intensity
+intensity_by_month = []
+
+for month_end in daily_pnl.resample('ME').sum().index:
+    month_str = month_end.strftime('%Y-%m')
+    try:
+        month_data = daily_pnl.loc[month_str]
+        month_total = month_data.sum(axis=1)
+
+        # Loss intensity for this month
+        losing_days_m = month_total[month_total < 0].index
+        loss_int_m = []
+        for day in losing_days_m:
+            row = month_data.loc[day]
+            gains = row[row > 0].sum()
+            losses = row[row < 0].sum()
+            if losses < 0:
+                loss_int_m.append(gains / abs(losses))
+
+        # Gain intensity for this month
+        winning_days_m = month_total[month_total > 0].index
+        gain_int_m = []
+        for day in winning_days_m:
+            row = month_data.loc[day]
+            gains = row[row > 0].sum()
+            losses = row[row < 0].sum()
+            if gains > 0:
+                gain_int_m.append(abs(losses) / gains)
+
+        intensity_by_month.append({
+            'date': month_end,
+            'loss_intensity': np.mean(loss_int_m) if loss_int_m else np.nan,
+            'gain_intensity': np.mean(gain_int_m) if gain_int_m else np.nan,
+        })
+    except KeyError:
+        pass
+
+intensity_df = pd.DataFrame(intensity_by_month)
+intensity_df = intensity_df.dropna(subset=['loss_intensity', 'gain_intensity'], how='all')
+intensity_df.set_index('date', inplace=True)
+
+# Create time series plot
+fig, ax = plt.subplots(figsize=(12, 6))
+
+ax.plot(intensity_df.index, intensity_df['loss_intensity'],
+        color='red', alpha=0.7, label='Loss Intensity (gain/|loss| on losing days)')
+ax.plot(intensity_df.index, intensity_df['gain_intensity'],
+        color='green', alpha=0.7, label='Gain Intensity (|loss|/gain on winning days)')
+
+# Add horizontal line at historical means
+ax.axhline(loss_intensity_mean, color='red', linestyle='--', alpha=0.5, linewidth=1)
+ax.axhline(gain_intensity_mean, color='green', linestyle='--', alpha=0.5, linewidth=1)
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Intensity Ratio')
+ax.set_title('Monthly Average Intensity Over Time')
+ax.legend(loc='upper right')
+ax.set_ylim(0, 1.2)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'intensity_timeseries.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Gain and Loss Drivers over time ---
+# Compute monthly average loss and gain drivers
+drivers_by_month = []
+
+for month_end in daily_pnl.resample('ME').sum().index:
+    month_str = month_end.strftime('%Y-%m')
+    try:
+        month_data = daily_pnl.loc[month_str]
+        month_total = month_data.sum(axis=1)
+
+        # Loss drivers for this month
+        losing_days_m = month_total[month_total < 0].index
+        loss_drv_m = []
+        for day in losing_days_m:
+            row = month_data.loc[day]
+            n = assets_to_cover_loss(row, 0.8)
+            if not np.isnan(n):
+                loss_drv_m.append(n)
+
+        # Gain drivers for this month
+        winning_days_m = month_total[month_total > 0].index
+        gain_drv_m = []
+        for day in winning_days_m:
+            row = month_data.loc[day]
+            n = assets_to_cover_gain(row, 0.8)
+            if not np.isnan(n):
+                gain_drv_m.append(n)
+
+        drivers_by_month.append({
+            'date': month_end,
+            'loss_drivers': np.mean(loss_drv_m) if loss_drv_m else np.nan,
+            'gain_drivers': np.mean(gain_drv_m) if gain_drv_m else np.nan,
+        })
+    except KeyError:
+        pass
+
+drivers_df = pd.DataFrame(drivers_by_month)
+drivers_df = drivers_df.dropna(subset=['loss_drivers', 'gain_drivers'], how='all')
+drivers_df.set_index('date', inplace=True)
+
+# Create time series plot for drivers
+fig, ax = plt.subplots(figsize=(12, 6))
+
+ax.plot(drivers_df.index, drivers_df['loss_drivers'],
+        color='red', alpha=0.7, label='Loss Drivers')
+ax.plot(drivers_df.index, drivers_df['gain_drivers'],
+        color='green', alpha=0.7, label='Gain Drivers')
+
+# Add horizontal lines at historical means
+ax.axhline(loss_driver_mean, color='red', linestyle='--', alpha=0.5, linewidth=1)
+ax.axhline(gain_driver_mean, color='green', linestyle='--', alpha=0.5, linewidth=1)
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Fraction of Assets (%)')
+ax.set_title('Monthly Average Drivers Over Time (% of assets to cover 80% of P&L)')
+ax.legend(loc='upper right')
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'drivers_timeseries.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Strength over time ---
+# Strength = abs(gains - losses) / (gains + losses)
+# where gains = sum of positive P&L, losses = abs(sum of negative P&L)
+# Ranges from 0 (balanced) to 1 (one-sided)
+
+strength_by_month = []
+
+for month_end in daily_pnl.resample('ME').sum().index:
+    month_str = month_end.strftime('%Y-%m')
+    try:
+        month_data = daily_pnl.loc[month_str]
+
+        # Compute strength for each day
+        daily_strengths = []
+        for day in month_data.index:
+            row = month_data.loc[day]
+            gains = row[row > 0].sum()  # Sum of positive P&L
+            losses = abs(row[row < 0].sum())  # Abs of sum of negative P&L
+
+            if gains + losses > 0:
+                strength = abs(gains - losses) / (gains + losses)
+                daily_strengths.append(strength)
+
+        if daily_strengths:
+            strength_by_month.append({
+                'date': month_end,
+                'strength': np.mean(daily_strengths),
+            })
+    except KeyError:
+        pass
+
+strength_df = pd.DataFrame(strength_by_month)
+strength_df = strength_df.dropna(subset=['strength'])
+strength_df.set_index('date', inplace=True)
+
+# Historical mean
+strength_mean = strength_df['strength'].mean()
+
+# Create time series plot for strength
+fig, ax = plt.subplots(figsize=(12, 6))
+
+ax.plot(strength_df.index, strength_df['strength'],
+        color='purple', alpha=0.7, label='Strength')
+
+# Add horizontal line at historical mean
+ax.axhline(strength_mean, color='purple', linestyle='--', alpha=0.5, linewidth=1,
+           label=f'Historical mean: {strength_mean:.2f}')
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Strength')
+ax.set_title('Monthly Average Strength Over Time')
+ax.legend(loc='upper right')
+ax.set_ylim(0, 1)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'strength_timeseries.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Strength by Asset Class over time ---
+# Compute strength for each asset class separately
+
+# Get unique classes
+classes = sorted(asset_to_class.values())
+unique_classes = sorted(set(classes))
+
+# Build dict mapping class -> list of assets
+class_to_assets = {}
+for asset, cls in asset_to_class.items():
+    if cls not in class_to_assets:
+        class_to_assets[cls] = []
+    class_to_assets[cls].append(asset)
+
+# Compute monthly strength by class
+strength_by_class_month = []
+
+for month_end in daily_pnl.resample('ME').sum().index:
+    month_str = month_end.strftime('%Y-%m')
+    try:
+        month_data = daily_pnl.loc[month_str]
+
+        row_data = {'date': month_end}
+
+        for cls in unique_classes:
+            # Get assets in this class that exist in our data
+            cls_assets = [a for a in class_to_assets.get(cls, []) if a in month_data.columns]
+            if not cls_assets:
+                row_data[cls] = np.nan
+                continue
+
+            cls_data = month_data[cls_assets]
+
+            # Compute strength for each day
+            daily_strengths = []
+            for day in cls_data.index:
+                row = cls_data.loc[day]
+                gains = row[row > 0].sum()
+                losses = abs(row[row < 0].sum())
+
+                if gains + losses > 0:
+                    strength = abs(gains - losses) / (gains + losses)
+                    daily_strengths.append(strength)
+
+            if daily_strengths:
+                row_data[cls] = np.mean(daily_strengths)
+            else:
+                row_data[cls] = np.nan
+
+        strength_by_class_month.append(row_data)
+    except KeyError:
+        pass
+
+strength_class_df = pd.DataFrame(strength_by_class_month)
+strength_class_df.set_index('date', inplace=True)
+
+# Create time series plot for strength by class
+fig, ax = plt.subplots(figsize=(12, 7))
+
+colors = plt.cm.tab10(np.linspace(0, 1, len(unique_classes)))
+for i, cls in enumerate(unique_classes):
+    if cls in strength_class_df.columns:
+        ax.plot(strength_class_df.index, strength_class_df[cls],
+                color=colors[i], alpha=0.7, label=cls, linewidth=1)
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Strength')
+ax.set_title('Monthly Average Strength by Asset Class Over Time')
+ax.legend(loc='upper right', fontsize=8, ncol=2)
+ax.set_ylim(0, 1)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'strength_by_class_timeseries.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Strength vs Quantile ---
+# For each month, compute the P&L quantile and the strength
+
+# Get monthly total P&L (already have monthly_total from earlier)
+# Merge with strength_df
+
+# Compute quantile for each month's P&L
+monthly_total_nz = monthly_total[monthly_total != 0]
+quantiles = monthly_total_nz.rank(pct=True)
+
+# Merge with strength data
+strength_quantile_df = pd.DataFrame({
+    'pnl': monthly_total_nz,
+    'quantile': quantiles,
+    'strength': strength_df['strength']
+}).dropna()
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+ax.scatter(strength_quantile_df['quantile'] * 100, strength_quantile_df['strength'],
+           alpha=0.5, s=30, c='purple')
+
+# Add regression line
+x = strength_quantile_df['quantile'].values * 100
+y = strength_quantile_df['strength'].values
+z = np.polyfit(x, y, 1)
+p = np.poly1d(z)
+x_line = np.linspace(0, 100, 100)
+ax.plot(x_line, p(x_line), 'r--', alpha=0.7, linewidth=2,
+        label=f'Slope: {z[0]:.4f}')
+
+# Correlation
+corr_sq = np.corrcoef(x, y)[0, 1]
+strength_quantile_corr = corr_sq
+
+ax.set_xlabel('Monthly P&L Quantile (%)')
+ax.set_ylabel('Strength')
+ax.set_title(f'Monthly P&L Quantile vs Strength (corr: {corr_sq:.3f})')
+ax.legend()
+ax.set_xlim(0, 100)
+ax.set_ylim(0, 1)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'strength_vs_quantile.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Gain and Loss Drivers vs Quantile ---
+# Merge drivers data with quantiles
+
+drivers_quantile_df = pd.DataFrame({
+    'pnl': monthly_total_nz,
+    'quantile': quantiles,
+    'loss_drivers': drivers_df['loss_drivers'],
+    'gain_drivers': drivers_df['gain_drivers']
+}).dropna()
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+x = drivers_quantile_df['quantile'].values * 100
+
+# Loss drivers (red)
+y_loss = drivers_quantile_df['loss_drivers'].values
+ax.scatter(x, y_loss, alpha=0.5, s=30, c='red', label='Loss Drivers')
+
+# Gain drivers (green)
+y_gain = drivers_quantile_df['gain_drivers'].values
+ax.scatter(x, y_gain, alpha=0.5, s=30, c='green', label='Gain Drivers')
+
+# Regression lines
+z_loss = np.polyfit(x, y_loss, 1)
+p_loss = np.poly1d(z_loss)
+z_gain = np.polyfit(x, y_gain, 1)
+p_gain = np.poly1d(z_gain)
+
+x_line = np.linspace(0, 100, 100)
+ax.plot(x_line, p_loss(x_line), 'r--', alpha=0.7, linewidth=2)
+ax.plot(x_line, p_gain(x_line), 'g--', alpha=0.7, linewidth=2)
+
+# Correlations
+corr_loss = np.corrcoef(x, y_loss)[0, 1]
+corr_gain = np.corrcoef(x, y_gain)[0, 1]
+
+ax.set_xlabel('Monthly P&L Quantile (%)')
+ax.set_ylabel('Drivers (%)')
+ax.set_title(f'Drivers vs P&L Quantile (corr: Loss={corr_loss:.3f}, Gain={corr_gain:.3f})')
+ax.legend()
+ax.set_xlim(0, 100)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'drivers_vs_quantile.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Strength vs P&L Cross-Correlation ---
+# Compute daily strength and P&L, then check if previous day's strength predicts today's P&L
+
+# Compute daily strength
+daily_strength = []
+for day in daily_pnl.index:
+    row = daily_pnl.loc[day]
+    gains = row[row > 0].sum()
+    losses = abs(row[row < 0].sum())
+
+    if gains + losses > 0:
+        strength = abs(gains - losses) / (gains + losses)
+        daily_strength.append({'date': day, 'strength': strength, 'pnl': daily_total.loc[day]})
+
+daily_strength_df = pd.DataFrame(daily_strength)
+daily_strength_df.set_index('date', inplace=True)
+
+# Remove zero P&L days
+daily_strength_df = daily_strength_df[daily_strength_df['pnl'] != 0]
+
+# Compute P&L quantile
+daily_strength_df['pnl_quantile'] = daily_strength_df['pnl'].rank(pct=True) * 100
+
+# Lag strength by 1 day
+daily_strength_df['prev_strength'] = daily_strength_df['strength'].shift(1)
+
+# Drop NaN from shift
+cross_corr_df = daily_strength_df.dropna()
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+x = cross_corr_df['pnl_quantile'].values
+y = cross_corr_df['prev_strength'].values
+
+ax.scatter(x, y, alpha=0.3, s=10, c='purple')
+
+# Regression line
+z = np.polyfit(x, y, 1)
+p = np.poly1d(z)
+x_line = np.linspace(0, 100, 100)
+ax.plot(x_line, p(x_line), 'r--', alpha=0.7, linewidth=2,
+        label=f'Slope: {z[0]:.4f}')
+
+# Correlation
+corr_cross = np.corrcoef(x, y)[0, 1]
+
+ax.set_xlabel('P&L Quantile (%)')
+ax.set_ylabel("Previous Day's Strength")
+ax.set_title(f"Today's P&L Quantile vs Previous Day's Strength (corr: {corr_cross:.3f})")
+ax.legend()
+ax.set_xlim(0, 100)
+ax.set_ylim(0, 1)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'strength_pnl_crosscorr.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Gain and Loss Drivers vs P&L Cross-Correlation ---
+# Compute daily drivers and check if previous day's drivers predict today's P&L
+
+# Compute daily gain and loss drivers
+daily_drivers = []
+for day in daily_pnl.index:
+    row = daily_pnl.loc[day]
+
+    # Loss drivers
+    loss_drv = assets_to_cover_loss(row, 0.8)
+
+    # Gain drivers
+    gain_drv = assets_to_cover_gain(row, 0.8)
+
+    daily_drivers.append({
+        'date': day,
+        'loss_drivers': loss_drv,
+        'gain_drivers': gain_drv,
+        'pnl': daily_total.loc[day]
+    })
+
+daily_drivers_df = pd.DataFrame(daily_drivers)
+daily_drivers_df.set_index('date', inplace=True)
+
+# Remove zero P&L days
+daily_drivers_df = daily_drivers_df[daily_drivers_df['pnl'] != 0]
+
+# Compute P&L quantile
+daily_drivers_df['pnl_quantile'] = daily_drivers_df['pnl'].rank(pct=True) * 100
+
+# Lag drivers by 1 day
+daily_drivers_df['prev_loss_drivers'] = daily_drivers_df['loss_drivers'].shift(1)
+daily_drivers_df['prev_gain_drivers'] = daily_drivers_df['gain_drivers'].shift(1)
+
+# Drop NaN from shift
+drivers_cross_df = daily_drivers_df.dropna()
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+x = drivers_cross_df['pnl_quantile'].values
+
+# Previous day's loss drivers (red)
+y_loss = drivers_cross_df['prev_loss_drivers'].values
+ax.scatter(x, y_loss, alpha=0.3, s=10, c='red', label='Prev Loss Drivers')
+
+# Previous day's gain drivers (green)
+y_gain = drivers_cross_df['prev_gain_drivers'].values
+ax.scatter(x, y_gain, alpha=0.3, s=10, c='green', label='Prev Gain Drivers')
+
+# Regression lines
+z_loss = np.polyfit(x, y_loss, 1)
+p_loss = np.poly1d(z_loss)
+z_gain = np.polyfit(x, y_gain, 1)
+p_gain = np.poly1d(z_gain)
+
+x_line = np.linspace(0, 100, 100)
+ax.plot(x_line, p_loss(x_line), 'r--', alpha=0.7, linewidth=2)
+ax.plot(x_line, p_gain(x_line), 'g--', alpha=0.7, linewidth=2)
+
+# Correlations
+corr_loss_cross = np.corrcoef(x, y_loss)[0, 1]
+corr_gain_cross = np.corrcoef(x, y_gain)[0, 1]
+
+ax.set_xlabel('P&L Quantile (%)')
+ax.set_ylabel("Previous Day's Drivers (%)")
+ax.set_title(f"P&L Quantile vs Previous Day's Drivers (corr: Loss={corr_loss_cross:.3f}, Gain={corr_gain_cross:.3f})")
+ax.legend()
+ax.set_xlim(0, 100)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'drivers_pnl_crosscorr.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Strength vs Abs P&L Cross-Correlation ---
+# Check if previous day's strength predicts the magnitude (absolute value) of today's P&L
+
+# Add absolute P&L and its quantile to daily_strength_df
+daily_strength_df['abs_pnl'] = daily_strength_df['pnl'].abs()
+daily_strength_df['abs_pnl_quantile'] = daily_strength_df['abs_pnl'].rank(pct=True) * 100
+
+# Create dataframe for cross-correlation
+abs_cross_df = daily_strength_df[['prev_strength', 'abs_pnl_quantile']].dropna()
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+x = abs_cross_df['abs_pnl_quantile'].values
+y = abs_cross_df['prev_strength'].values
+
+ax.scatter(x, y, alpha=0.3, s=10, c='purple')
+
+# Regression line
+z = np.polyfit(x, y, 1)
+p = np.poly1d(z)
+x_line = np.linspace(0, 100, 100)
+ax.plot(x_line, p(x_line), 'r--', alpha=0.7, linewidth=2,
+        label=f'Slope: {z[0]:.4f}')
+
+# Correlation
+corr_abs_cross = np.corrcoef(x, y)[0, 1]
+
+ax.set_xlabel('|P&L| Quantile (%)')
+ax.set_ylabel("Previous Day's Strength")
+ax.set_title(f"Today's |P&L| Quantile vs Previous Day's Strength (corr: {corr_abs_cross:.3f})")
+ax.legend()
+ax.set_xlim(0, 100)
+ax.set_ylim(0, 1)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'strength_abspnl_crosscorr.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Previous Day's Quantile vs Today's Quantile ---
+# Check for autocorrelation in P&L quantiles
+
+# Lag P&L quantile by 1 day
+daily_strength_df['prev_pnl_quantile'] = daily_strength_df['pnl_quantile'].shift(1)
+
+# Create dataframe for cross-correlation
+quantile_cross_df = daily_strength_df[['prev_pnl_quantile', 'pnl_quantile']].dropna()
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+x = quantile_cross_df['prev_pnl_quantile'].values
+y = quantile_cross_df['pnl_quantile'].values
+
+ax.scatter(x, y, alpha=0.3, s=10, c='blue')
+
+# Regression line
+z = np.polyfit(x, y, 1)
+p = np.poly1d(z)
+x_line = np.linspace(0, 100, 100)
+ax.plot(x_line, p(x_line), 'r--', alpha=0.7, linewidth=2,
+        label=f'Slope: {z[0]:.3f}')
+
+# Correlation
+corr_quantile = np.corrcoef(x, y)[0, 1]
+
+ax.set_xlabel("Previous Day's P&L Quantile (%)")
+ax.set_ylabel("Today's P&L Quantile (%)")
+ax.set_title(f"Previous Day's P&L Quantile vs Today's P&L Quantile (corr: {corr_quantile:.3f})")
+ax.legend()
+ax.set_xlim(0, 100)
+ax.set_ylim(0, 100)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'quantile_autocorr.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Monthly P&L Quantile Autocorrelation ---
+# Check for autocorrelation at monthly level (less noisy than daily)
+
+# Use monthly_total_nz which already has non-zero months
+monthly_quantiles = monthly_total_nz.rank(pct=True) * 100
+
+# Create dataframe
+monthly_autocorr_df = pd.DataFrame({
+    'pnl': monthly_total_nz,
+    'quantile': monthly_quantiles
+})
+
+# Lag by 1 month
+monthly_autocorr_df['prev_quantile'] = monthly_autocorr_df['quantile'].shift(1)
+
+# Drop NaN
+monthly_autocorr_df = monthly_autocorr_df.dropna()
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+x = monthly_autocorr_df['prev_quantile'].values
+y = monthly_autocorr_df['quantile'].values
+
+ax.scatter(x, y, alpha=0.5, s=30, c='blue')
+
+# Regression line
+z = np.polyfit(x, y, 1)
+p = np.poly1d(z)
+x_line = np.linspace(0, 100, 100)
+ax.plot(x_line, p(x_line), 'r--', alpha=0.7, linewidth=2,
+        label=f'Slope: {z[0]:.3f}')
+
+# Correlation
+corr_monthly = np.corrcoef(x, y)[0, 1]
+
+ax.set_xlabel("Previous Month's P&L Quantile (%)")
+ax.set_ylabel("This Month's P&L Quantile (%)")
+ax.set_title(f"Monthly P&L Quantile Autocorrelation (corr: {corr_monthly:.3f})")
+ax.legend()
+ax.set_xlim(0, 100)
+ax.set_ylim(0, 100)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'monthly_quantile_autocorr.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+@
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\newpage
+
+\tableofcontents
+\newpage
+
+\section{Data Summary}
+Loaded \Sexpr{py$n_rows} rows, \Sexpr{py$n_assets} assets.
+Date range: \Sexpr{py$date_min} to \Sexpr{py$date_max}.
+
+\newpage
+\section{Monthly P\&L by Asset}
+<<asset_table, engine='python', results='asis'>>=
+print(asset_table_latex)
+@
+
+\newpage
+\section{Monthly P\&L by Asset Class}
+<<class_table, engine='python', results='asis'>>=
+print(class_table_latex)
+@
+
+\newpage
+\section{Apr/May 2025 Correlation}
+Correlation between Apr 2025 and May 2025 cross-sectional P\&L: \textbf{\Sexpr{py$corr_str}}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/histogram.pdf}
+\caption{Distribution of Monthly P\&L with Apr 2025 and May 2025 marked}
+\label{fig:histogram}
+\end{figure}
+
+\newpage
+\section{Losing Months Analysis}
+<<loss_table_out, engine='python', results='asis'>>=
+print(loss_table_latex)
+@
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\textwidth]{dev/scatter_loss.pdf}
+\caption{Losing Months: Loss vs Next Month Recovery}
+\label{fig:scatter_loss}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\textwidth]{dev/scatter_win.pdf}
+\caption{Winning Months: Gain vs Next Month}
+\label{fig:scatter_win}
+\end{figure}
+
+\newpage
+\section{Conditional Auto-correlation}
+
+The following tables analyze the relationship between current month performance and previous month performance by asset class.
+
+\textbf{Auto-correlation table:} Shows the lag-1 autocorrelation of monthly P\&L for each asset class. ``All'' is the unconditional autocorrelation. ``If $+$ve'' and ``If $-$ve'' condition on the \emph{total portfolio} (sum across all assets) having positive or negative P\&L in the previous month. ``If $>$med$+$'' conditions on the previous month's total exceeding the median of positive months; ``If $<$med$-$'' conditions on being below the median of negative months.
+
+<<autocorr_table, engine='python', results='asis'>>=
+print(autocorr_table_latex)
+@
+
+\textbf{Conditional average table:} Shows the average monthly P\&L for each asset class, conditioned on the \emph{total portfolio} performance in the previous month. ``After $+$ve'' is the average class P\&L when the previous month's total portfolio P\&L (sum across all assets) was positive. ``After $-$ve'' is the average when the previous month's total portfolio was negative. ``After $>$med$+$'' conditions on the previous month's total exceeding the median of positive months; ``After $<$med$-$'' conditions on being below the median of negative months.
+
+<<avg_table, engine='python', results='asis'>>=
+print(avg_table_latex)
+@
+
+\newpage
+\section{Recovery Length}
+
+This section analyzes how many months it takes to recover from a loss-making month. Recovery is defined as the number of months until cumulative P\&L (starting from the loss month) turns non-negative. All P\&L values are shown with 2x leverage applied.
+
+<<recovery_table, engine='python', results='asis'>>=
+print(recovery_table_latex)
+@
+
+<<recovery_count, engine='python', results='asis'>>=
+print(recovery_count_latex)
+@
+
+\newpage
+\section{Loss Day Characteristics}
+
+This section analyzes the characteristics of losing days at the daily level. All P\&L values use 2x leverage.
+
+\subsection{Loss Drivers}
+
+For each losing day, we sort losing assets by loss size (most negative first) and compute what fraction of them is needed to cover 80\% of the total daily loss. This reveals whether losses are concentrated in a few assets or broadly distributed.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/loss_drivers.pdf}
+\caption{Fraction of losing assets needed to cover 80\% of daily loss}
+\label{fig:loss_drivers}
+\end{figure}
+
+Summary: Mean = \Sexpr{sprintf("%.1f", py$loss_driver_mean)}\%, Median = \Sexpr{sprintf("%.1f", py$loss_driver_median)}\% (n = \Sexpr{py$loss_driver_n} losing days).
+
+\subsection{Loss Intensity}
+
+On each losing day, we compute the ratio of total gains to total losses (gain / $|$loss$|$). Since these are losing days, this ratio is always less than 1. A ratio close to 1 indicates gains nearly offset losses; a ratio close to 0 indicates few offsetting gains.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/loss_intensity.pdf}
+\caption{Distribution of Gain/Loss ratio on losing days}
+\label{fig:loss_intensity}
+\end{figure}
+
+Summary: Mean ratio = \Sexpr{sprintf("%.2f", py$loss_intensity_mean)}, Median = \Sexpr{sprintf("%.2f", py$loss_intensity_median)} (n = \Sexpr{py$loss_intensity_n} losing days).
+
+\subsection{Gain Drivers}
+
+Analogous to loss drivers: for each winning day, we sort gaining assets by gain size (most positive first) and compute what fraction of them is needed to cover 80\% of the total daily gain.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/gain_drivers.pdf}
+\caption{Fraction of gaining assets needed to cover 80\% of daily gain}
+\label{fig:gain_drivers}
+\end{figure}
+
+Summary: Mean = \Sexpr{sprintf("%.1f", py$gain_driver_mean)}\%, Median = \Sexpr{sprintf("%.1f", py$gain_driver_median)}\% (n = \Sexpr{py$gain_driver_n} winning days).
+
+\subsection{Gain Intensity}
+
+On each winning day, we compute the ratio of total losses to total gains ($|$loss$|$ / gain). A ratio close to 0 indicates few offsetting losses; a ratio close to 1 indicates losses nearly offset gains.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/gain_intensity.pdf}
+\caption{Distribution of Loss/Gain ratio on winning days}
+\label{fig:gain_intensity}
+\end{figure}
+
+Summary: Mean ratio = \Sexpr{sprintf("%.2f", py$gain_intensity_mean)}, Median = \Sexpr{sprintf("%.2f", py$gain_intensity_median)} (n = \Sexpr{py$gain_intensity_n} winning days).
+
+\subsection{Mar--May 2025 Comparison}
+
+The following table compares loss and gain characteristics for March, April, and May 2025 against the historical average.
+
+<<monthly_stats, engine='python', results='asis'>>=
+print(monthly_stats_latex)
+@
+
+\begin{itemize}
+\item \textbf{Drivers (\%)}: Fraction of losing/gaining assets needed to cover 80\% of the day's total P\&L. Lower values indicate more concentrated P\&L.
+\item \textbf{Intensity}: Mean offset ratio---on losing days, it is gain/$|$loss$|$; on winning days, it is $|$loss$|$/gain. Values closer to 1 indicate more offsetting; closer to 0 indicates concentrated P\&L.
+\item \textbf{n}: Number of losing or winning days in the period (sample size).
+\item \textbf{Total}: Sum of P\&L on losing/winning days for that month (bps). For Historical Avg, this is the average monthly total across all months.
+\end{itemize}
+
+\newpage
+\section{Intensity Over Time}
+
+This section shows how loss intensity and gain intensity have evolved over time. Each point represents the monthly average intensity ratio.
+
+\begin{itemize}
+\item \textbf{Loss Intensity} (red): Average gain/$|$loss$|$ ratio on losing days. Higher values indicate that gains offset more of the losses on losing days.
+\item \textbf{Gain Intensity} (green): Average $|$loss$|$/gain ratio on winning days. Higher values indicate that losses offset more of the gains on winning days.
+\end{itemize}
+
+Dashed horizontal lines show the historical averages.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{dev/intensity_timeseries.pdf}
+\caption{Monthly average intensity ratios over time}
+\label{fig:intensity_ts}
+\end{figure}
+
+\newpage
+\section{Gain and Loss Drivers Over Time}
+
+This section shows how P\&L concentration has evolved over time. Each point represents the monthly average fraction of assets needed to cover 80\% of the total daily P\&L.
+
+\begin{itemize}
+\item \textbf{Loss Drivers} (red): Fraction of losing assets needed to cover 80\% of daily loss.
+\item \textbf{Gain Drivers} (green): Fraction of gaining assets needed to cover 80\% of daily gain.
+\end{itemize}
+
+Lower values indicate more concentrated P\&L (fewer assets driving the result); higher values indicate P\&L spread across more assets. Dashed lines show historical averages.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{dev/drivers_timeseries.pdf}
+\caption{Monthly average gain and loss drivers over time}
+\label{fig:drivers_ts}
+\end{figure}
+
+\newpage
+\section{Strength Over Time}
+
+Strength measures how one-sided the daily P\&L is across assets. It is defined as:
+
+\[
+\text{Strength} = \frac{|\text{Gains} - \text{Losses}|}{\text{Gains} + \text{Losses}}
+\]
+
+where Gains is the sum of positive asset P\&L and Losses is the absolute value of the sum of negative asset P\&L on each day.
+
+\begin{itemize}
+\item \textbf{Strength = 0}: Gains exactly equal losses (perfectly balanced day---net P\&L is zero).
+\item \textbf{Strength = 1}: Entirely one-sided day (all gains and no losses, or all losses and no gains).
+\item \textbf{Intermediate values}: Higher strength indicates more one-sided days; lower strength indicates gains and losses are more balanced.
+\end{itemize}
+
+Each point represents the monthly average strength across all trading days in that month.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{dev/strength_timeseries.pdf}
+\caption{Monthly average strength over time}
+\label{fig:strength_ts}
+\end{figure}
+
+\newpage
+\section{Strength by Asset Class Over Time}
+
+This section shows the strength metric computed separately for each asset class. For each class, strength is calculated using only the assets within that class:
+
+\[
+\text{Strength}_{\text{class}} = \frac{|\text{Gains}_{\text{class}} - \text{Losses}_{\text{class}}|}{\text{Gains}_{\text{class}} + \text{Losses}_{\text{class}}}
+\]
+
+This allows comparison of how one-sided the P\&L is within each asset class over time.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{dev/strength_by_class_timeseries.pdf}
+\caption{Monthly average strength by asset class over time}
+\label{fig:strength_class_ts}
+\end{figure}
+
+\newpage
+\section{Strength vs P\&L Quantile}
+
+This section examines the relationship between monthly P\&L performance and the strength metric. Each point represents one month:
+
+\begin{itemize}
+\item \textbf{X-axis}: The percentile rank of that month's total P\&L (0\% = worst month, 100\% = best month).
+\item \textbf{Y-axis}: The average strength for that month.
+\end{itemize}
+
+A positive relationship would indicate that stronger months (more one-sided daily P\&L) tend to have better performance; a negative relationship would indicate the opposite.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/strength_vs_quantile.pdf}
+\caption{Monthly P\&L quantile vs strength}
+\label{fig:strength_quantile}
+\end{figure}
+
+\newpage
+\section{Gain and Loss Drivers vs P\&L Quantile}
+
+This section examines how P\&L concentration (drivers) relates to monthly performance. Each point represents one month:
+
+\begin{itemize}
+\item \textbf{Red}: Loss Drivers---fraction of losing assets needed to cover 80\% of daily losses.
+\item \textbf{Green}: Gain Drivers---fraction of gaining assets needed to cover 80\% of daily gains.
+\item \textbf{X-axis}: The percentile rank of that month's total P\&L.
+\end{itemize}
+
+Lower driver values indicate more concentrated P\&L (fewer assets driving the result). A negative relationship between drivers and quantile would suggest that months with more concentrated losses/gains tend to perform better/worse.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/drivers_vs_quantile.pdf}
+\caption{Gain and loss drivers vs monthly P\&L quantile}
+\label{fig:drivers_quantile}
+\end{figure}
+
+\newpage
+\section{Strength vs P\&L Cross-Correlation}
+
+This section examines whether the previous day's strength predicts today's P\&L performance. Each point represents one day:
+
+\begin{itemize}
+\item \textbf{X-axis}: Today's P\&L quantile (percentile rank across all days).
+\item \textbf{Y-axis}: Previous day's strength.
+\end{itemize}
+
+A non-zero correlation would suggest that one-sided days tend to be followed by predictably better or worse performance.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/strength_pnl_crosscorr.pdf}
+\caption{Today's P\&L quantile vs previous day's strength}
+\label{fig:strength_crosscorr}
+\end{figure}
+
+\newpage
+\section{Drivers vs P\&L Cross-Correlation}
+
+This section examines whether the previous day's gain/loss drivers predict today's P\&L performance. Each point represents one day:
+
+\begin{itemize}
+\item \textbf{Red}: Previous day's Loss Drivers (fraction of losing assets to cover 80\% of loss).
+\item \textbf{Green}: Previous day's Gain Drivers (fraction of gaining assets to cover 80\% of gain).
+\item \textbf{X-axis}: Today's P\&L quantile (percentile rank across all days).
+\end{itemize}
+
+A non-zero correlation would suggest that days with more concentrated gains/losses tend to be followed by predictably better or worse performance.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/drivers_pnl_crosscorr.pdf}
+\caption{Today's P\&L quantile vs previous day's drivers}
+\label{fig:drivers_crosscorr}
+\end{figure}
+
+\newpage
+\section{Strength vs |P\&L| Cross-Correlation}
+
+This section examines whether the previous day's strength predicts the magnitude of today's P\&L (regardless of direction). Each point represents one day:
+
+\begin{itemize}
+\item \textbf{X-axis}: Today's $|$P\&L$|$ quantile (percentile rank of absolute P\&L across all days).
+\item \textbf{Y-axis}: Previous day's strength.
+\end{itemize}
+
+A positive correlation would suggest that one-sided days tend to be followed by larger moves (in either direction); a negative correlation would suggest they are followed by smaller moves.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/strength_abspnl_crosscorr.pdf}
+\caption{Today's $|$P\&L$|$ quantile vs previous day's strength}
+\label{fig:strength_abs_crosscorr}
+\end{figure}
+
+\newpage
+\section{P\&L Quantile Autocorrelation}
+
+This section examines whether yesterday's P\&L performance predicts today's performance. Each point represents one day:
+
+\begin{itemize}
+\item \textbf{X-axis}: Previous day's P\&L quantile.
+\item \textbf{Y-axis}: Today's P\&L quantile.
+\end{itemize}
+
+A positive correlation would indicate momentum (good days followed by good days); a negative correlation would indicate mean reversion (good days followed by bad days).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/quantile_autocorr.pdf}
+\caption{Previous day's P\&L quantile vs today's P\&L quantile}
+\label{fig:quantile_autocorr}
+\end{figure}
+
+\newpage
+\section{Monthly P\&L Quantile Autocorrelation}
+
+Daily P\&L can be noisy, so this section examines autocorrelation at the monthly level. Each point represents one month:
+
+\begin{itemize}
+\item \textbf{X-axis}: Previous month's P\&L quantile.
+\item \textbf{Y-axis}: This month's P\&L quantile.
+\end{itemize}
+
+A positive correlation would indicate momentum (good months followed by good months); a negative correlation would indicate mean reversion.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{dev/monthly_quantile_autocorr.pdf}
+\caption{Previous month's P\&L quantile vs this month's P\&L quantile}
+\label{fig:monthly_quantile_autocorr}
+\end{figure}
+
+\end{document}
