@@ -981,18 +981,49 @@ cumul_total = (long_pnl + short_pnl).cumsum()
 cumul_long = long_pnl.cumsum()    # negative weights = short straddles
 cumul_short = short_pnl.cumsum()  # positive weights = long straddles
 
-fig, ax = plt.subplots(figsize=(12, 6))
-ax.plot(cumul_total.index, cumul_total.values, linewidth=2, color='black', label='Total')
-ax.plot(cumul_long.index, cumul_long.values, linewidth=1.2, color='red', label='Long (nve weights)')
-ax.plot(cumul_short.index, cumul_short.values, linewidth=1.2, color='green', label='Short (pve weights)')
-ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
-ax.set_xlabel('Date')
-ax.set_ylabel('Cumulative P&L (bps)')
-ax.set_title('Cumulative Strategy P&L')
-ax.legend()
-ax.grid(True, alpha=0.3)
+# Compute drawdown
+drawdown_series = cumul_total - cumul_total.cummax()
+
+# Cumulative P&L with drawdown shading (2-panel)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
+
+ax1.plot(cumul_total.index, cumul_total.values, linewidth=2, color='black', label='Total')
+ax1.plot(cumul_long.index, cumul_long.values, linewidth=1.2, color='red', label='Long (nve weights)')
+ax1.plot(cumul_short.index, cumul_short.values, linewidth=1.2, color='green', label='Short (pve weights)')
+ax1.fill_between(cumul_total.index, cumul_total.values, cumul_total.cummax().values, color='red', alpha=0.15)
+ax1.axhline(0, color='gray', linestyle='--', alpha=0.5)
+ax1.set_ylabel('Cumulative P&L (bps)')
+ax1.set_title('Cumulative Strategy P&L')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+ax2.fill_between(drawdown_series.index, drawdown_series.values, 0, color='red', alpha=0.4)
+ax2.plot(drawdown_series.index, drawdown_series.values, linewidth=0.8, color='darkred')
+ax2.set_ylabel('Drawdown (bps)')
+ax2.set_xlabel('Date')
+ax2.grid(True, alpha=0.3)
+
 plt.tight_layout()
 fig.savefig(FIGURE_DIR + 'result_cumulative_pnl.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Standalone drawdown chart by asset class
+fig, ax = plt.subplots(figsize=(12, 5))
+colors_map_dd = {'commodity': 'brown', 'equity': 'blue', 'fx': 'green', 'rates': 'orange', 'stonks': 'purple'}
+for cls in ['commodity', 'equity', 'fx', 'rates', 'stonks']:
+    if cls in class_daily_pnl:
+        cls_cumul = class_daily_pnl[cls].cumsum()
+        cls_dd = cls_cumul - cls_cumul.cummax()
+        ax.plot(cls_dd.index, cls_dd.values, linewidth=1, color=colors_map_dd.get(cls, 'gray'), label=cls, alpha=0.7)
+# Total drawdown
+ax.plot(drawdown_series.index, drawdown_series.values, linewidth=2, color='black', label='Total')
+ax.set_xlabel('Date')
+ax.set_ylabel('Drawdown (bps)')
+ax.set_title('Drawdown by Asset Class')
+ax.legend(loc='lower left')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_drawdown_by_class.pdf', dpi=150, bbox_inches='tight')
 plt.close(fig)
 
 # Remove days where both are zero
@@ -1070,6 +1101,41 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 fig.savefig(FIGURE_DIR + 'result_long_short_corr_by_class.pdf', dpi=150, bbox_inches='tight')
 plt.close(fig)
+
+# --- Cross-Asset-Class Correlation Matrix ---
+class_corr_names = sorted([c for c in class_daily_pnl.keys() if c != 'Total'])
+corr_df = pd.DataFrame({cls: class_daily_pnl[cls] for cls in class_corr_names})
+# Only use days where at least one class is non-zero
+corr_df = corr_df[(corr_df != 0).any(axis=1)]
+cross_class_corr = corr_df.corr()
+
+def cross_class_corr_to_latex(corr_mat):
+    classes = corr_mat.columns.tolist()
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Cross-Asset-Class P\&L Correlation}')
+    lines.append(r'\label{tab:cross_class_corr}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{l|' + 'r' * len(classes) + '}')
+    lines.append(r'\toprule')
+    lines.append(' & ' + ' & '.join(classes) + r' \\')
+    lines.append(r'\midrule')
+    for cls in classes:
+        cells = [cls]
+        for cls2 in classes:
+            val = corr_mat.loc[cls, cls2]
+            if cls == cls2:
+                cells.append('--')
+            else:
+                cells.append(f'{val:.2f}')
+        lines.append(' & '.join(cells) + r' \\')
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+cross_class_corr_latex = cross_class_corr_to_latex(cross_class_corr)
 
 def compute_max_drawdown(pnl_series):
     cumulative = pnl_series.cumsum()
@@ -2122,7 +2188,16 @@ print(pnl_matrix_latex)
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{result_cumulative_pnl.pdf}
-\caption{Cumulative Strategy P\&L over time}
+\caption{Cumulative Strategy P\&L with drawdown (bottom panel)}
+\end{figure}
+
+\newpage
+\section{Drawdown by Asset Class}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_drawdown_by_class.pdf}
+\caption{Drawdown by Asset Class}
 \end{figure}
 
 \newpage
@@ -2173,6 +2248,15 @@ Rolling correlation between long and short P\&L within each asset class.
 \includegraphics[width=0.95\textwidth]{result_long_short_corr_by_class.pdf}
 \caption{Realized Correlation: Long vs Short P\&L by Asset Class (252-day rolling)}
 \end{figure}
+
+\newpage
+\section{Cross-Asset-Class Correlation}
+
+Pairwise correlation of daily P\&L between asset classes (excluding zero-activity days).
+
+<<cross_class_corr_out, engine='python', results='asis'>>=
+print(cross_class_corr_latex)
+@
 
 \newpage
 \section{Rolling Hit Ratio}
