@@ -2075,12 +2075,12 @@ Rolling 252-day hit ratio by asset class.
 \end{figure}
 
 \newpage
-\section{Worst Cases by Period}
+\section{Outcomes by Period Length}
 
-Worst-case cumulative P\&L over rolling windows of different lengths. Values shown are the minimum rolling sum (in bps) for each period length and asset class.
+Statistics of rolling cumulative P\&L over windows of different lengths. All values in bps.
 
-<<worst_cases, engine='python', results='asis'>>=
-# Compute worst cases by period using ref_daily_pnl_by_class
+<<outcomes_by_period, engine='python', results='asis'>>=
+# Compute outcomes by period using ref_daily_pnl_by_class
 # Period lengths in trading days
 periods = {
     '1 week': 5,
@@ -2092,44 +2092,65 @@ periods = {
 
 # Asset class order
 cols = ['commodity', 'equity', 'fx', 'rates', 'stonks', 'all']
+col_headers = ['Cmdty', 'Eqty', 'FX', 'Rates', 'Stnks', 'All']
 
-# Compute worst case for each period and class
-worst_cases = {}
+# Compute all stats for each period and class
+stats_min = {}
+stats_max = {}
+stats_median = {}
+stats_mean = {}
+
 for period_name, window in periods.items():
-    worst_cases[period_name] = {}
+    stats_min[period_name] = {}
+    stats_max[period_name] = {}
+    stats_median[period_name] = {}
+    stats_mean[period_name] = {}
     for cls in cols:
         if cls in ref_daily_pnl_by_class:
             pnl = ref_daily_pnl_by_class[cls]
             rolling_sum = pnl.rolling(window=window, min_periods=window).sum()
-            worst_cases[period_name][cls] = rolling_sum.min()
+            stats_min[period_name][cls] = rolling_sum.min()
+            stats_max[period_name][cls] = rolling_sum.max()
+            stats_median[period_name][cls] = rolling_sum.median()
+            stats_mean[period_name][cls] = rolling_sum.mean()
         else:
-            worst_cases[period_name][cls] = 0
+            stats_min[period_name][cls] = 0
+            stats_max[period_name][cls] = 0
+            stats_median[period_name][cls] = 0
+            stats_mean[period_name][cls] = 0
 
-# Generate LaTeX table
-lines = []
-lines.append(r'\begin{table}[H]')
-lines.append(r'\centering')
-lines.append(r'\caption{Worst Cases by Period (minimum rolling sum, bps)}')
-lines.append(r'\label{tab:worst_cases}')
-lines.append(r'\small')
-lines.append(r'\begin{tabular}{l|rrrrr|r}')
-lines.append(r'\toprule')
-lines.append('Period & Cmdty & Eqty & FX & Rates & Stnks & All \\\\')
-lines.append(r'\midrule')
+def make_period_table(stats_dict, caption, label):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{' + caption + '}')
+    lines.append(r'\label{' + label + '}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{l|rrrrr|r}')
+    lines.append(r'\toprule')
+    lines.append('Period & ' + ' & '.join(col_headers) + r' \\')
+    lines.append(r'\midrule')
 
-for period_name in periods.keys():
-    cells = [period_name]
-    for cls in cols:
-        val = worst_cases[period_name].get(cls, 0)
-        cells.append(f'{int(round(val)):,}')
-    lines.append(' & '.join(cells) + r' \\')
+    for period_name in periods.keys():
+        cells = [period_name]
+        for cls in cols:
+            val = stats_dict[period_name].get(cls, 0)
+            cells.append(f'{int(round(val)):,}')
+        lines.append(' & '.join(cells) + r' \\')
 
-lines.append(r'\bottomrule')
-lines.append(r'\end{tabular}')
-lines.append(r'\end{table}')
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
 
-worst_cases_latex = '\n'.join(lines)
-print(worst_cases_latex)
+# Generate all four tables
+print(make_period_table(stats_min, 'Minimum (worst case)', 'tab:period_min'))
+print()
+print(make_period_table(stats_max, 'Maximum (best case)', 'tab:period_max'))
+print()
+print(make_period_table(stats_median, 'Median', 'tab:period_median'))
+print()
+print(make_period_table(stats_mean, 'Mean', 'tab:period_mean'))
 @
 
 \newpage
