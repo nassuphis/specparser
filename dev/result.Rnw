@@ -517,7 +517,7 @@ def format_val(val):
         return f'{val:.2f}'
 
 def signal_octet_to_latex(df, signals):
-    """Generate a table for 8 signals: 4 pairs stacked vertically."""
+    """Generate a table for up to 8 signals: pairs stacked vertically."""
     abbrevs = [col_abbrev[c] for c in cols]
 
     # Get dataframes for each signal
@@ -531,40 +531,38 @@ def signal_octet_to_latex(df, signals):
     lines.append(r'\begin{tabular}{l|rrrrrr|rrrrrr}')
     lines.append(r'\toprule')
 
-    # First pair header with column abbreviations
-    header1 = r' & \multicolumn{6}{c|}{' + sigs_esc[0] + r'} & \multicolumn{6}{c}{' + sigs_esc[1] + r'} \\'
-    lines.append(header1)
-    header2 = 'Stat & ' + ' & '.join(abbrevs) + ' & ' + ' & '.join(abbrevs) + r' \\'
-    lines.append(header2)
-    lines.append(r'\midrule')
+    # Asset class abbreviations at top (common for all pairs)
+    header_abbrevs = 'Stat & ' + ' & '.join(abbrevs) + ' & ' + ' & '.join(abbrevs) + r' \\'
+    lines.append(header_abbrevs)
 
-    # First pair data
-    for i in range(len(dfs[0])):
-        stat_name = dfs[0].iloc[i]['name'].replace('_', r'\_')
-        cells = [stat_name]
-        for col in cols:
-            cells.append(format_val(dfs[0].iloc[i][col]))
-        for col in cols:
-            cells.append(format_val(dfs[1].iloc[i][col]))
-        lines.append(' & '.join(cells) + r' \\')
+    # Each pair: signal names as separator, then data
+    n_pairs = (len(signals) + 1) // 2
+    for p in range(n_pairs):
+        idx1 = p * 2
+        idx2 = p * 2 + 1
 
-    # Remaining pairs (no column abbreviations, just signal names)
-    for p in range(1, len(signals) // 2):
-        idx1, idx2 = p * 2, p * 2 + 1
-        if idx1 >= len(signals):
-            break
-        lines.append(r'\midrule')
-        header = r' & \multicolumn{6}{c|}{' + sigs_esc[idx1] + r'} & \multicolumn{6}{c}{' + sigs_esc[idx2] + r'} \\'
-        lines.append(header)
         lines.append(r'\midrule')
 
+        # Signal names as separator row
+        if idx2 < len(signals):
+            sig_header = r' & \multicolumn{6}{c|}{' + sigs_esc[idx1] + r'} & \multicolumn{6}{c}{' + sigs_esc[idx2] + r'} \\'
+        else:
+            # Odd number of signals - only one in last pair
+            sig_header = r' & \multicolumn{6}{c|}{' + sigs_esc[idx1] + r'} & \multicolumn{6}{c}{} \\'
+        lines.append(sig_header)
+        lines.append(r'\midrule')
+
+        # Data rows
         for i in range(len(dfs[idx1])):
             stat_name = dfs[idx1].iloc[i]['name'].replace('_', r'\_')
             cells = [stat_name]
             for col in cols:
                 cells.append(format_val(dfs[idx1].iloc[i][col]))
-            for col in cols:
-                cells.append(format_val(dfs[idx2].iloc[i][col]))
+            if idx2 < len(signals):
+                for col in cols:
+                    cells.append(format_val(dfs[idx2].iloc[i][col]))
+            else:
+                cells.extend([''] * 6)
             lines.append(' & '.join(cells) + r' \\')
 
     lines.append(r'\bottomrule')
