@@ -554,13 +554,21 @@ def signal_octet_to_latex(df, signals):
 
         # Data rows
         for i in range(len(dfs[idx1])):
-            stat_name = dfs[idx1].iloc[i]['name'].replace('_', r'\_')
+            stat_name_raw = dfs[idx1].iloc[i]['name']
+            stat_name = stat_name_raw.replace('_', r'\_')
+            is_sharpe = (stat_name_raw == 'sharpe_pnl')
             cells = [stat_name]
             for col in cols:
-                cells.append(format_val(dfs[idx1].iloc[i][col]))
+                val = format_val(dfs[idx1].iloc[i][col])
+                if is_sharpe and col == 'all':
+                    val = r'\textbf{' + val + '}'
+                cells.append(val)
             if idx2 < len(signals):
                 for col in cols:
-                    cells.append(format_val(dfs[idx2].iloc[i][col]))
+                    val = format_val(dfs[idx2].iloc[i][col])
+                    if is_sharpe and col == 'all':
+                        val = r'\textbf{' + val + '}'
+                    cells.append(val)
             else:
                 cells.extend([''] * 6)
             lines.append(' & '.join(cells) + r' \\')
