@@ -620,7 +620,7 @@ class_map = {0: 'commodity', 1: 'equity', 2: 'fx', 3: 'rates', 4: 'stonks'}
 # Daily wpnl (rowwise sum of wpnl from reference cube)
 daily_wpnl_ref = wpnl_from_ref.sum(axis=1) * 10000  # to bps
 daily_wpnl_ref_nz = daily_wpnl_ref[daily_wpnl_ref != 0]
-ref_wpnl_sharpe_nz = (daily_wpnl_ref_nz.mean() / daily_wpnl_ref_nz.std() * np.sqrt(252)) if len(daily_wpnl_ref_nz) > 1 and daily_wpnl_ref_nz.std() > 0 else 0
+ref_wpnl_sharpe_nz = (daily_wpnl_ref_nz.mean() / daily_wpnl_ref_nz.std() * np.sqrt(256)) if len(daily_wpnl_ref_nz) > 1 and daily_wpnl_ref_nz.std() > 0 else 0
 
 # Long/short P&L from hedged_01 sign
 long_mask = hedged_01_weights > 0
