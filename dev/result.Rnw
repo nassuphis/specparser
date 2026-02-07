@@ -2119,18 +2119,28 @@ for period_name, window in periods.items():
             stats_median[period_name][cls] = 0
             stats_mean[period_name][cls] = 0
 
-def make_period_table(stats_dict, caption, label):
-    lines = []
-    lines.append(r'\begin{table}[H]')
-    lines.append(r'\centering')
-    lines.append(r'\caption{' + caption + '}')
-    lines.append(r'\label{' + label + '}')
-    lines.append(r'\small')
-    lines.append(r'\begin{tabular}{l|rrrrr|r}')
-    lines.append(r'\toprule')
-    lines.append('Period & ' + ' & '.join(col_headers) + r' \\')
-    lines.append(r'\midrule')
+# Generate combined table with statistics as separators
+all_stats = [
+    ('Minimum (worst case)', stats_min),
+    ('Maximum (best case)', stats_max),
+    ('Median', stats_median),
+    ('Mean', stats_mean)
+]
 
+lines = []
+lines.append(r'\begin{table}[H]')
+lines.append(r'\centering')
+lines.append(r'\caption{Outcomes by Period Length (bps)}')
+lines.append(r'\label{tab:outcomes_by_period}')
+lines.append(r'\small')
+lines.append(r'\begin{tabular}{l|rrrrr|r}')
+lines.append(r'\toprule')
+lines.append('Period & ' + ' & '.join(col_headers) + r' \\')
+
+for stat_name, stats_dict in all_stats:
+    lines.append(r'\midrule')
+    lines.append(r' & \multicolumn{6}{c}{' + stat_name + r'} \\')
+    lines.append(r'\midrule')
     for period_name in periods.keys():
         cells = [period_name]
         for cls in cols:
@@ -2138,19 +2148,11 @@ def make_period_table(stats_dict, caption, label):
             cells.append(f'{int(round(val)):,}')
         lines.append(' & '.join(cells) + r' \\')
 
-    lines.append(r'\bottomrule')
-    lines.append(r'\end{tabular}')
-    lines.append(r'\end{table}')
-    return '\n'.join(lines)
+lines.append(r'\bottomrule')
+lines.append(r'\end{tabular}')
+lines.append(r'\end{table}')
 
-# Generate all four tables
-print(make_period_table(stats_min, 'Minimum (worst case)', 'tab:period_min'))
-print()
-print(make_period_table(stats_max, 'Maximum (best case)', 'tab:period_max'))
-print()
-print(make_period_table(stats_median, 'Median', 'tab:period_median'))
-print()
-print(make_period_table(stats_mean, 'Mean', 'tab:period_mean'))
+print('\n'.join(lines))
 @
 
 \newpage
