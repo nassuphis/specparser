@@ -2075,6 +2075,64 @@ Rolling 252-day hit ratio by asset class.
 \end{figure}
 
 \newpage
+\section{Worst Cases by Period}
+
+Worst-case cumulative P\&L over rolling windows of different lengths. Values shown are the minimum rolling sum (in bps) for each period length and asset class.
+
+<<worst_cases, engine='python', results='asis'>>=
+# Compute worst cases by period using ref_daily_pnl_by_class
+# Period lengths in trading days
+periods = {
+    '1 week': 5,
+    '1 month': 21,
+    '3 months': 63,
+    '6 months': 126,
+    '1 year': 252
+}
+
+# Asset class order
+cols = ['commodity', 'equity', 'fx', 'rates', 'stonks', 'all']
+
+# Compute worst case for each period and class
+worst_cases = {}
+for period_name, window in periods.items():
+    worst_cases[period_name] = {}
+    for cls in cols:
+        if cls in ref_daily_pnl_by_class:
+            pnl = ref_daily_pnl_by_class[cls]
+            rolling_sum = pnl.rolling(window=window, min_periods=window).sum()
+            worst_cases[period_name][cls] = rolling_sum.min()
+        else:
+            worst_cases[period_name][cls] = 0
+
+# Generate LaTeX table
+lines = []
+lines.append(r'\begin{table}[H]')
+lines.append(r'\centering')
+lines.append(r'\caption{Worst Cases by Period (minimum rolling sum, bps)}')
+lines.append(r'\label{tab:worst_cases}')
+lines.append(r'\small')
+lines.append(r'\begin{tabular}{l|rrrrr|r}')
+lines.append(r'\toprule')
+lines.append('Period & Cmdty & Eqty & FX & Rates & Stnks & All \\\\')
+lines.append(r'\midrule')
+
+for period_name in periods.keys():
+    cells = [period_name]
+    for cls in cols:
+        val = worst_cases[period_name].get(cls, 0)
+        cells.append(f'{int(round(val)):,}')
+    lines.append(' & '.join(cells) + r' \\')
+
+lines.append(r'\bottomrule')
+lines.append(r'\end{tabular}')
+lines.append(r'\end{table}')
+
+worst_cases_latex = '\n'.join(lines)
+print(worst_cases_latex)
+@
+
+\newpage
 \section{Recovery Length}
 
 This section analyzes how many months it takes to recover from a loss-making month. Recovery is defined as the number of months until cumulative P\&L (starting from the loss month) turns non-negative.
