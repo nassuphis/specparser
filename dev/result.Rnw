@@ -1459,6 +1459,195 @@ def tail_risk_to_latex(df, monthly_tr):
 
 tail_risk_latex = tail_risk_to_latex(tail_risk_df, monthly_tr)
 
+# --- P&L Component Decomposition ---
+# Load option_pnl_cube and delta_pnl_cube
+option_pnl_3d, _, _, _ = load_cube_as_3d(RESULT_DIR, 'option_pnl_cube')
+delta_pnl_3d, _, _, _ = load_cube_as_3d(RESULT_DIR, 'delta_pnl_cube')
+decay_3d, _, _, _ = load_cube_as_3d(RESULT_DIR, 'decay_cube')
+
+# Apply inception weighting (same as for pnl_cube)
+option_wpnl = (option_pnl_3d * inception_hedged).sum(axis=(1, 2)) * 10000
+delta_wpnl = (delta_pnl_3d * inception_hedged).sum(axis=(1, 2)) * 10000
+decay_wpnl = (decay_3d * inception_hedged).sum(axis=(1, 2)) * 10000
+total_wpnl_check = (pnl_cube_3d * inception_hedged).sum(axis=(1, 2)) * 10000
+
+option_wpnl_s = pd.Series(option_wpnl, index=pnl_dates)
+delta_wpnl_s = pd.Series(delta_wpnl, index=pnl_dates)
+decay_wpnl_s = pd.Series(decay_wpnl, index=pnl_dates)
+total_wpnl_s = pd.Series(total_wpnl_check, index=pnl_dates)
+
+# Component stats
+def component_stats(series):
+    nz = series[series != 0]
+    if len(nz) < 10:
+        return {'mean': 0, 'total': 0, 'sharpe': 0}
+    return {
+        'mean': nz.mean(),
+        'total': nz.sum(),
+        'sharpe': (nz.mean() / nz.std()) * np.sqrt(256) if nz.std() > 0 else 0
+    }
+
+comp_stats = {
+    'Option P\\&L': component_stats(option_wpnl_s),
+    'Delta P\\&L': component_stats(delta_wpnl_s),
+    'Decay': component_stats(decay_wpnl_s),
+    'Total': component_stats(total_wpnl_s)
+}
+
+def component_to_latex(stats):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{P\&L Component Decomposition (bps)}')
+    lines.append(r'\label{tab:pnl_components}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{l|rrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Component & Mean daily & Sharpe & Total \\')
+    lines.append(r'\midrule')
+    for name, s in stats.items():
+        cells = [name, f"{s['mean']:.2f}", f"{s['sharpe']:.2f}", f"{int(round(s['total'])):,}"]
+        lines.append(' & '.join(cells) + r' \\')
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+component_latex = component_to_latex(comp_stats)
+
+# Stacked area chart of cumulative components
+fig, ax = plt.subplots(figsize=(12, 6))
+cumul_option = option_wpnl_s.cumsum()
+cumul_delta = delta_wpnl_s.cumsum()
+cumul_total_comp = total_wpnl_s.cumsum()
+ax.plot(cumul_total_comp.index, cumul_total_comp.values, linewidth=2, color='black', label='Total')
+ax.plot(cumul_option.index, cumul_option.values, linewidth=1.2, color='blue', label='Option P&L')
+ax.plot(cumul_delta.index, cumul_delta.values, linewidth=1.2, color='red', label='Delta P&L')
+ax.plot(decay_wpnl_s.cumsum().index, decay_wpnl_s.cumsum().values, linewidth=1, color='orange', linestyle='--', label='Decay')
+ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('Date')
+ax.set_ylabel('Cumulative P&L (bps)')
+ax.set_title('Cumulative P&L by Component')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_pnl_components.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Concentration Metrics ---
+# Per-asset total wpnl contribution
+asset_total_wpnl = wpnl_stored.sum(axis=0) * 10000  # sum over dates, per asset
+asset_total_wpnl_abs = np.abs(asset_total_wpnl)
+total_abs_wpnl = asset_total_wpnl_abs.sum()
+
+# Sort by absolute contribution
+asset_names_list = strategy_asset_df['asset_string'].tolist()
+asset_contrib = pd.DataFrame({
+    'asset': asset_names_list,
+    'wpnl': asset_total_wpnl,
+    'abs_wpnl': asset_total_wpnl_abs
+}).sort_values('abs_wpnl', ascending=False).reset_index(drop=True)
+
+# Top-10 and top-20 share
+top10_share = asset_contrib.head(10)['abs_wpnl'].sum() / total_abs_wpnl * 100
+top20_share = asset_contrib.head(20)['abs_wpnl'].sum() / total_abs_wpnl * 100
+
+# Herfindahl index
+weights = asset_total_wpnl_abs / total_abs_wpnl
+hhi = (weights ** 2).sum()
+effective_assets = 1 / hhi if hhi > 0 else 0
+
+# Top-10 table
+def concentration_to_latex(df, top10_share, top20_share, effective_assets):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Top 10 Assets by $|$P\&L$|$ Contribution}')
+    lines.append(r'\label{tab:concentration}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{l|rr}')
+    lines.append(r'\toprule')
+    lines.append(r'Asset & Total P\&L (bps) & $|$Contribution$|$ (\%) \\')
+    lines.append(r'\midrule')
+    for _, row in df.head(10).iterrows():
+        pct = row['abs_wpnl'] / total_abs_wpnl * 100
+        asset_esc = row['asset'].replace('_', r'\_')
+        cells = [asset_esc, f"{int(round(row['wpnl'])):,}", f"{pct:.1f}"]
+        lines.append(' & '.join(cells) + r' \\')
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+concentration_latex = concentration_to_latex(asset_contrib, top10_share, top20_share, effective_assets)
+concentration_bullets = (
+    f"Top 10 assets: {top10_share:.1f}\\% of $|$P\\&L$|$. "
+    f"Top 20: {top20_share:.1f}\\%. "
+    f"Effective assets (1/HHI): {effective_assets:.0f} of {len(asset_names_list)}."
+)
+
+# --- Volatility Regime Conditioning ---
+# Load vol_cube
+vol_3d, vol_date_df, vol_asset_df, _ = load_cube_as_3d(RESULT_DIR, 'vol_cube')
+
+# Average implied vol across assets and slices per day
+daily_avg_vol = np.nanmean(vol_3d, axis=(1, 2))
+vol_dates = pd.to_datetime(vol_date_df['date_string'].values)
+vol_series = pd.Series(daily_avg_vol, index=vol_dates)
+vol_series = vol_series[vol_series > 0]  # exclude zero days
+
+# Define terciles based on expanding window (to avoid look-ahead)
+vol_tercile_low = vol_series.expanding().quantile(0.33)
+vol_tercile_high = vol_series.expanding().quantile(0.67)
+
+# Align with daily_pnl
+common_dates = daily_pnl.index.intersection(vol_series.index)
+pnl_aligned = daily_pnl.loc[common_dates]
+vol_aligned = vol_series.loc[common_dates]
+low_aligned = vol_tercile_low.loc[common_dates]
+high_aligned = vol_tercile_high.loc[common_dates]
+
+low_vol_mask = vol_aligned <= low_aligned
+high_vol_mask = vol_aligned >= high_aligned
+mid_vol_mask = ~low_vol_mask & ~high_vol_mask
+
+regime_stats = {}
+for regime, mask in [('Low Vol', low_vol_mask), ('Mid Vol', mid_vol_mask), ('High Vol', high_vol_mask)]:
+    regime_pnl = pnl_aligned[mask]
+    nz = regime_pnl[regime_pnl != 0]
+    if len(nz) > 10:
+        regime_stats[regime] = {
+            'days': len(nz),
+            'mean': nz.mean(),
+            'sharpe': (nz.mean() / nz.std()) * np.sqrt(256) if nz.std() > 0 else 0,
+            'hit': (nz > 0).sum() / len(nz) * 100,
+            'dd': -(nz.cumsum().cummax() - nz.cumsum()).max()
+        }
+    else:
+        regime_stats[regime] = {'days': 0, 'mean': 0, 'sharpe': 0, 'hit': 0, 'dd': 0}
+
+def vol_regime_to_latex(stats):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Performance by Volatility Regime (bps)}')
+    lines.append(r'\label{tab:vol_regime}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{l|rrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Regime & Days & Mean P\&L & Sharpe & Hit (\%) \\')
+    lines.append(r'\midrule')
+    for regime in ['Low Vol', 'Mid Vol', 'High Vol']:
+        s = stats[regime]
+        cells = [regime, f"{s['days']:,}", f"{s['mean']:.2f}", f"{s['sharpe']:.2f}", f"{s['hit']:.1f}"]
+        lines.append(' & '.join(cells) + r' \\')
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+vol_regime_latex = vol_regime_to_latex(regime_stats)
+
 # --- P&L Recalc Error Matrix ---
 # Monthly sum of absolute errors: stored wpnl vs computed (inception-weighted hedged)
 
@@ -2171,6 +2360,40 @@ This matrix shows the sum of absolute differences between stored wpnl (from stra
 
 <<error_matrix_out, engine='python', results='asis'>>=
 print(error_matrix_latex)
+@
+
+\newpage
+\section{P\&L Component Decomposition}
+
+Breakdown of total P\&L into option P\&L (gamma + theta + vega) and delta hedge P\&L.
+
+<<pnl_components_out, engine='python', results='asis'>>=
+print(component_latex)
+@
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_pnl_components.pdf}
+\caption{Cumulative P\&L by Component (option, delta, decay)}
+\end{figure}
+
+\newpage
+\section{Concentration}
+
+How concentrated is P\&L across assets.
+
+<<concentration_out, engine='python', results='asis'>>=
+print(concentration_latex)
+print(f"\\noindent {concentration_bullets}")
+@
+
+\newpage
+\section{Volatility Regime}
+
+Performance conditioned on implied volatility level (expanding-window terciles to avoid look-ahead).
+
+<<vol_regime_out, engine='python', results='asis'>>=
+print(vol_regime_latex)
 @
 
 \newpage
