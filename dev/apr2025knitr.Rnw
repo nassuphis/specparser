@@ -1587,11 +1587,13 @@ plt.close(fig)
 # Check for autocorrelation at monthly level (less noisy than daily)
 
 # Use monthly_total_nz which already has non-zero months
-monthly_quantiles = monthly_total_nz.rank(pct=True) * 100
+# Exclude months after Dec 2025
+monthly_total_filtered = monthly_total_nz[monthly_total_nz.index <= '2025-12-31']
+monthly_quantiles = monthly_total_filtered.rank(pct=True) * 100
 
 # Create dataframe
 monthly_autocorr_df = pd.DataFrame({
-    'pnl': monthly_total_nz,
+    'pnl': monthly_total_filtered,
     'quantile': monthly_quantiles
 })
 
@@ -1628,6 +1630,264 @@ ax.set_ylim(0, 100)
 plt.tight_layout()
 fig.savefig(FIGURE_DIR + 'monthly_quantile_autocorr.pdf', dpi=150, bbox_inches='tight')
 plt.close(fig)
+
+# --- P&L Stats by Class ---
+# Compute stats: mean_pnl, mean_abs_pnl, sharpe, hit_ratio, drawdown
+
+# Daily P&L by asset (in leveraged bps)
+daily_by_asset = df * 10000 * 2
+daily_by_asset = daily_by_asset[daily_by_asset.sum(axis=1) != 0]  # Remove zero days
+
+# Map assets to classes
+daily_by_class = {}
+for asset in daily_by_asset.columns:
+    cls = asset_to_class.get(asset, 'Other')
+    if cls not in daily_by_class:
+        daily_by_class[cls] = []
+    daily_by_class[cls].append(asset)
+
+# Aggregate daily P&L by class
+class_daily_pnl = {}
+for cls, assets in daily_by_class.items():
+    class_daily_pnl[cls] = daily_by_asset[assets].sum(axis=1)
+
+# Add Total
+class_daily_pnl['Total'] = daily_by_asset.sum(axis=1)
+
+def compute_max_drawdown(cumulative_pnl):
+    """Compute maximum drawdown from cumulative P&L series"""
+    running_max = cumulative_pnl.cummax()
+    drawdown = cumulative_pnl - running_max
+    return drawdown.min()
+
+# Compute stats for each class
+stats_rows = []
+class_order = sorted([c for c in class_daily_pnl.keys() if c != 'Total']) + ['Total']
+
+for cls in class_order:
+    pnl = class_daily_pnl[cls]
+    cumulative = pnl.cumsum()
+
+    mean_pnl = pnl.mean()
+    mean_abs_pnl = pnl.abs().mean()
+    sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252) if pnl.std() > 0 else np.nan
+    hit_ratio = (pnl > 0).sum() / len(pnl) * 100
+    max_dd = compute_max_drawdown(cumulative)
+
+    stats_rows.append({
+        'class': cls,
+        'mean_pnl': mean_pnl,
+        'mean_abs_pnl': mean_abs_pnl,
+        'sharpe': sharpe,
+        'hit_ratio': hit_ratio,
+        'drawdown': max_dd
+    })
+
+stats_df = pd.DataFrame(stats_rows)
+stats_df.set_index('class', inplace=True)
+
+# Transpose so classes are columns
+stats_t = stats_df.T
+
+# Generate LaTeX table
+def stats_to_latex(df):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{P\&L Statistics by Asset Class (daily, bps, 2x leverage)}')
+    lines.append(r'\label{tab:pnl_stats}')
+    lines.append(r'\small')
+
+    # Column format: first column left-aligned (stat name), rest right-aligned, vertical line before Total
+    n_classes = len(df.columns) - 1  # excluding Total
+    lines.append(r'\begin{tabular}{l' + 'r' * n_classes + '|r}')
+    lines.append(r'\toprule')
+    lines.append('Statistic & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    row_labels = {
+        'mean_pnl': 'Mean P\\&L',
+        'mean_abs_pnl': 'Mean $|$P\\&L$|$',
+        'sharpe': 'Sharpe (ann.)',
+        'hit_ratio': 'Hit Ratio (\\%)',
+        'drawdown': 'Max Drawdown'
+    }
+
+    for stat in df.index:
+        cells = [row_labels.get(stat, stat)]
+        for cls in df.columns:
+            val = df.loc[stat, cls]
+            if stat in ('mean_pnl', 'mean_abs_pnl'):
+                cells.append(f'{val:.2f}')
+            elif stat == 'sharpe':
+                cells.append(f'{val:.2f}')
+            elif stat == 'hit_ratio':
+                cells.append(f'{val:.1f}')
+            else:
+                cells.append(f'{int(round(val)):,}')
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+pnl_stats_latex = stats_to_latex(stats_t)
+
+# --- P&L Matrix ---
+# Create a year x month matrix of P&L with colored cells
+
+# Get monthly P&L (already have monthly_total)
+pnl_matrix_data = monthly_total.copy()
+pnl_matrix_data = pnl_matrix_data[pnl_matrix_data != 0]  # Remove zero months
+
+# Extract year and month
+pnl_matrix_df = pd.DataFrame({
+    'pnl': pnl_matrix_data,
+    'year': pnl_matrix_data.index.year,
+    'month': pnl_matrix_data.index.month
+})
+
+# Pivot to year x month matrix
+pnl_pivot = pnl_matrix_df.pivot(index='year', columns='month', values='pnl')
+
+# Add total column
+pnl_pivot['Total'] = pnl_pivot.sum(axis=1)
+
+# Sort by year descending (most recent first)
+pnl_pivot = pnl_pivot.sort_index(ascending=False)
+
+# Rename columns to month names
+month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', 'Total']
+pnl_pivot.columns = month_names
+
+# Function to get color intensity based on value
+def get_cell_color(val, max_abs):
+    if pd.isna(val):
+        return 'white'
+    intensity = min(abs(val) / max_abs, 1.0) * 40  # Scale to 0-40
+    if val > 0:
+        return f'green!{int(intensity)}'
+    elif val < 0:
+        return f'red!{int(intensity)}'
+    else:
+        return 'white'
+
+# Find max absolute values separately for months and Total
+# Months are ranked among months, years (Total) are ranked among years
+month_cols = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+max_abs_months = pnl_pivot[month_cols].abs().max().max()
+max_abs_total = pnl_pivot['Total'].abs().max()
+
+# Generate LaTeX table with separate color scaling for months vs Total
+def pnl_matrix_to_latex(df, max_abs_months, max_abs_total):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Monthly P\&L Matrix (bps, 2x leverage)}')
+    lines.append(r'\label{tab:pnl_matrix}')
+    lines.append(r'\small')
+    # Add vertical lines: between Year and Jan, and between Dec and Total
+    lines.append(r'\begin{tabular}{r|' + 'r' * 12 + '|r}')
+    lines.append(r'\toprule')
+    lines.append('Year & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    for year, row in df.iterrows():
+        cells = [str(year)]
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                cells.append('')
+            else:
+                # Use appropriate max_abs based on column
+                if col == 'Total':
+                    color = get_cell_color(val, max_abs_total)
+                else:
+                    color = get_cell_color(val, max_abs_months)
+                val_str = f'{int(round(val)):,}'
+                cells.append(r'\cellcolor{' + color + '}' + val_str)
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+pnl_matrix_latex = pnl_matrix_to_latex(pnl_pivot, max_abs_months, max_abs_total)
+
+# --- Daily P&L QQ Plot ---
+# Compare daily P&L distribution against normal with same mean and std
+from scipy import stats
+
+# Get daily total P&L (sum across all assets)
+daily_pnl = df.sum(axis=1) * 10000 * 2  # leveraged bps
+daily_pnl = daily_pnl[daily_pnl != 0]  # Remove zero days
+
+# Compute mean and std
+pnl_mean = daily_pnl.mean()
+pnl_std = daily_pnl.std()
+
+# Sort the data
+sorted_pnl = np.sort(daily_pnl.values)
+n = len(sorted_pnl)
+
+# Theoretical quantiles from normal distribution with same mean/std
+theoretical_quantiles = stats.norm.ppf(np.linspace(0.001, 0.999, n), loc=pnl_mean, scale=pnl_std)
+
+# Create QQ plot
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.scatter(theoretical_quantiles, sorted_pnl, alpha=0.5, s=10)
+
+# Add 45-degree reference line
+min_val = min(theoretical_quantiles.min(), sorted_pnl.min())
+max_val = max(theoretical_quantiles.max(), sorted_pnl.max())
+ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='y = x')
+
+ax.set_xlabel(f'Theoretical Quantiles (Normal, μ={pnl_mean:.1f}, σ={pnl_std:.1f})')
+ax.set_ylabel('Sample Quantiles (Daily P&L, bps)')
+ax.set_title('Daily P&L QQ Plot vs Normal Distribution')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'daily_pnl_qq.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Monthly P&L QQ Plot ---
+# Compare monthly P&L distribution against normal with same mean and std
+
+# Get monthly total P&L (already have monthly_total)
+monthly_pnl_qq = monthly_total[monthly_total != 0]  # Remove zero months
+
+# Compute mean and std
+monthly_mean = monthly_pnl_qq.mean()
+monthly_std = monthly_pnl_qq.std()
+
+# Sort the data
+sorted_monthly = np.sort(monthly_pnl_qq.values)
+n_monthly = len(sorted_monthly)
+
+# Theoretical quantiles from normal distribution with same mean/std
+theoretical_monthly = stats.norm.ppf(np.linspace(0.001, 0.999, n_monthly), loc=monthly_mean, scale=monthly_std)
+
+# Create QQ plot
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.scatter(theoretical_monthly, sorted_monthly, alpha=0.7, s=30)
+
+# Add 45-degree reference line
+min_val = min(theoretical_monthly.min(), sorted_monthly.min())
+max_val = max(theoretical_monthly.max(), sorted_monthly.max())
+ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='y = x')
+
+ax.set_xlabel(f'Theoretical Quantiles (Normal, μ={monthly_mean:.1f}, σ={monthly_std:.1f})')
+ax.set_ylabel('Sample Quantiles (Monthly P&L, bps)')
+ax.set_title('Monthly P&L QQ Plot vs Normal Distribution')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'monthly_pnl_qq.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
 @
 
 \begin{document}
@@ -1643,7 +1903,47 @@ Loaded \Sexpr{py$n_rows} rows, \Sexpr{py$n_assets} assets.
 Date range: \Sexpr{py$date_min} to \Sexpr{py$date_max}.
 
 \newpage
-\section{Monthly P\&L by Asset}
+\section{P\&L Stats}
+
+Summary statistics by asset class computed from daily P\&L.
+
+<<pnl_stats, engine='python', results='asis'>>=
+print(pnl_stats_latex)
+@
+
+\newpage
+\section{P\&L Matrix}
+
+Monthly P\&L by year and month. Green indicates gains, red indicates losses. Color intensity reflects magnitude.
+
+<<pnl_matrix, engine='python', results='asis'>>=
+print(pnl_matrix_latex)
+@
+
+\newpage
+\section{Daily P\&L QQ Plot}
+
+Quantile-quantile plot comparing daily P\&L against a normal distribution fitted with the same mean and standard deviation. Deviations from the diagonal line indicate departures from normality (e.g., fat tails).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\textwidth]{dev/daily_pnl_qq.pdf}
+\caption{Daily P\&L QQ Plot vs Normal Distribution}
+\end{figure}
+
+\newpage
+\section{Monthly P\&L QQ Plot}
+
+Quantile-quantile plot comparing monthly P\&L against a normal distribution fitted with the same mean and standard deviation. Deviations from the diagonal line indicate departures from normality (e.g., fat tails).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\textwidth]{dev/monthly_pnl_qq.pdf}
+\caption{Monthly P\&L QQ Plot vs Normal Distribution}
+\end{figure}
+
+\newpage
+\section{P\&L by Asset for Mar25, Apr25 and May25}
 <<asset_table, engine='python', results='asis'>>=
 print(asset_table_latex)
 @

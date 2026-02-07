@@ -1,0 +1,1923 @@
+\documentclass[11pt]{article}
+\usepackage[portrait, margin=1.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage[dvipsnames,table]{xcolor}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{hyperref}
+\usepackage{amsmath}
+
+\title{\vspace{2cm}\Huge\textbf{Backtest Results}\\\vspace{0.5cm}\Large result\_nick\_20260202\_stagger1\_f1d8}
+\author{}
+\date{\vspace{1cm}\today}
+
+% Setup reticulate with project virtualenv
+<<setup, include=FALSE>>=
+library(reticulate)
+use_virtualenv("/Users/nicknassuphis/specparser/.venv", required = TRUE)
+library(knitr)
+opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE, results='asis')
+@
+
+% All Python code in one chunk to ensure variable persistence
+<<all_python, engine='python', include=FALSE>>=
+import sys
+import os
+import pandas as pd
+import numpy as np
+import warnings
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numba
+
+# --- Numba helper functions ---
+
+@numba.njit(parallel=True)
+def cube_rwlf(x, f, threshold=1e-15):
+    """
+    Rolling with last fill.
+
+    For each (slice, col), when f[row, col, slice] > threshold,
+    grab x[row, col] and carry forward.
+
+    Args:
+        x: 2D array (n_rows, n_cols) - source values
+        f: 3D array (n_rows, n_cols, n_slices) - trigger points
+
+    Returns:
+        3D array - values from x propagated from trigger points
+    """
+    n_rows, n_cols, n_slices = f.shape
+    res = np.zeros((n_rows, n_cols, n_slices), dtype=x.dtype)
+
+    for slice_idx in numba.prange(n_slices):
+        for col in range(n_cols):
+            last = 0.0
+            for row in range(n_rows):
+                if f[row, col, slice_idx] > threshold:
+                    last = x[row, col]
+                res[row, col, slice_idx] = last
+
+    return res
+
+
+def load_cube_as_3d(result_dir, cube_name):
+    """Load a cube from parquet and reshape to 3D numpy array."""
+    df = pd.read_parquet(f"{result_dir}/{cube_name}.parquet")
+    date_df = pd.read_parquet(f"{result_dir}/{cube_name}_date.parquet")
+    asset_df = pd.read_parquet(f"{result_dir}/{cube_name}_asset.parquet")
+
+    # Get third dimension (slice, result, signal, etc.)
+    dim3_col = [c for c in df.columns if c not in ['date', 'asset', 'value']][0]
+    dim3_df = pd.read_parquet(f"{result_dir}/{cube_name}_{dim3_col}.parquet")
+
+    n_dates, n_assets, n_dim3 = len(date_df), len(asset_df), len(dim3_df)
+    cube = df['value'].values.reshape((n_dates, n_assets, n_dim3), order='C')
+
+    return cube, date_df, asset_df, dim3_df
+
+
+# Paths
+PROJECT_ROOT = "/Users/nicknassuphis/specparser"
+RESULT_DIR = PROJECT_ROOT + "/data/result_nick_20260202_stagger1_f1d8"
+FIGURE_DIR = PROJECT_ROOT + "/dev/"
+
+# --- Data Overview ---
+# List all parquet files with sizes
+files_info = []
+for f in sorted(os.listdir(RESULT_DIR)):
+    if f.endswith('.parquet'):
+        size = os.path.getsize(os.path.join(RESULT_DIR, f))
+        files_info.append({'file': f, 'size_mb': size / 1024 / 1024})
+
+files_df = pd.DataFrame(files_info)
+total_size_mb = files_df['size_mb'].sum()
+n_files = len(files_df)
+
+# --- Load Dimension Files ---
+asset_df = pd.read_parquet(f"{RESULT_DIR}/asset.parquet")
+date_df = pd.read_parquet(f"{RESULT_DIR}/date.parquet")
+n_assets = len(asset_df)
+n_dates = len(date_df)
+date_min = date_df['date_string'].min()
+date_max = date_df['date_string'].max()
+
+# --- Load Strategy Cube Metadata ---
+strategy_result = pd.read_parquet(f"{RESULT_DIR}/strategy_result.parquet")
+n_strategy_slices = len(strategy_result)
+
+# --- Load Stats ---
+stats_df = pd.read_parquet(f"{RESULT_DIR}/stats.parquet")
+
+# --- Load Signals Metadata ---
+signals_signal = pd.read_parquet(f"{RESULT_DIR}/signals_signal.parquet")
+n_signals = len(signals_signal)
+
+# --- Load PnL Cube Slice Metadata ---
+pnl_slice = pd.read_parquet(f"{RESULT_DIR}/pnl_cube_slice.parquet")
+n_pnl_slices = len(pnl_slice)
+
+# --- Load Reference Result Metadata ---
+reference_result = pd.read_parquet(f"{RESULT_DIR}/reference_result.parquet")
+n_reference_slices = len(reference_result)
+
+# --- Cube Sizes ---
+cubes_info = []
+cube_names = ['strategy', 'pnl_cube', 'signals', 'residuals', 'reference',
+              'signal_ranks', 'entry_cube', 'expiry_cube', 'decay_cube',
+              'vega_cube', 'vol_cube', 'option_pnl_cube', 'delta_pnl_cube']
+
+for cube in cube_names:
+    fpath = f"{RESULT_DIR}/{cube}.parquet"
+    if os.path.exists(fpath):
+        size = os.path.getsize(fpath) / 1024 / 1024
+        df = pd.read_parquet(fpath)
+        cubes_info.append({
+            'cube': cube,
+            'rows': len(df),
+            'size_mb': size
+        })
+
+cubes_df = pd.DataFrame(cubes_info)
+
+# --- Generate Files Overview Table ---
+def files_to_latex(df):
+    # Split into 3 columns
+    n = len(df)
+    third = (n + 2) // 3
+
+    left = df.iloc[:third].reset_index(drop=True)
+    mid = df.iloc[third:2*third].reset_index(drop=True)
+    right = df.iloc[2*third:].reset_index(drop=True)
+
+    # Pad shorter columns
+    max_len = max(len(left), len(mid), len(right))
+    for d in [left, mid, right]:
+        while len(d) < max_len:
+            d.loc[len(d)] = {'file': '', 'size_mb': np.nan}
+
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Parquet Files in Result Directory}')
+    lines.append(r'\label{tab:files}')
+    lines.append(r'\scriptsize')
+    lines.append(r'\begin{tabular}{lr|lr|lr}')
+    lines.append(r'\toprule')
+    lines.append(r'File & MB & File & MB & File & MB \\')
+    lines.append(r'\midrule')
+
+    for i in range(max_len):
+        cells = []
+        for d in [left, mid, right]:
+            f = d.loc[i, 'file'] if i < len(d) else ''
+            s = d.loc[i, 'size_mb'] if i < len(d) else np.nan
+            if pd.isna(s) or f == '':
+                cells.extend(['', ''])
+            else:
+                # Truncate long filenames
+                fname = f.replace('.parquet', '').replace('_', r'\_')
+                if len(fname) > 25:
+                    fname = fname[:22] + '...'
+                cells.extend([fname, f'{s:.1f}'])
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+files_latex = files_to_latex(files_df)
+
+# --- Generate File Contents Table ---
+# Compact color-coded table with one-line descriptions
+
+file_contents_data = [
+    # (file, category, rows, description)
+    # Dimension files
+    ('asset', 'dim', 180, 'Asset index → name mapping'),
+    ('date', 'dim', 9854, 'Date index → string mapping'),
+    ('asset_ndx', 'dim', 180, 'Alternative asset indexing'),
+    ('date_ndx', 'dim', 9854, 'Alternative date indexing'),
+    ('group_names', 'dim', 5, 'Asset class names (commodity/equity/fx/rates/stonks)'),
+    ('subgroup_names', 'dim', 11, 'Subgroup names (regional/style)'),
+
+    # Config files
+    ('AMT', 'config', 237, 'Asset config as JSON (Class, Hedge, Vol, Slippage, etc.)'),
+    ('asset_config', 'config', 189, 'Per-asset params (group, risk, limit, cap, model)'),
+    ('yaml_config', 'config', 5211, 'YAML config file lines'),
+    ('json_config', 'config', 1, 'JSON config string'),
+    ('run_options', 'config', 13143, 'Runtime options (git, timestamp, paths)'),
+
+    # Strategy cube
+    ('strategy', 'cube', 39021840, '3D cube: 9854×180×22 (pnl, hedged, wpnl, ranks, etc.)'),
+    ('strategy_result', 'cube', 22, 'Strategy slice names'),
+
+    # P&L cubes (all 9854×180×10)
+    ('pnl_cube', 'pnl', 17737200, 'Raw straddle P\\&L (option + delta)'),
+    ('option_pnl_cube', 'pnl', 17737200, 'Option-only P\\&L'),
+    ('delta_pnl_cube', 'pnl', 17737200, 'Delta hedge P\\&L'),
+    ('entry_cube', 'pnl', 17737200, 'Entry indicators (1 on entry day)'),
+    ('expiry_cube', 'pnl', 17737200, 'Exit indicators (1 on expiry day)'),
+    ('entry_weight_cube', 'pnl', 17737200, 'Stagger weights propagated for straddle life'),
+    ('decay_cube', 'pnl', 17737200, 'Theta/decay P\\&L'),
+    ('vega_cube', 'pnl', 17737200, 'Vega exposure'),
+    ('vol_cube', 'pnl', 17737200, 'Implied volatility'),
+    ('pnl_cube_slice', 'pnl', 10, 'Slice names (pnl\\_1 to pnl\\_10 = stagger weights)'),
+
+    # Signal cubes
+    ('signals', 'signal', 35474400, '3D cube: 9854×180×20 raw signal values'),
+    ('signal_ranks', 'signal', 35474400, 'Cross-sectional signal ranks'),
+    ('signals_signal', 'signal', 20, 'Signal names (pearson/tau/one/sign × rsi/calmar/etc.)'),
+    ('residuals', 'signal', 7094880, '3D cube: 9854×180×4 factor-adjusted residuals'),
+    ('residuals_residual', 'signal', 4, 'Residual types (pearson, tau, one, sign)'),
+
+    # Reference cube
+    ('reference', 'ref', 175598280, '3D cube: 9854×180×99 reference metrics'),
+    ('reference_result', 'ref', 99, 'Reference slice names'),
+
+    # Stats
+    ('stats', 'stats', 29, 'Aggregated stats by class (mean, sharpe, hit, dd)'),
+    ('signal_hedged_stats', 'stats', 580, 'Stats for hedged signal combos'),
+    ('signal_norm_stats', 'stats', 580, 'Stats for normalized signal combos'),
+
+    # Backtest detail
+    ('backtest', 'bt', 6230449, 'Straddle-day level P\\&L with all fields'),
+    ('backtest_pnl_ndx', 'bt', 6230954, 'Indexed P\\&L for fast lookup'),
+    ('recent_entries', 'bt', 4294, 'Currently active straddles'),
+
+    # Straddle files
+    ('straddles1', 'strad', 192246, 'Straddle definitions (tickers, entry/expiry)'),
+    ('straddles5', 'strad', 6404102, 'Straddle valuations over time'),
+    ('straddle_entry_expiry', 'strad', 192246, 'Entry/expiry dates per straddle'),
+    ('straddle_ndx', 'strad', 186685, 'Straddle indexing'),
+    ('straddle_start_ndx', 'strad', 186692, 'Straddle start date indices'),
+    ('straddle_tickers', 'strad', 192246, 'Ticker mapping for straddles'),
+    ('straddle_biz', 'strad', 240084, 'Business day info (has\\_hedge, has\\_vol)'),
+    ('straddle_days', 'strad', 240084, 'Calendar day breakdown'),
+
+    # Price files
+    ('prices', 'price', 8506227, 'Combined price data (ticker, date, field, value)'),
+    ('bbg_prices', 'price', 7143932, 'Raw Bloomberg prices'),
+    ('calc_prices', 'price', 1293084, 'Calculated/derived prices'),
+    ('cv_prices', 'price', 69247, 'CV prices'),
+
+    # Ticker files
+    ('tickers', 'ticker', 5078, 'Master ticker list (source, ticker, field)'),
+    ('hedge_tickers', 'ticker', 303912, 'Hedge ticker assignments'),
+    ('vol_tickers', 'ticker', 240084, 'Volatility ticker assignments'),
+
+    # Other
+    ('cds_roll_dates', 'other', 54, 'CDS roll dates'),
+    ('current_bbg_chain_data', 'other', 6985, 'Bloomberg futures chain data'),
+    ('expiry_overrides', 'other', 6100, 'Manual expiry date overrides'),
+]
+
+# Category colors and labels
+cat_colors = {
+    'dim': ('blue!15', 'Dimension'),
+    'config': ('orange!15', 'Config'),
+    'cube': ('green!15', 'Strategy'),
+    'pnl': ('red!15', 'P\\&L Cube'),
+    'signal': ('purple!15', 'Signal'),
+    'ref': ('cyan!15', 'Reference'),
+    'stats': ('yellow!20', 'Stats'),
+    'bt': ('brown!15', 'Backtest'),
+    'strad': ('pink!15', 'Straddle'),
+    'price': ('olive!15', 'Price'),
+    'ticker': ('teal!15', 'Ticker'),
+    'other': ('gray!15', 'Other'),
+}
+
+def file_contents_to_latex(data, colors):
+    lines = []
+    lines.append(r'\begin{longtable}{lrlp{7.5cm}}')
+    lines.append(r'\caption{File Contents Reference} \\')
+    lines.append(r'\toprule')
+    lines.append(r'\textbf{File} & \textbf{Rows} & \textbf{Category} & \textbf{Description} \\')
+    lines.append(r'\midrule')
+    lines.append(r'\endfirsthead')
+    lines.append(r'\toprule')
+    lines.append(r'\textbf{File} & \textbf{Rows} & \textbf{Category} & \textbf{Description} \\')
+    lines.append(r'\midrule')
+    lines.append(r'\endhead')
+    lines.append(r'\midrule')
+    lines.append(r'\multicolumn{4}{r}{\textit{Continued...}} \\')
+    lines.append(r'\endfoot')
+    lines.append(r'\bottomrule')
+    lines.append(r'\endlastfoot')
+
+    for fname, cat, rows, desc in data:
+        color, cat_label = colors[cat]
+        fname_esc = fname.replace('_', r'\_')
+        if rows >= 1000000:
+            rows_str = f'{rows/1000000:.1f}M'
+        elif rows >= 1000:
+            rows_str = f'{rows/1000:.0f}K'
+        else:
+            rows_str = str(rows)
+        lines.append(
+            r'\rowcolor{' + color + '}' +
+            f'{fname_esc} & {rows_str} & {cat_label} & {desc} ' + r'\\'
+        )
+
+    lines.append(r'\end{longtable}')
+    return '\n'.join(lines)
+
+file_contents_latex = file_contents_to_latex(file_contents_data, cat_colors)
+
+# --- Generate Cubes Table ---
+def cubes_to_latex(df):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Cube Files Summary}')
+    lines.append(r'\label{tab:cubes}')
+    lines.append(r'\begin{tabular}{lrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Cube & Rows & Size (MB) \\')
+    lines.append(r'\midrule')
+
+    for _, row in df.iterrows():
+        name = row['cube'].replace('_', r'\_')
+        lines.append(f"{name} & {row['rows']:,} & {row['size_mb']:.1f} " + r'\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+cubes_latex = cubes_to_latex(cubes_df)
+
+# --- Generate Assets Table (3 columns) ---
+def assets_to_latex(df):
+    n = len(df)
+    third = (n + 2) // 3
+
+    left = df.iloc[:third].reset_index(drop=True)
+    mid = df.iloc[third:2*third].reset_index(drop=True)
+    right = df.iloc[2*third:].reset_index(drop=True)
+
+    max_len = max(len(left), len(mid), len(right))
+
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Assets in Universe}')
+    lines.append(r'\label{tab:assets}')
+    lines.append(r'\scriptsize')
+    lines.append(r'\begin{tabular}{rl|rl|rl}')
+    lines.append(r'\toprule')
+    lines.append(r'ID & Asset & ID & Asset & ID & Asset \\')
+    lines.append(r'\midrule')
+
+    for i in range(max_len):
+        cells = []
+        for d in [left, mid, right]:
+            if i < len(d):
+                idx = d.loc[i, 'asset']
+                name = d.loc[i, 'asset_string'].replace('_', r'\_')
+                cells.extend([str(idx), name])
+            else:
+                cells.extend(['', ''])
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+assets_latex = assets_to_latex(asset_df)
+
+# --- Generate Strategy Slices Table ---
+def slices_to_latex(df, caption, label):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(f'\\caption{{{caption}}}')
+    lines.append(f'\\label{{tab:{label}}}')
+    lines.append(r'\begin{tabular}{rl}')
+    lines.append(r'\toprule')
+    lines.append(r'ID & Slice \\')
+    lines.append(r'\midrule')
+
+    for _, row in df.iterrows():
+        idx = row.iloc[1]
+        name = row.iloc[0].replace('_', r'\_')
+        lines.append(f"{idx} & {name} " + r'\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+strategy_slices_latex = slices_to_latex(strategy_result, 'Strategy Cube Slices', 'strategy_slices')
+signals_latex = slices_to_latex(signals_signal, 'Signal Types', 'signals')
+pnl_slices_latex = slices_to_latex(pnl_slice, 'PnL Cube Slices (Stagger Weights)', 'pnl_slices')
+
+# --- Generate Reference Result Slices Table (3 columns) ---
+def reference_slices_to_latex(df):
+    n = len(df)
+    third = (n + 2) // 3
+
+    left = df.iloc[:third].reset_index(drop=True)
+    mid = df.iloc[third:2*third].reset_index(drop=True)
+    right = df.iloc[2*third:].reset_index(drop=True)
+
+    max_len = max(len(left), len(mid), len(right))
+
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Reference Cube Slices (' + str(n) + r' result types)}')
+    lines.append(r'\label{tab:reference_slices}')
+    lines.append(r'\scriptsize')
+    lines.append(r'\begin{tabular}{rl|rl|rl}')
+    lines.append(r'\toprule')
+    lines.append(r'ID & Slice & ID & Slice & ID & Slice \\')
+    lines.append(r'\midrule')
+
+    for i in range(max_len):
+        cells = []
+        for d in [left, mid, right]:
+            if i < len(d):
+                idx = d.iloc[i, 1]  # result column
+                name = d.iloc[i, 0].replace('_', r'\_')  # result_string column
+                cells.extend([str(int(idx)), name])
+            else:
+                cells.extend(['', ''])
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+reference_slices_latex = reference_slices_to_latex(reference_result)
+
+# --- Generate Stats Table ---
+def stats_to_latex(df):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Backtest Statistics by Asset Class}')
+    lines.append(r'\label{tab:stats}')
+    lines.append(r'\small')
+
+    cols = df.columns.tolist()
+    lines.append(r'\begin{tabular}{l' + 'r' * (len(cols) - 1) + '}')
+    lines.append(r'\toprule')
+    header = ' & '.join([c.replace('_', r'\_') for c in cols])
+    lines.append(header + r' \\')
+    lines.append(r'\midrule')
+
+    for _, row in df.iterrows():
+        cells = []
+        for i, c in enumerate(cols):
+            val = row[c]
+            if i == 0:
+                cells.append(str(val).replace('_', r'\_'))
+            elif pd.isna(val):
+                cells.append('')
+            else:
+                cells.append(f'{val:.2f}')
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+stats_latex = stats_to_latex(stats_df)
+
+# --- Generate Signal Hedged Stats Tables (4 signals per table, stacked) ---
+signal_hedged_stats_df = pd.read_parquet(f"{RESULT_DIR}/signal_hedged_stats.parquet")
+
+# Remove non-useful statistics
+exclude_stats = ['MAD_nz_pnl', 'Q_nz_pnl', 'R_nz_pnl', 'S_nz_pnl', 'T_nz_pnl',
+                 'sd_ratio_xy_nz', 'sd_ratio_q50xy_xy', 'hit_ratio_ratio_nz', 'winloss_ratio_nz',
+                 'dudd_pnl', 'dudd_pve', 'dudd_nve', 'hit_pnl', 'hit_pve', 'hit_nve']
+signal_hedged_stats_df = signal_hedged_stats_df[~signal_hedged_stats_df['name'].isin(exclude_stats)]
+
+# Abbreviated column headers
+col_abbrev = {'commodity': 'cmd', 'equity': 'eq', 'fx': 'fx', 'rates': 'rat', 'stonks': 'stk', 'all': 'all'}
+cols = ['commodity', 'equity', 'fx', 'rates', 'stonks', 'all']
+
+def format_val(val):
+    if pd.isna(val):
+        return ''
+    elif abs(val) >= 100:
+        return f'{val:.0f}'
+    elif abs(val) >= 10:
+        return f'{val:.1f}'
+    else:
+        return f'{val:.2f}'
+
+def signal_octet_to_latex(df, signals):
+    """Generate a table for 8 signals: 4 pairs stacked vertically."""
+    abbrevs = [col_abbrev[c] for c in cols]
+
+    # Get dataframes for each signal
+    dfs = [df[df['signal'] == sig].copy().reset_index(drop=True) for sig in signals]
+    sigs_esc = [sig.replace('_', r'\_') for sig in signals]
+
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\scriptsize')
+    lines.append(r'\begin{tabular}{l|rrrrrr|rrrrrr}')
+    lines.append(r'\toprule')
+
+    # First pair header with column abbreviations
+    header1 = r' & \multicolumn{6}{c|}{' + sigs_esc[0] + r'} & \multicolumn{6}{c}{' + sigs_esc[1] + r'} \\'
+    lines.append(header1)
+    header2 = 'Stat & ' + ' & '.join(abbrevs) + ' & ' + ' & '.join(abbrevs) + r' \\'
+    lines.append(header2)
+    lines.append(r'\midrule')
+
+    # First pair data
+    for i in range(len(dfs[0])):
+        stat_name = dfs[0].iloc[i]['name'].replace('_', r'\_')
+        cells = [stat_name]
+        for col in cols:
+            cells.append(format_val(dfs[0].iloc[i][col]))
+        for col in cols:
+            cells.append(format_val(dfs[1].iloc[i][col]))
+        lines.append(' & '.join(cells) + r' \\')
+
+    # Remaining pairs (no column abbreviations, just signal names)
+    for p in range(1, len(signals) // 2):
+        idx1, idx2 = p * 2, p * 2 + 1
+        if idx1 >= len(signals):
+            break
+        lines.append(r'\midrule')
+        header = r' & \multicolumn{6}{c|}{' + sigs_esc[idx1] + r'} & \multicolumn{6}{c}{' + sigs_esc[idx2] + r'} \\'
+        lines.append(header)
+        lines.append(r'\midrule')
+
+        for i in range(len(dfs[idx1])):
+            stat_name = dfs[idx1].iloc[i]['name'].replace('_', r'\_')
+            cells = [stat_name]
+            for col in cols:
+                cells.append(format_val(dfs[idx1].iloc[i][col]))
+            for col in cols:
+                cells.append(format_val(dfs[idx2].iloc[i][col]))
+            lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+# Get unique signals in order
+signal_names = signal_hedged_stats_df['signal'].unique().tolist()
+
+# Generate tables with up to 8 signals per table (pairs stacked)
+signal_hedged_tables_latex = []
+for i in range(0, len(signal_names), 8):
+    batch = signal_names[i:i+8]
+    signal_hedged_tables_latex.append(signal_octet_to_latex(signal_hedged_stats_df, batch))
+
+signal_hedged_all_latex = '\n\n'.join(signal_hedged_tables_latex)
+
+# --- Load and Plot wpnl from strategy cube ---
+# Load strategy cube data for wpnl slice
+strategy_data = pd.read_parquet(f"{RESULT_DIR}/strategy.parquet")
+strategy_date = pd.read_parquet(f"{RESULT_DIR}/strategy_date.parquet")
+strategy_asset = pd.read_parquet(f"{RESULT_DIR}/strategy_asset.parquet")
+
+# Get wpnl slice (result=22)
+wpnl_data = strategy_data[strategy_data['result'] == 22].copy()
+
+# Merge with date strings
+wpnl_data = wpnl_data.merge(strategy_date, on='date')
+wpnl_data['date_dt'] = pd.to_datetime(wpnl_data['date_string'])
+
+# Daily total P&L
+daily_pnl = wpnl_data.groupby('date_dt')['value'].sum() * 10000  # to bps
+daily_pnl = daily_pnl[daily_pnl != 0]
+
+# Cumulative P&L (will be plotted after long/short are computed)
+cumulative_pnl = daily_pnl.cumsum()
+
+# Monthly P&L distribution
+monthly_pnl = daily_pnl.resample('ME').sum()
+monthly_pnl = monthly_pnl[monthly_pnl != 0]
+
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.hist(monthly_pnl.values, bins=40, edgecolor='black', alpha=0.7)
+ax.axvline(0, color='red', linestyle='--', linewidth=2)
+ax.axvline(monthly_pnl.mean(), color='green', linestyle='--', linewidth=2,
+           label=f'Mean: {monthly_pnl.mean():.0f} bps')
+ax.set_xlabel('Monthly P&L (bps)')
+ax.set_ylabel('Frequency')
+ax.set_title('Monthly P&L Distribution')
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_monthly_hist.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# (Cumulative P&L and Rolling Vol plots are generated after class_daily_pnl is computed)
+
+# --- P&L Stats by Class ---
+# Compute stats from daily wpnl by asset class
+
+# Get hedged weights (result=21) to determine asset class allocation
+hedged_data = strategy_data[strategy_data['result'] == 21].copy()
+hedged_data = hedged_data.merge(strategy_date, on='date')
+hedged_data = hedged_data.merge(strategy_asset, on='asset')
+hedged_data['date_dt'] = pd.to_datetime(hedged_data['date_string'])
+
+# Load asset class mapping from strategy cube (result=1 is asset_class)
+class_data = strategy_data[strategy_data['result'] == 1].copy()
+class_data = class_data.merge(strategy_asset, on='asset')
+# Get first non-zero class for each asset
+asset_class_map = class_data.groupby('asset_string')['value'].first().to_dict()
+
+# Load class names from group_names.parquet
+group_names_df = pd.read_parquet(f"{RESULT_DIR}/group_names.parquet")
+class_names = dict(zip(group_names_df['value'].astype(int), group_names_df['name']))
+class_name_list = group_names_df['name'].tolist()  # ordered list of class names
+
+# Get wpnl by asset
+wpnl_by_asset = wpnl_data.pivot(index='date_dt', columns='asset', values='value') * 10000
+
+# Map asset indices to class names
+asset_to_class = {}
+for _, row in strategy_asset.iterrows():
+    asset_idx = row['asset']
+    asset_name = row['asset_string']
+    class_val = asset_class_map.get(asset_name, 0)
+    asset_to_class[asset_idx] = class_names.get(int(class_val), 'other')
+
+# Aggregate by class
+class_daily_pnl = {}
+for cls in class_names.values():
+    cls_assets = [a for a, c in asset_to_class.items() if c == cls]
+    if cls_assets:
+        cls_cols = [a for a in cls_assets if a in wpnl_by_asset.columns]
+        if cls_cols:
+            class_daily_pnl[cls] = wpnl_by_asset[cls_cols].sum(axis=1)
+
+class_daily_pnl['Total'] = wpnl_by_asset.sum(axis=1)
+
+# Cumulative P&L by asset class
+fig, ax = plt.subplots(figsize=(12, 6))
+colors_map = {'commodity': 'brown', 'equity': 'blue', 'fx': 'green',
+              'rates': 'purple', 'stonks': 'orange', 'Total': 'black'}
+for cls in class_name_list + ['Total']:
+    if cls in class_daily_pnl:
+        cumul = class_daily_pnl[cls].cumsum()
+        lw = 2.5 if cls == 'Total' else 1.2
+        ax.plot(cumul.index, cumul.values, label=cls, color=colors_map.get(cls, 'gray'), linewidth=lw)
+
+ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('Date')
+ax.set_ylabel('Cumulative P&L (bps)')
+ax.set_title('Cumulative P&L by Asset Class')
+ax.legend(loc='upper left')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_cumulative_by_class.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Rolling volatility by asset class (EMA of abs(pnl) with 364/365 decay)
+alpha = 1 - 364/365  # EMA decay factor
+
+fig, ax = plt.subplots(figsize=(12, 6))
+for cls in class_name_list + ['Total']:
+    if cls in class_daily_pnl:
+        abs_pnl = class_daily_pnl[cls].abs()
+        rolling_vol = abs_pnl.ewm(alpha=alpha, adjust=False).mean()
+        lw = 2.5 if cls == 'Total' else 1.2
+        ax.plot(rolling_vol.index, rolling_vol.values, label=cls,
+                color=colors_map.get(cls, 'gray'), linewidth=lw)
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Rolling Volatility (bps)')
+ax.set_title('Rolling Volatility by Asset Class (EMA of |P&L|, 364/365 decay)')
+ax.legend(loc='upper left')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_rolling_vol_by_class.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Realized correlation: Long vs Short P&L (using cubes with inception weights)
+# Load pnl_cube as 3D array
+pnl_cube_3d, pnl_cube_date_df, pnl_cube_asset_df, _ = load_cube_as_3d(RESULT_DIR, 'pnl_cube')
+
+# Load entry_cube (trigger points for inception weighting)
+entry_cube_3d, _, _, _ = load_cube_as_3d(RESULT_DIR, 'entry_cube')
+
+# Load hedged weights from strategy cube
+strategy_result_df = pd.read_parquet(f"{RESULT_DIR}/strategy_result.parquet")
+strategy_cube_df = pd.read_parquet(f"{RESULT_DIR}/strategy.parquet")
+strategy_date_df = pd.read_parquet(f"{RESULT_DIR}/strategy_date.parquet")
+strategy_asset_df = pd.read_parquet(f"{RESULT_DIR}/strategy_asset.parquet")
+
+n_strat_dates = len(strategy_date_df)
+n_strat_assets = len(strategy_asset_df)
+n_strat_results = len(strategy_result_df)
+strategy_cube = strategy_cube_df['value'].values.reshape((n_strat_dates, n_strat_assets, n_strat_results), order='C')
+
+# Get hedged slice (daily hedged weights with sign)
+slice_names = strategy_result_df['result_string'].tolist()
+hedged_idx = slice_names.index('hedged')
+hedged_mat = strategy_cube[:, :, hedged_idx]
+
+# Use cube_rwlf to propagate inception hedged weights: at each entry point, grab
+# the hedged weight and carry forward for the life of the straddle
+inception_hedged = cube_rwlf(hedged_mat.astype(np.float64), entry_cube_3d.astype(np.float64))
+
+# Weighted P&L = pnl * inception_hedged
+wpnl_cube_3d = pnl_cube_3d * inception_hedged
+
+# Get stored wpnl from strategy cube for error comparison
+wpnl_idx = slice_names.index('wpnl')
+wpnl_stored = strategy_cube[:, :, wpnl_idx]  # shape: (date, asset)
+
+# Computed wpnl = sum across slices
+wpnl_computed = wpnl_cube_3d.sum(axis=2)  # shape: (date, asset)
+
+# Compute absolute error per (date, asset)
+wpnl_error = np.abs(wpnl_computed - wpnl_stored)
+
+# Sum error across assets per date
+wpnl_error_daily = wpnl_error.sum(axis=1) * 10000  # to bps
+
+# Create error series with date index
+strat_dates = pd.to_datetime(strategy_date_df['date_string'].values)
+wpnl_error_series = pd.Series(wpnl_error_daily, index=strat_dates)
+
+# Split by sign of inception weight (long = positive, short = negative)
+long_mask = inception_hedged > 0
+short_mask = inception_hedged < 0
+
+# Sum weighted P&L by long/short classification across assets and slices
+long_pnl_daily = (wpnl_cube_3d * long_mask).sum(axis=(1, 2)) * 10000  # to bps
+short_pnl_daily = (wpnl_cube_3d * short_mask).sum(axis=(1, 2)) * 10000  # to bps
+
+# Create date index
+pnl_dates = pd.to_datetime(pnl_cube_date_df['date_string'].values)
+long_pnl = pd.Series(long_pnl_daily, index=pnl_dates)
+short_pnl = pd.Series(short_pnl_daily, index=pnl_dates)
+
+# Plot cumulative P&L with long/short breakdown
+# Note: "long" has negative weights (short straddles), "short" has positive weights
+cumul_total = (long_pnl + short_pnl).cumsum()
+cumul_long = long_pnl.cumsum()    # negative weights = short straddles
+cumul_short = short_pnl.cumsum()  # positive weights = long straddles
+
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(cumul_total.index, cumul_total.values, linewidth=2, color='black', label='Total')
+ax.plot(cumul_long.index, cumul_long.values, linewidth=1.2, color='red', label='Long (nve weights)')
+ax.plot(cumul_short.index, cumul_short.values, linewidth=1.2, color='green', label='Short (pve weights)')
+ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('Date')
+ax.set_ylabel('Cumulative P&L (bps)')
+ax.set_title('Cumulative Strategy P&L')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_cumulative_pnl.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Remove days where both are zero
+valid_days = (long_pnl != 0) | (short_pnl != 0)
+long_pnl = long_pnl[valid_days]
+short_pnl = short_pnl[valid_days]
+
+# Compute rolling correlation (252-day window)
+rolling_corr = long_pnl.rolling(window=252, min_periods=60).corr(short_pnl)
+
+# Plot
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(rolling_corr.index, rolling_corr.values, linewidth=1, color='blue')
+ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+ax.axhline(rolling_corr.mean(), color='red', linestyle='--', alpha=0.7,
+           label=f'Mean: {rolling_corr.mean():.2f}')
+ax.set_xlabel('Date')
+ax.set_ylabel('Correlation')
+ax.set_title('Realized Correlation: Long vs Short P&L (252-day rolling, inception weights)')
+ax.set_ylim(-1, 1)
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_long_short_corr.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Realized correlation by asset class
+# Need to map asset indices to classes
+# Build asset index to class mapping
+asset_idx_to_class = {}
+for asset_idx in range(pnl_cube_3d.shape[1]):
+    # asset indices are 1-based in the data, but 0-based in the cube
+    asset_name = pnl_cube_asset_df.iloc[asset_idx]['asset_string']
+    class_val = asset_class_map.get(asset_name, 0)
+    asset_idx_to_class[asset_idx] = class_names.get(int(class_val), 'other')
+
+fig, ax = plt.subplots(figsize=(12, 6))
+
+for cls in class_name_list:
+    # Get asset indices in this class
+    cls_asset_indices = [idx for idx, c in asset_idx_to_class.items() if c == cls]
+
+    if len(cls_asset_indices) > 0:
+        # Slice the cubes for this class
+        wpnl_cls = wpnl_cube_3d[:, cls_asset_indices, :]
+        inception_hedged_cls = inception_hedged[:, cls_asset_indices, :]
+
+        long_mask_cls = inception_hedged_cls > 0
+        short_mask_cls = inception_hedged_cls < 0
+
+        long_pnl_cls = (wpnl_cls * long_mask_cls).sum(axis=(1, 2)) * 10000
+        short_pnl_cls = (wpnl_cls * short_mask_cls).sum(axis=(1, 2)) * 10000
+
+        long_pnl_cls_series = pd.Series(long_pnl_cls, index=pnl_dates)
+        short_pnl_cls_series = pd.Series(short_pnl_cls, index=pnl_dates)
+
+        # Remove days where both are zero
+        valid = (long_pnl_cls_series != 0) | (short_pnl_cls_series != 0)
+        long_pnl_cls_series = long_pnl_cls_series[valid]
+        short_pnl_cls_series = short_pnl_cls_series[valid]
+
+        # Rolling correlation
+        if len(long_pnl_cls_series) > 60:
+            rolling_corr_cls = long_pnl_cls_series.rolling(window=252, min_periods=60).corr(short_pnl_cls_series)
+            ax.plot(rolling_corr_cls.index, rolling_corr_cls.values,
+                    label=cls, color=colors_map.get(cls, 'gray'), linewidth=1.2, alpha=0.8)
+
+ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('Date')
+ax.set_ylabel('Correlation')
+ax.set_title('Realized Correlation: Long vs Short P&L by Asset Class (252-day rolling, inception weights)')
+ax.set_ylim(-1, 1)
+ax.legend(loc='lower left')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_long_short_corr_by_class.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+def compute_max_drawdown(pnl_series):
+    cumulative = pnl_series.cumsum()
+    running_max = cumulative.cummax()
+    drawdown = cumulative - running_max
+    return drawdown.min()
+
+# Compute long/short P&L per class for stats
+class_long_pnl = {}
+class_short_pnl = {}
+
+for cls in class_name_list:
+    cls_asset_indices = [idx for idx, c in asset_idx_to_class.items() if c == cls]
+    if len(cls_asset_indices) > 0:
+        wpnl_cls = wpnl_cube_3d[:, cls_asset_indices, :]
+        inception_hedged_cls = inception_hedged[:, cls_asset_indices, :]
+
+        long_mask_cls = inception_hedged_cls > 0
+        short_mask_cls = inception_hedged_cls < 0
+
+        long_pnl_cls = (wpnl_cls * long_mask_cls).sum(axis=(1, 2)) * 10000
+        short_pnl_cls = (wpnl_cls * short_mask_cls).sum(axis=(1, 2)) * 10000
+
+        class_long_pnl[cls] = pd.Series(long_pnl_cls, index=pnl_dates)
+        class_short_pnl[cls] = pd.Series(short_pnl_cls, index=pnl_dates)
+
+# Total long/short (already computed)
+class_long_pnl['Total'] = long_pnl
+class_short_pnl['Total'] = short_pnl
+
+# Compute stats
+pnl_stats_rows = []
+class_order = sorted([c for c in class_daily_pnl.keys() if c != 'Total']) + ['Total']
+
+for cls in class_order:
+    pnl = class_daily_pnl[cls]
+    pnl_nz = pnl[pnl != 0]
+
+    mean_pnl = pnl_nz.mean() if len(pnl_nz) > 0 else 0
+    mean_abs_pnl = pnl_nz.abs().mean() if len(pnl_nz) > 0 else 0
+    sharpe = (pnl_nz.mean() / pnl_nz.std()) * np.sqrt(256) if len(pnl_nz) > 1 and pnl_nz.std() > 0 else 0
+    hit_ratio = (pnl_nz > 0).sum() / len(pnl_nz) * 100 if len(pnl_nz) > 0 else 0
+    max_dd = compute_max_drawdown(pnl_nz)
+
+    # Long/short stats
+    long_pnl_cls = class_long_pnl.get(cls, pd.Series([0]))
+    short_pnl_cls = class_short_pnl.get(cls, pd.Series([0]))
+
+    long_nz = long_pnl_cls[long_pnl_cls != 0]
+    short_nz = short_pnl_cls[short_pnl_cls != 0]
+
+    mean_pve_pnl = long_nz.mean() if len(long_nz) > 0 else 0
+    mean_nve_pnl = short_nz.mean() if len(short_nz) > 0 else 0
+    mean_abs_pve_pnl = long_nz.abs().mean() if len(long_nz) > 0 else 0
+    mean_abs_nve_pnl = short_nz.abs().mean() if len(short_nz) > 0 else 0
+
+    pve_sharpe = (long_nz.mean() / long_nz.std()) * np.sqrt(256) if len(long_nz) > 1 and long_nz.std() > 0 else 0
+    nve_sharpe = (short_nz.mean() / short_nz.std()) * np.sqrt(256) if len(short_nz) > 1 and short_nz.std() > 0 else 0
+
+    pve_hit_ratio = (long_nz > 0).sum() / len(long_nz) * 100 if len(long_nz) > 0 else 0
+    nve_hit_ratio = (short_nz > 0).sum() / len(short_nz) * 100 if len(short_nz) > 0 else 0
+
+    # Correlation of long to short: exclude rows where either is zero
+    both_nz_mask = (long_pnl_cls != 0) & (short_pnl_cls != 0)
+    long_both_nz = long_pnl_cls[both_nz_mask]
+    short_both_nz = short_pnl_cls[both_nz_mask]
+    if len(long_both_nz) > 1 and len(short_both_nz) > 1:
+        cor_ls = long_both_nz.corr(short_both_nz)
+    else:
+        cor_ls = 0
+
+    pnl_stats_rows.append({
+        'class': cls,
+        'mean_pnl': mean_pnl,
+        'mean_pve_pnl': mean_pve_pnl,
+        'mean_nve_pnl': mean_nve_pnl,
+        'mean_abs_pnl': mean_abs_pnl,
+        'mean_abs_pve_pnl': mean_abs_pve_pnl,
+        'mean_abs_nve_pnl': mean_abs_nve_pnl,
+        'sharpe': sharpe,
+        'pve_sharpe': pve_sharpe,
+        'nve_sharpe': nve_sharpe,
+        'hit_ratio': hit_ratio,
+        'pve_hit_ratio': pve_hit_ratio,
+        'nve_hit_ratio': nve_hit_ratio,
+        'drawdown': max_dd,
+        'cor_ls': cor_ls
+    })
+
+pnl_stats_df = pd.DataFrame(pnl_stats_rows)
+pnl_stats_df.set_index('class', inplace=True)
+pnl_stats_t = pnl_stats_df.T
+
+# Generate P&L Stats LaTeX
+def pnl_stats_to_latex(df):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{P\&L Statistics by Asset Class (daily, bps)}')
+    lines.append(r'\label{tab:pnl_stats}')
+    lines.append(r'\small')
+
+    n_classes = len(df.columns) - 1
+    lines.append(r'\begin{tabular}{l' + 'r' * n_classes + '|r}')
+    lines.append(r'\toprule')
+    lines.append('Statistic & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    row_labels = {
+        'mean_pnl': 'Mean P\\&L',
+        'mean_pve_pnl': 'Mean(pve P\\&L)',
+        'mean_nve_pnl': 'Mean(nve P\\&L)',
+        'mean_abs_pnl': 'Mean $|$P\\&L$|$',
+        'mean_abs_pve_pnl': 'Mean $|$pve P\\&L$|$',
+        'mean_abs_nve_pnl': 'Mean $|$nve P\\&L$|$',
+        'sharpe': 'Sharpe (ann.)',
+        'pve_sharpe': 'pve Sharpe',
+        'nve_sharpe': 'nve Sharpe',
+        'hit_ratio': 'Hit Ratio (\\%)',
+        'pve_hit_ratio': 'pve Hit (\\%)',
+        'nve_hit_ratio': 'nve Hit (\\%)',
+        'drawdown': 'Max Drawdown',
+        'cor_ls': 'CorLS'
+    }
+
+    # Define row order
+    row_order = [
+        'mean_pnl', 'mean_pve_pnl', 'mean_nve_pnl',
+        'mean_abs_pnl', 'mean_abs_pve_pnl', 'mean_abs_nve_pnl',
+        'sharpe', 'pve_sharpe', 'nve_sharpe',
+        'hit_ratio', 'pve_hit_ratio', 'nve_hit_ratio',
+        'drawdown', 'cor_ls'
+    ]
+
+    for stat in row_order:
+        if stat not in df.index:
+            continue
+        cells = [row_labels.get(stat, stat)]
+        for cls in df.columns:
+            val = df.loc[stat, cls]
+            if stat in ('mean_pnl', 'mean_pve_pnl', 'mean_nve_pnl',
+                        'mean_abs_pnl', 'mean_abs_pve_pnl', 'mean_abs_nve_pnl'):
+                cells.append(f'{val:.2f}')
+            elif stat in ('sharpe', 'pve_sharpe', 'nve_sharpe'):
+                cells.append(f'{val:.2f}')
+            elif stat == 'cor_ls':
+                cells.append(f'{val * 100:.2f}')
+            elif stat in ('hit_ratio', 'pve_hit_ratio', 'nve_hit_ratio'):
+                cells.append(f'{val:.1f}')
+            else:
+                cells.append(f'{int(round(val)):,}')
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+pnl_stats_latex = pnl_stats_to_latex(pnl_stats_t)
+
+# --- P&L Recalc Error Matrix ---
+# Monthly sum of absolute errors: stored wpnl vs computed (inception-weighted hedged)
+
+# Filter out zero error days
+wpnl_error_nz = wpnl_error_series[wpnl_error_series > 0]
+
+# Resample to monthly sum of absolute errors
+monthly_error = wpnl_error_nz.resample('ME').sum()
+monthly_error = monthly_error[monthly_error > 0]  # Remove zero months
+
+error_matrix_df = pd.DataFrame({
+    'error': monthly_error,
+    'year': monthly_error.index.year,
+    'month': monthly_error.index.month
+})
+
+error_pivot = error_matrix_df.pivot(index='year', columns='month', values='error')
+error_pivot['Total'] = error_pivot.sum(axis=1)
+error_pivot = error_pivot.sort_index(ascending=False)
+
+error_month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', 'Total']
+error_pivot.columns = error_month_names
+
+# Color scale for error matrix (all values are positive, use red intensity)
+def get_error_cell_color(val, max_val):
+    if pd.isna(val) or val == 0:
+        return 'white'
+    intensity = min(val / max_val, 1.0) * 40
+    return f'red!{int(intensity)}'
+
+error_month_cols = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+max_error_months = error_pivot[error_month_cols].max().max() if len(error_pivot) > 0 else 1
+max_error_total = error_pivot['Total'].max() if len(error_pivot) > 0 else 1
+
+def error_matrix_to_latex(df, max_months, max_total):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{P\&L Recalc Error Matrix: Sum of $|$stored wpnl - computed wpnl$|$ (bps)}')
+    lines.append(r'\label{tab:error_matrix}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{r|' + 'r' * 12 + '|r}')
+    lines.append(r'\toprule')
+    lines.append('Year & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    for year, row in df.iterrows():
+        cells = [str(year)]
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val) or val == 0:
+                cells.append('')
+            else:
+                if col == 'Total':
+                    color = get_error_cell_color(val, max_total)
+                else:
+                    color = get_error_cell_color(val, max_months)
+                # Format small values with decimals, larger with commas
+                if val < 1:
+                    val_str = f'{val:.4f}'
+                elif val < 10:
+                    val_str = f'{val:.2f}'
+                else:
+                    val_str = f'{val:.1f}'
+                cells.append(r'\cellcolor{' + color + '}' + val_str)
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+# Check if there are any errors
+if len(error_pivot) > 0 and error_pivot['Total'].sum() > 0:
+    error_matrix_latex = error_matrix_to_latex(error_pivot, max_error_months, max_error_total)
+else:
+    # No errors - create a simple message
+    error_matrix_latex = r'''\begin{table}[H]
+\centering
+\caption{P\&L Recalc Error Matrix: Sum of $|$stored wpnl - computed wpnl$|$ (bps)}
+\label{tab:error_matrix}
+\textcolor{green!70!black}{\textbf{No errors detected - computed wpnl matches stored wpnl exactly.}}
+\end{table}'''
+
+# --- P&L Matrix ---
+# Monthly P&L matrix by year
+
+# Filter out zero months
+monthly_pnl_nz = monthly_pnl[monthly_pnl != 0]
+
+pnl_matrix_df = pd.DataFrame({
+    'pnl': monthly_pnl_nz,
+    'year': monthly_pnl_nz.index.year,
+    'month': monthly_pnl_nz.index.month
+})
+
+pnl_pivot = pnl_matrix_df.pivot(index='year', columns='month', values='pnl')
+pnl_pivot['Total'] = pnl_pivot.sum(axis=1)
+pnl_pivot = pnl_pivot.sort_index(ascending=False)
+
+month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', 'Total']
+pnl_pivot.columns = month_names
+
+def get_cell_color(val, max_abs):
+    if pd.isna(val):
+        return 'white'
+    intensity = min(abs(val) / max_abs, 1.0) * 40
+    if val > 0:
+        return f'green!{int(intensity)}'
+    elif val < 0:
+        return f'red!{int(intensity)}'
+    else:
+        return 'white'
+
+# Separate scaling for months vs Total
+month_cols = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+max_abs_months = pnl_pivot[month_cols].abs().max().max()
+max_abs_total = pnl_pivot['Total'].abs().max()
+
+def pnl_matrix_to_latex(df, max_abs_months, max_abs_total):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Monthly P\&L Matrix (bps)}')
+    lines.append(r'\label{tab:pnl_matrix}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{r|' + 'r' * 12 + '|r}')
+    lines.append(r'\toprule')
+    lines.append('Year & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    for year, row in df.iterrows():
+        cells = [str(year)]
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                cells.append('')
+            else:
+                if col == 'Total':
+                    color = get_cell_color(val, max_abs_total)
+                else:
+                    color = get_cell_color(val, max_abs_months)
+                val_str = f'{int(round(val)):,}'
+                cells.append(r'\cellcolor{' + color + '}' + val_str)
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+pnl_matrix_latex = pnl_matrix_to_latex(pnl_pivot, max_abs_months, max_abs_total)
+
+# --- Rolling Hit Ratio ---
+# Compute rolling hit ratio (252-day window) for total portfolio
+rolling_hit_total = (daily_pnl > 0).rolling(window=252, min_periods=60).mean() * 100
+
+# Plot rolling hit ratio (total)
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(rolling_hit_total.index, rolling_hit_total.values, linewidth=1, color='blue')
+ax.axhline(50, color='gray', linestyle='--', alpha=0.5)
+mean_hit = rolling_hit_total.mean()
+ax.axhline(mean_hit, color='red', linestyle='--', alpha=0.7,
+           label=f'Mean: {mean_hit:.1f}%')
+ax.set_xlabel('Date')
+ax.set_ylabel('Hit Ratio (%)')
+ax.set_title('Rolling Hit Ratio - Total Portfolio (252-day rolling)')
+# Dynamic y-axis limits with padding
+ymin = rolling_hit_total.min() - 3
+ymax = rolling_hit_total.max() + 3
+ax.set_ylim(ymin, ymax)
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_rolling_hit_total.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Rolling hit ratio by asset class
+fig, ax = plt.subplots(figsize=(12, 6))
+all_hit_values = []
+for cls in class_name_list + ['Total']:
+    if cls in class_daily_pnl:
+        pnl = class_daily_pnl[cls]
+        pnl_nz = pnl[pnl != 0]
+        rolling_hit = (pnl_nz > 0).rolling(window=252, min_periods=60).mean() * 100
+        all_hit_values.extend(rolling_hit.dropna().values)
+        lw = 2.5 if cls == 'Total' else 1.2
+        ax.plot(rolling_hit.index, rolling_hit.values, label=cls,
+                color=colors_map.get(cls, 'gray'), linewidth=lw, alpha=0.8)
+
+ax.axhline(50, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('Date')
+ax.set_ylabel('Hit Ratio (%)')
+ax.set_title('Rolling Hit Ratio by Asset Class (252-day rolling)')
+# Dynamic y-axis limits with padding
+ymin = min(all_hit_values) - 3
+ymax = max(all_hit_values) + 3
+ax.set_ylim(ymin, ymax)
+ax.legend(loc='lower left')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_rolling_hit_by_class.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# --- Recovery Length Analysis ---
+# For each loss month, count months until cumulative P&L turns positive
+
+def compute_recovery_months(pnl_series):
+    """Compute recovery months for each loss month in a P&L series.
+
+    Returns list of recovery lengths (in months) for each loss month.
+    None if recovery never happened within the data.
+    """
+    pnl = pnl_series.dropna()
+    pnl = pnl[pnl != 0]  # Remove zero months
+
+    recovery_lengths = []
+
+    for i in range(len(pnl)):
+        if pnl.iloc[i] < 0:  # Loss month
+            # Track cumulative P&L from this point
+            cumsum = pnl.iloc[i]
+            months_to_recover = None
+            for j in range(i + 1, len(pnl)):
+                cumsum += pnl.iloc[j]
+                if cumsum >= 0:
+                    months_to_recover = j - i
+                    break
+            recovery_lengths.append((pnl.iloc[i], months_to_recover))
+
+    return recovery_lengths
+
+def avg_recovery_by_threshold(recovery_data, threshold=0):
+    """Compute average recovery months for losses exceeding threshold."""
+    filtered = [(loss, months) for loss, months in recovery_data
+                if loss < -threshold and months is not None]
+    if len(filtered) == 0:
+        return np.nan, 0
+    return np.mean([m for _, m in filtered]), len(filtered)
+
+# Compute recovery for each asset class using monthly P&L
+monthly_by_class = {}
+for cls in sorted(class_daily_pnl.keys()):
+    monthly_by_class[cls] = class_daily_pnl[cls].resample('ME').sum()
+    monthly_by_class[cls] = monthly_by_class[cls][monthly_by_class[cls] != 0]
+
+recovery_by_class = {}
+for cls in sorted(monthly_by_class.keys()):
+    recovery_by_class[cls] = compute_recovery_months(monthly_by_class[cls])
+
+# Build recovery table
+def build_recovery_table(recovery_data, thresholds=[0, 100, 200, 400]):
+    rows = []
+    for cls in sorted([c for c in recovery_data.keys() if c != 'Total']):
+        row = {'class': cls}
+        for thresh in thresholds:
+            avg, n = avg_recovery_by_threshold(recovery_data[cls], thresh)
+            row[f't{thresh}'] = avg
+            row[f'n{thresh}'] = n
+        rows.append(row)
+
+    # Add "Total" row
+    if 'Total' in recovery_data:
+        row = {'class': 'Total'}
+        for thresh in thresholds:
+            avg, n = avg_recovery_by_threshold(recovery_data['Total'], thresh)
+            row[f't{thresh}'] = avg
+            row[f'n{thresh}'] = n
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+recovery_df = build_recovery_table(recovery_by_class)
+
+# Generate LaTeX for recovery table
+def recovery_table_to_latex(dataframe):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Average Months to Recovery by Asset Class}')
+    lines.append(r'\label{tab:recovery}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Class & Any Loss & $>$100 bps & $>$200 bps & $>$400 bps \\')
+    lines.append(r'\midrule')
+
+    for _, row in dataframe.iterrows():
+        name = str(row['class']).replace('_', r'\_')
+        t0 = f"{row['t0']:.1f}" if pd.notna(row['t0']) else '--'
+        t100 = f"{row['t100']:.1f}" if pd.notna(row['t100']) else '--'
+        t200 = f"{row['t200']:.1f}" if pd.notna(row['t200']) else '--'
+        t400 = f"{row['t400']:.1f}" if pd.notna(row['t400']) else '--'
+
+        if row['class'] == 'Total':
+            lines.append(r'\midrule')
+            lines.append(f'\\textbf{{{name}}} & \\textbf{{{t0}}} & \\textbf{{{t100}}} & \\textbf{{{t200}}} & \\textbf{{{t400}}} \\\\')
+        else:
+            lines.append(f'{name} & {t0} & {t100} & {t200} & {t400} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+recovery_table_latex = recovery_table_to_latex(recovery_df)
+
+# Also create a table with sample counts
+def recovery_count_to_latex(dataframe):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Number of Loss Months by Threshold}')
+    lines.append(r'\label{tab:recovery_count}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{lrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Class & Any Loss & $>$100 bps & $>$200 bps & $>$400 bps \\')
+    lines.append(r'\midrule')
+
+    for _, row in dataframe.iterrows():
+        name = str(row['class']).replace('_', r'\_')
+        n0 = int(row['n0']) if pd.notna(row['n0']) else 0
+        n100 = int(row['n100']) if pd.notna(row['n100']) else 0
+        n200 = int(row['n200']) if pd.notna(row['n200']) else 0
+        n400 = int(row['n400']) if pd.notna(row['n400']) else 0
+
+        if row['class'] == 'Total':
+            lines.append(r'\midrule')
+            lines.append(f'\\textbf{{{name}}} & \\textbf{{{n0}}} & \\textbf{{{n100}}} & \\textbf{{{n200}}} & \\textbf{{{n400}}} \\\\')
+        else:
+            lines.append(f'{name} & {n0} & {n100} & {n200} & {n400} \\\\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+recovery_count_latex = recovery_count_to_latex(recovery_df)
+
+# --- Entries Matrix ---
+# Load entry_cube and sum across slice axis
+entry_cube = pd.read_parquet(f"{RESULT_DIR}/entry_cube.parquet")
+entry_cube_date = pd.read_parquet(f"{RESULT_DIR}/entry_cube_date.parquet")
+
+# Sum across slices to get total entries per date
+entry_by_date = entry_cube.groupby('date')['value'].sum().reset_index()
+entry_by_date = entry_by_date.merge(entry_cube_date, on='date')
+entry_by_date['date_dt'] = pd.to_datetime(entry_by_date['date_string'])
+entry_by_date['year'] = entry_by_date['date_dt'].dt.year
+entry_by_date['month'] = entry_by_date['date_dt'].dt.month
+
+# Sum entries per year/month
+entry_counts = entry_by_date.groupby(['year', 'month'])['value'].sum().reset_index(name='count')
+
+# Pivot to matrix form
+entry_pivot = entry_counts.pivot(index='year', columns='month', values='count')
+entry_pivot = entry_pivot.sort_index(ascending=False)
+
+# Rename columns to month names
+month_names_short = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+entry_pivot.columns = [month_names_short[m-1] for m in entry_pivot.columns]
+
+# Compute median for color coding
+all_entry_values = entry_pivot.values.flatten()
+all_entry_values = all_entry_values[~np.isnan(all_entry_values)]
+entry_median = np.median(all_entry_values)
+n_total_entries = int(all_entry_values.sum())
+
+def get_matrix_cell_color(val, median, all_vals):
+    if pd.isna(val):
+        return 'white'
+    max_dist = max(abs(all_vals.max() - median), abs(all_vals.min() - median))
+    if max_dist == 0:
+        return 'white'
+    intensity = min(abs(val - median) / max_dist, 1.0) * 30
+    if val > median:
+        return f'green!{int(intensity)}'
+    elif val < median:
+        return f'red!{int(intensity)}'
+    else:
+        return 'white'
+
+def entries_matrix_to_latex(df, median, all_vals):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Entry Count by Month (sum of entry\_cube)}')
+    lines.append(r'\label{tab:entries}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{r|' + 'r' * len(df.columns) + '}')
+    lines.append(r'\toprule')
+    lines.append('Year & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    for year, row in df.iterrows():
+        cells = [str(year)]
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                cells.append('')
+            else:
+                color = get_matrix_cell_color(val, median, all_vals)
+                val_str = f'{int(val):,}'
+                cells.append(r'\cellcolor{' + color + '}' + val_str)
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+entries_matrix_latex = entries_matrix_to_latex(entry_pivot, entry_median, all_entry_values)
+
+# --- Exits Matrix ---
+# Load expiry_cube and sum across slice axis
+expiry_cube = pd.read_parquet(f"{RESULT_DIR}/expiry_cube.parquet")
+expiry_cube_date = pd.read_parquet(f"{RESULT_DIR}/expiry_cube_date.parquet")
+
+# Sum across slices to get total exits per date
+exit_by_date = expiry_cube.groupby('date')['value'].sum().reset_index()
+exit_by_date = exit_by_date.merge(expiry_cube_date, on='date')
+exit_by_date['date_dt'] = pd.to_datetime(exit_by_date['date_string'])
+exit_by_date['year'] = exit_by_date['date_dt'].dt.year
+exit_by_date['month'] = exit_by_date['date_dt'].dt.month
+
+# Sum exits per year/month
+exit_counts = exit_by_date.groupby(['year', 'month'])['value'].sum().reset_index(name='count')
+
+# Pivot to matrix form
+exit_pivot = exit_counts.pivot(index='year', columns='month', values='count')
+exit_pivot = exit_pivot.sort_index(ascending=False)
+
+# Rename columns to month names
+exit_pivot.columns = [month_names_short[m-1] for m in exit_pivot.columns]
+
+# Compute median for color coding
+all_exit_values = exit_pivot.values.flatten()
+all_exit_values = all_exit_values[~np.isnan(all_exit_values)]
+exit_median = np.median(all_exit_values)
+n_total_exits = int(all_exit_values.sum())
+
+def exits_matrix_to_latex(df, median, all_vals):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Exit Count by Month (sum of expiry\_cube)}')
+    lines.append(r'\label{tab:exits}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{r|' + 'r' * len(df.columns) + '}')
+    lines.append(r'\toprule')
+    lines.append('Year & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    for year, row in df.iterrows():
+        cells = [str(year)]
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                cells.append('')
+            else:
+                color = get_matrix_cell_color(val, median, all_vals)
+                val_str = f'{int(val):,}'
+                cells.append(r'\cellcolor{' + color + '}' + val_str)
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+exits_matrix_latex = exits_matrix_to_latex(exit_pivot, exit_median, all_exit_values)
+
+# --- Entries - Exits Matrix ---
+# Compute difference: entries - exits per month
+# Both pivots have same structure (year x month), align them
+diff_pivot = entry_pivot.copy()
+for col in diff_pivot.columns:
+    if col in exit_pivot.columns:
+        diff_pivot[col] = entry_pivot[col].subtract(exit_pivot[col], fill_value=0)
+
+# For color scaling: positive = more entries than exits (green), negative = more exits (red)
+all_diff_values = diff_pivot.values.flatten()
+all_diff_values = all_diff_values[~np.isnan(all_diff_values)]
+max_abs_diff = np.abs(all_diff_values).max() if len(all_diff_values) > 0 else 1
+
+def diff_matrix_to_latex(df, max_abs):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Entries - Exits by Month}')
+    lines.append(r'\label{tab:diff_matrix}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{r|' + 'r' * len(df.columns) + '}')
+    lines.append(r'\toprule')
+    lines.append('Year & ' + ' & '.join(df.columns) + r' \\')
+    lines.append(r'\midrule')
+
+    for year, row in df.iterrows():
+        cells = [str(year)]
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                cells.append('')
+            else:
+                # Positive = more entries (green), negative = more exits (red)
+                intensity = min(abs(val) / max_abs, 1.0) * 40 if max_abs > 0 else 0
+                if val > 0:
+                    color = f'green!{int(intensity)}'
+                elif val < 0:
+                    color = f'red!{int(intensity)}'
+                else:
+                    color = 'white'
+                val_str = f'{int(val):+,}' if val != 0 else '0'
+                cells.append(r'\cellcolor{' + color + '}' + val_str)
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+diff_matrix_latex = diff_matrix_to_latex(diff_pivot, max_abs_diff)
+
+# --- Entry - Exit Reconciliation ---
+# Load cubes for reconciliation
+entry_cube_3d, entry_date_df, _, _ = load_cube_as_3d(RESULT_DIR, 'entry_cube')
+exit_cube_3d, _, _, _ = load_cube_as_3d(RESULT_DIR, 'expiry_cube')
+ewc_cube_3d, _, _, _ = load_cube_as_3d(RESULT_DIR, 'entry_weight_cube')
+
+recon_dates = pd.to_datetime(entry_date_df['date_string'].values)
+
+# Daily counts
+daily_entries_recon = (entry_cube_3d > 0).sum(axis=(1, 2))
+daily_exits_recon = (exit_cube_3d > 0).sum(axis=(1, 2))
+cumsum_entries_exits = np.cumsum(daily_entries_recon - daily_exits_recon)
+live_straddles_recon = (ewc_cube_3d != 0).sum(axis=(1, 2))
+
+# Key insight: live_straddles = cumsum + exits_today
+# Because on exit day, the straddle is still "live" (ewc != 0)
+implied_live = cumsum_entries_exits + daily_exits_recon
+recon_match = np.allclose(implied_live, live_straddles_recon)
+
+# Create reconciliation stats
+recon_stats = {
+    'total_entries': int(daily_entries_recon.sum()),
+    'total_exits': int(daily_exits_recon.sum()),
+    'net_entries_exits': int(daily_entries_recon.sum() - daily_exits_recon.sum()),
+    'max_cumsum': int(cumsum_entries_exits.max()),
+    'min_live': int(live_straddles_recon.min()),
+    'max_live': int(live_straddles_recon.max()),
+    'mean_live': float(live_straddles_recon.mean()),
+    'recon_match': recon_match,
+    'max_recon_diff': int(np.abs(implied_live - live_straddles_recon).max())
+}
+
+# Create time series for plotting
+recon_series = pd.DataFrame({
+    'cumsum_entries_exits': cumsum_entries_exits,
+    'live_straddles': live_straddles_recon,
+    'daily_exits': daily_exits_recon
+}, index=recon_dates)
+
+# Plot reconciliation
+fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+# Top: cumsum vs live straddles
+ax1 = axes[0]
+ax1.plot(recon_series.index, recon_series['live_straddles'],
+         label='Live Straddles (ewc ≠ 0)', linewidth=1.5, color='blue')
+ax1.plot(recon_series.index, recon_series['cumsum_entries_exits'],
+         label='Cumsum(Entries - Exits)', linewidth=1, color='red', alpha=0.7)
+ax1.set_ylabel('Count')
+ax1.set_title('Live Straddles vs Cumulative Entries - Exits')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# Bottom: the difference (should equal daily_exits)
+ax2 = axes[1]
+diff_series = recon_series['live_straddles'] - recon_series['cumsum_entries_exits']
+ax2.plot(recon_series.index, diff_series, label='Live - Cumsum (= Exits Today)',
+         linewidth=1, color='green')
+ax2.plot(recon_series.index, recon_series['daily_exits'],
+         label='Daily Exits', linewidth=1, color='orange', alpha=0.5)
+ax2.set_xlabel('Date')
+ax2.set_ylabel('Count')
+ax2.set_title('Difference = Daily Exits (straddles exit on their last live day)')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+fig.savefig(FIGURE_DIR + 'result_entry_exit_recon.pdf', dpi=150, bbox_inches='tight')
+plt.close(fig)
+@
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\newpage
+
+\tableofcontents
+\newpage
+
+\section{Data Summary}
+
+This document presents the structure and contents of backtest results from:
+
+\texttt{result\_nick\_20260202\_stagger1\_f1d8}
+
+\begin{itemize}
+\item \textbf{Total files:} \Sexpr{py$n_files} parquet files
+\item \textbf{Total size:} \Sexpr{sprintf("%.1f", py$total_size_mb)} MB
+\item \textbf{Assets:} \Sexpr{py$n_assets}
+\item \textbf{Dates:} \Sexpr{py$n_dates} (\Sexpr{py$date_min} to \Sexpr{py$date_max})
+\item \textbf{Strategy slices:} \Sexpr{py$n_strategy_slices}
+\item \textbf{Signal types:} \Sexpr{py$n_signals}
+\item \textbf{Stagger weights:} \Sexpr{py$n_pnl_slices}
+\end{itemize}
+
+\newpage
+\section{Files Overview}
+
+<<files_table, engine='python', results='asis'>>=
+print(files_latex)
+@
+
+\newpage
+\section{File Contents}
+
+Color-coded reference for all parquet files. Row counts shown as K (thousands) or M (millions).
+
+<<file_contents_table, engine='python', results='asis'>>=
+print(file_contents_latex)
+@
+
+\subsection{Key File Details}
+
+\textbf{Cubes:} All cubes stored in long format with columns (date, asset, dim3, value). Reshape to 3D with \texttt{values.reshape((n\_dates, n\_assets, n\_dim3), order='C')}.
+
+\textbf{P\&L Cubes:} All share dimensions 9,854 dates $\times$ 180 assets $\times$ 10 slices (stagger weights). The \texttt{entry\_weight\_cube} contains unsigned stagger weights (0.25, 0.333) propagated for straddle life.
+
+\textbf{Strategy Cube Slices:} asset\_class, sub\_class, pnl, cap, liquidity, winsorized\_pnl, rank\_rescale, rank\_sum, rank\_sum\_median, rank\_centered, conviction, is\_live, normalized\_signal, risk\_weight, risk\_signal, class\_weight, class\_signal, beta, norm, redistribute, \textbf{hedged} (signed weights), \textbf{wpnl} (weighted P\&L).
+
+\textbf{Signal Types:} Combine correlation (pearson, tau, one, sign) with metric (rsi, calmar, sign, streak, range) = 20 signals.
+
+\textbf{backtest.parquet columns:} Underlying, straddle, Class, Entry, Expiry, EntryWeight, entry\_date, expiry\_date, date, px, fsw, pva, strike, vol, mv, option\_pnl, delta\_pnl, pnl, vega, decay, spot, bidask, delta, RiskAdj, WeightCap, auxUnderlying.
+
+\newpage
+\section{Cube Structure}
+
+All cubes are stored in long format with columns:
+\begin{itemize}
+\item \texttt{date} -- integer index (1-based)
+\item \texttt{asset} -- integer index (1-based)
+\item \texttt{\{dim3\}} -- third dimension index (varies: slice, result, signal, residual)
+\item \texttt{value} -- the data value
+\end{itemize}
+
+Each cube has companion files mapping indices to strings:
+\begin{itemize}
+\item \texttt{\{cube\}\_date.parquet}: date\_string, date
+\item \texttt{\{cube\}\_asset.parquet}: asset\_string, asset
+\item \texttt{\{cube\}\_\{dim3\}.parquet}: \{dim3\}\_string, \{dim3\}
+\end{itemize}
+
+<<cubes_table, engine='python', results='asis'>>=
+print(cubes_latex)
+@
+
+\newpage
+\section{Assets}
+
+<<assets_table, engine='python', results='asis'>>=
+print(assets_latex)
+@
+
+\newpage
+\section{Strategy Cube Slices}
+
+The strategy cube contains \Sexpr{py$n_strategy_slices} result types:
+
+<<strategy_slices, engine='python', results='asis'>>=
+print(strategy_slices_latex)
+@
+
+\section{Signal Types}
+
+<<signals_table, engine='python', results='asis'>>=
+print(signals_latex)
+@
+
+\section{PnL Cube Slices}
+
+<<pnl_slices, engine='python', results='asis'>>=
+print(pnl_slices_latex)
+@
+
+\section{Reference Cube Slices}
+
+<<reference_slices, engine='python', results='asis'>>=
+print(reference_slices_latex)
+@
+
+\newpage
+\section{Backtest Statistics}
+
+<<stats_table, engine='python', results='asis'>>=
+print(stats_latex)
+@
+
+\newpage
+\section{Signal Hedged Statistics}
+
+P\&L statistics for each signal-residual combination. Each table shows 29 statistics across asset classes.
+
+<<signal_hedged_stats, engine='python', results='asis'>>=
+print(signal_hedged_all_latex)
+@
+
+\newpage
+\section{P\&L Stats}
+
+Summary statistics by asset class computed from daily P\&L.
+
+<<pnl_stats_out, engine='python', results='asis'>>=
+print(pnl_stats_latex)
+@
+
+\newpage
+\section{P\&L Recalc Error}
+
+This matrix shows the sum of absolute differences between stored wpnl (from strategy cube) and computed wpnl (inception-weighted hedged $\times$ pnl). All values should be zero or negligible, confirming the inception weighting algorithm is correct.
+
+<<error_matrix_out, engine='python', results='asis'>>=
+print(error_matrix_latex)
+@
+
+\newpage
+\section{P\&L Matrix}
+
+Monthly P\&L by year and month. Green indicates gains, red indicates losses. Color intensity reflects magnitude (months scaled among months, years scaled among years).
+
+<<pnl_matrix_out, engine='python', results='asis'>>=
+print(pnl_matrix_latex)
+@
+
+\newpage
+\section{Cumulative P\&L}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_cumulative_pnl.pdf}
+\caption{Cumulative Strategy P\&L over time}
+\end{figure}
+
+\newpage
+\section{Monthly P\&L Distribution}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{result_monthly_hist.pdf}
+\caption{Distribution of Monthly P\&L}
+\end{figure}
+
+\newpage
+\section{Cumulative P\&L by Asset Class}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_cumulative_by_class.pdf}
+\caption{Cumulative P\&L by Asset Class}
+\end{figure}
+
+\newpage
+\section{Rolling Volatility by Asset Class}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_rolling_vol_by_class.pdf}
+\caption{Rolling Volatility by Asset Class (EMA of $|$P\&L$|$, 364/365 decay)}
+\end{figure}
+
+\newpage
+\section{Realized Correlation: Long vs Short P\&L}
+
+Rolling correlation between P\&L from long positions (positive weights) and short positions (negative weights).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_long_short_corr.pdf}
+\caption{Realized Correlation: Long vs Short P\&L (252-day rolling window)}
+\end{figure}
+
+\newpage
+\section{Realized Correlation by Asset Class}
+
+Rolling correlation between long and short P\&L within each asset class.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_long_short_corr_by_class.pdf}
+\caption{Realized Correlation: Long vs Short P\&L by Asset Class (252-day rolling)}
+\end{figure}
+
+\newpage
+\section{Rolling Hit Ratio}
+
+Rolling 252-day hit ratio (percentage of winning days) for the total portfolio.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_rolling_hit_total.pdf}
+\caption{Rolling Hit Ratio - Total Portfolio (252-day rolling window)}
+\end{figure}
+
+\newpage
+\section{Rolling Hit Ratio by Asset Class}
+
+Rolling 252-day hit ratio by asset class.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_rolling_hit_by_class.pdf}
+\caption{Rolling Hit Ratio by Asset Class (252-day rolling window)}
+\end{figure}
+
+\newpage
+\section{Recovery Length}
+
+This section analyzes how many months it takes to recover from a loss-making month. Recovery is defined as the number of months until cumulative P\&L (starting from the loss month) turns non-negative.
+
+<<recovery_table, engine='python', results='asis'>>=
+print(recovery_table_latex)
+@
+
+<<recovery_count, engine='python', results='asis'>>=
+print(recovery_count_latex)
+@
+
+\newpage
+\section{Entries}
+
+Entry count by month. Each entry is a unique (entry\_date, Underlying, Entry) combination. Green indicates above-median count, red indicates below-median count. Total entries: \Sexpr{format(py$n_total_entries, big.mark=",")}.
+
+<<entries_matrix, engine='python', results='asis'>>=
+print(entries_matrix_latex)
+@
+
+\newpage
+\section{Exits}
+
+Exit count by month. Each exit is a unique (expiry\_date, Underlying, Expiry) combination. Green indicates above-median count, red indicates below-median count. Total exits: \Sexpr{format(py$n_total_exits, big.mark=",")}.
+
+<<exits_matrix, engine='python', results='asis'>>=
+print(exits_matrix_latex)
+@
+
+\newpage
+\section{Entries - Exits}
+
+Difference between entries and exits per month (entries minus exits). Positive values (green) indicate more entries than exits, negative values (red) indicate more exits than entries.
+
+<<diff_matrix, engine='python', results='asis'>>=
+print(diff_matrix_latex)
+@
+
+\newpage
+\section{Entry - Exit Reconciliation}
+
+The entries-exits difference can appear confusing because large positive values one month are often followed by large negative values. Here's the key insight:
+
+\textbf{On the exit day, a straddle is both ``live'' (ewc $\neq$ 0) AND counted as exited.}
+
+This means:
+\begin{itemize}
+\item \textbf{Live Straddles} = Cumsum(Entries - Exits) + Exits Today
+\item The cumulative sum tracks straddles that have entered but not yet reached their exit day
+\item On the exit day itself, the straddle is still active (still has P\&L) but is also counted as an exit
+\end{itemize}
+
+\subsection{Reconciliation Statistics}
+
+\begin{itemize}
+\item Total Entries: \Sexpr{format(py$recon_stats$total_entries, big.mark=",")}
+\item Total Exits: \Sexpr{format(py$recon_stats$total_exits, big.mark=",")}
+\item Net (should be 0): \Sexpr{py$recon_stats$net_entries_exits}
+\item Max Cumsum(Entries - Exits): \Sexpr{format(py$recon_stats$max_cumsum, big.mark=",")}
+\item Live Straddles: min=\Sexpr{py$recon_stats$min_live}, max=\Sexpr{format(py$recon_stats$max_live, big.mark=",")}, mean=\Sexpr{sprintf("%.0f", py$recon_stats$mean_live)}
+\item Reconciliation Match: \Sexpr{if(py$recon_stats$recon_match) "Yes" else "No"} (max diff = \Sexpr{py$recon_stats$max_recon_diff})
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{result_entry_exit_recon.pdf}
+\caption{Top: Live straddles vs cumulative entries-exits. Bottom: The difference equals daily exits, confirming that straddles are ``live'' on their exit day.}
+\end{figure}
+
+\end{document}
