@@ -1990,6 +1990,45 @@ def recovery_count_to_latex(dataframe):
 
 recovery_count_latex = recovery_count_to_latex(recovery_df)
 
+# --- Recovery Enhancements ---
+# Compute max recovery, % never recovered, and histogram for Total
+total_recovery = recovery_by_class.get('Total', [])
+total_recovered = [(loss, months) for loss, months in total_recovery if months is not None]
+total_never_recovered = [(loss, months) for loss, months in total_recovery if months is None]
+
+max_recovery_months = max([m for _, m in total_recovered]) if total_recovered else 0
+pct_never_recovered = len(total_never_recovered) / len(total_recovery) * 100 if total_recovery else 0
+total_loss_months = len(total_recovery)
+
+recovery_enhancement_bullets = (
+    f"\\item Total loss months: {total_loss_months}\n"
+    f"\\item Maximum recovery: {max_recovery_months} months\n"
+    f"\\item Never recovered within data: {len(total_never_recovered)} ({pct_never_recovered:.1f}\\%)"
+)
+
+# Histogram of recovery lengths
+recovery_lengths_all = [m for _, m in total_recovered if m is not None]
+if len(recovery_lengths_all) > 0:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    max_len = max(recovery_lengths_all)
+    bins = range(0, max_len + 2)
+    ax.hist(recovery_lengths_all, bins=bins, edgecolor='black', alpha=0.7, color='steelblue')
+    ax.axvline(np.mean(recovery_lengths_all), color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {np.mean(recovery_lengths_all):.1f} months')
+    ax.axvline(np.median(recovery_lengths_all), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(recovery_lengths_all):.0f} months')
+    ax.set_xlabel('Months to Recovery')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Distribution of Recovery Lengths (Total Portfolio)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(FIGURE_DIR + 'result_recovery_hist.pdf', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    recovery_hist_exists = True
+else:
+    recovery_hist_exists = False
+
 # --- Entries Matrix ---
 # Load entry_cube and sum across slice axis
 entry_cube = pd.read_parquet(f"{RESULT_DIR}/entry_cube.parquet")
@@ -2595,6 +2634,21 @@ print(recovery_table_latex)
 
 <<recovery_count, engine='python', results='asis'>>=
 print(recovery_count_latex)
+@
+
+\begin{itemize}
+<<recovery_enhance, engine='python', results='asis'>>=
+print(recovery_enhancement_bullets)
+@
+\end{itemize}
+
+<<recovery_hist_fig, engine='python', results='asis'>>=
+if recovery_hist_exists:
+    print(r'\begin{figure}[H]')
+    print(r'\centering')
+    print(r'\includegraphics[width=0.85\textwidth]{result_recovery_hist.pdf}')
+    print(r'\caption{Distribution of Recovery Lengths (Total Portfolio)}')
+    print(r'\end{figure}')
 @
 
 \newpage
