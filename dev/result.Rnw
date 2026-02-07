@@ -599,7 +599,9 @@ ref_result_df = pd.read_parquet(f"{RESULT_DIR}/reference_result.parquet")
 n_ref_dates = len(ref_date_df)
 n_ref_assets = len(ref_asset_df)
 n_ref_results = len(ref_result_df)
-ref_cube = ref_cube_df['value'].values.reshape((n_ref_dates, n_ref_assets, n_ref_results), order='C')
+# Sort by (date, asset, result) before reshape - critical!
+ref_cube_sorted = ref_cube_df.sort_values(['date', 'asset', 'result'])
+ref_cube = ref_cube_sorted['value'].values.reshape((n_ref_dates, n_ref_assets, n_ref_results), order='C')
 
 # Get slice indices
 result_names = ref_result_df['result_string'].tolist()
@@ -618,15 +620,15 @@ pnl_2d = pnl_cube_ref.sum(axis=2)  # (dates, assets)
 # Compute weighted P&L
 wpnl_ref = pnl_2d * hedged_01_weights  # (dates, assets)
 
-# Map asset class codes to names
-class_map = {1: 'commodity', 2: 'equity', 3: 'fx', 4: 'rates', 5: 'stonks'}
+# Map asset class codes to names (0=commodity, 1=equity, 2=fx, 3=rates, 4=stonks)
+class_map = {0: 'commodity', 1: 'equity', 2: 'fx', 3: 'rates', 4: 'stonks'}
 
 # Compute stats by asset class
 def compute_pnl_stats(daily_pnl):
     """Compute P&L statistics from daily P&L series."""
     pnl = daily_pnl * 10000  # to bps
-    pve = pnl.clip(lower=0)
-    nve = pnl.clip(upper=0)
+    pve = np.clip(pnl, 0, None)  # positive values only
+    nve = np.clip(pnl, None, 0)  # negative values only
 
     nz_pnl = pnl[pnl != 0]
     nz_pve = pve[pve != 0]
@@ -646,10 +648,10 @@ def compute_pnl_stats(daily_pnl):
     stats['sharpe_nve'] = (stats['mean_nve'] / stats['sd_nz_nve'] * np.sqrt(252)) if stats['sd_nz_nve'] > 0 else 0
 
     # Drawdown
-    cumsum = pnl.cumsum()
-    running_max = cumsum.cummax()
+    cumsum = np.cumsum(pnl)
+    running_max = np.maximum.accumulate(cumsum)
     drawdown = running_max - cumsum
-    stats['dd_pnl'] = drawdown.max() if len(drawdown) > 0 else 0
+    stats['dd_pnl'] = np.max(drawdown) if len(drawdown) > 0 else 0
 
     # Hit rate
     stats['hit_pnl'] = (pnl > 0).sum() / len(pnl[pnl != 0]) if len(pnl[pnl != 0]) > 0 else 0
@@ -1882,6 +1884,7 @@ P\&L statistics for each signal-residual combination. Each table shows 29 statis
 print(signal_hedged_all_latex)
 @
 
+\newpage
 \section{Reference P\&L Stats}
 
 P\&L statistics computed using the reference implementation weights (hedged\_01 from reference cube).
