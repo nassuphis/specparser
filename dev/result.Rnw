@@ -242,7 +242,7 @@ file_contents_data = [
     # Stats
     ('stats', 'stats', 29, 'Aggregated stats by class (mean, sharpe, hit, dd)'),
     ('signal_hedged_stats', 'stats', 580, 'Stats for hedged signal combos'),
-    ('signal_norm_stats', 'stats', 580, 'Stats for normalized signal combos'),
+    ('signal_norm_stats', 'stats', 580, 'Stats for normalized signal combos (unused)'),
 
     # Backtest detail
     ('backtest', 'bt', 6230449, 'Straddle-day level P\\&L with all fields'),
@@ -1826,6 +1826,13 @@ ax2.grid(True, alpha=0.3)
 plt.tight_layout()
 fig.savefig(FIGURE_DIR + 'result_entry_exit_recon.pdf', dpi=150, bbox_inches='tight')
 plt.close(fig)
+
+# --- Executive Summary Variables ---
+exec_sharpe = pnl_stats_t.loc['sharpe', 'Total']
+exec_mean_pnl = pnl_stats_t.loc['mean_pnl', 'Total']
+exec_hit_ratio = pnl_stats_t.loc['hit_ratio', 'Total']
+exec_drawdown = int(round(pnl_stats_t.loc['drawdown', 'Total']))
+exec_cor_ls = pnl_stats_t.loc['cor_ls', 'Total'] * 100
 @
 
 \begin{document}
@@ -1834,6 +1841,20 @@ plt.close(fig)
 \newpage
 
 \tableofcontents
+\newpage
+
+\section{Executive Summary}
+
+\begin{itemize}
+\item \textbf{Assets:} \Sexpr{py$n_assets} \quad \textbf{Dates:} \Sexpr{py$n_dates} (\Sexpr{py$date_min} to \Sexpr{py$date_max})
+\item \textbf{Sharpe (ann.):} \Sexpr{sprintf("%.2f", py$exec_sharpe)}
+\item \textbf{Mean daily P\&L:} \Sexpr{sprintf("%.2f", py$exec_mean_pnl)} bps
+\item \textbf{Hit Ratio:} \Sexpr{sprintf("%.1f", py$exec_hit_ratio)}\%
+\item \textbf{Max Drawdown:} \Sexpr{format(py$exec_drawdown, big.mark=",")} bps
+\item \textbf{Long/Short Correlation:} \Sexpr{sprintf("%.1f", py$exec_cor_ls)}\%
+\item \textbf{Signal types:} \Sexpr{py$n_signals} \quad \textbf{Stagger weights:} \Sexpr{py$n_pnl_slices}
+\end{itemize}
+
 \newpage
 
 \section{Data Summary}
@@ -1853,90 +1874,6 @@ This document presents the structure and contents of backtest results from:
 \end{itemize}
 
 \newpage
-\section{Files Overview}
-
-<<files_table, engine='python', results='asis'>>=
-print(files_latex)
-@
-
-\newpage
-\section{File Contents}
-
-Color-coded reference for all parquet files. Row counts shown as K (thousands) or M (millions).
-
-<<file_contents_table, engine='python', results='asis'>>=
-print(file_contents_latex)
-@
-
-\subsection{Key File Details}
-
-\textbf{Cubes:} All cubes stored in long format with columns (date, asset, dim3, value). Reshape to 3D with \texttt{values.reshape((n\_dates, n\_assets, n\_dim3), order='C')}.
-
-\textbf{P\&L Cubes:} All share dimensions 9,854 dates $\times$ 180 assets $\times$ 10 slices (stagger weights). The \texttt{entry\_weight\_cube} contains unsigned stagger weights (0.25, 0.333) propagated for straddle life.
-
-\textbf{Strategy Cube Slices:} asset\_class, sub\_class, pnl, cap, liquidity, winsorized\_pnl, rank\_rescale, rank\_sum, rank\_sum\_median, rank\_centered, conviction, is\_live, normalized\_signal, risk\_weight, risk\_signal, class\_weight, class\_signal, beta, norm, redistribute, \textbf{hedged} (signed weights), \textbf{wpnl} (weighted P\&L).
-
-\textbf{Signal Types:} Combine correlation (pearson, tau, one, sign) with metric (rsi, calmar, sign, streak, range) = 20 signals.
-
-\textbf{backtest.parquet columns:} Underlying, straddle, Class, Entry, Expiry, EntryWeight, entry\_date, expiry\_date, date, px, fsw, pva, strike, vol, mv, option\_pnl, delta\_pnl, pnl, vega, decay, spot, bidask, delta, RiskAdj, WeightCap, auxUnderlying.
-
-\newpage
-\section{Cube Structure}
-
-All cubes are stored in long format with columns:
-\begin{itemize}
-\item \texttt{date} -- integer index (1-based)
-\item \texttt{asset} -- integer index (1-based)
-\item \texttt{\{dim3\}} -- third dimension index (varies: slice, result, signal, residual)
-\item \texttt{value} -- the data value
-\end{itemize}
-
-Each cube has companion files mapping indices to strings:
-\begin{itemize}
-\item \texttt{\{cube\}\_date.parquet}: date\_string, date
-\item \texttt{\{cube\}\_asset.parquet}: asset\_string, asset
-\item \texttt{\{cube\}\_\{dim3\}.parquet}: \{dim3\}\_string, \{dim3\}
-\end{itemize}
-
-<<cubes_table, engine='python', results='asis'>>=
-print(cubes_latex)
-@
-
-\newpage
-\section{Assets}
-
-<<assets_table, engine='python', results='asis'>>=
-print(assets_latex)
-@
-
-\newpage
-\section{Strategy Cube Slices}
-
-The strategy cube contains \Sexpr{py$n_strategy_slices} result types:
-
-<<strategy_slices, engine='python', results='asis'>>=
-print(strategy_slices_latex)
-@
-
-\section{Signal Types}
-
-<<signals_table, engine='python', results='asis'>>=
-print(signals_latex)
-@
-
-\section{PnL Cube Slices}
-
-<<pnl_slices, engine='python', results='asis'>>=
-print(pnl_slices_latex)
-@
-
-\section{Reference Cube Slices}
-
-<<reference_slices, engine='python', results='asis'>>=
-print(reference_slices_latex)
-@
-
-\newpage
 \section{Backtest Statistics}
 
 <<stats_table, engine='python', results='asis'>>=
@@ -1953,6 +1890,15 @@ print(signal_hedged_all_latex)
 @
 
 \newpage
+\section{P\&L Stats}
+
+Summary statistics by asset class computed from daily P\&L.
+
+<<pnl_stats_out, engine='python', results='asis'>>=
+print(pnl_stats_latex)
+@
+
+\newpage
 \section{Reference P\&L Stats}
 
 P\&L statistics computed using the reference implementation weights (hedged\_01 from reference cube).
@@ -1966,15 +1912,6 @@ print(ref_stats_latex)
 print(f"\\item {ref_wpnl_bullet}")
 @
 \end{itemize}
-
-\newpage
-\section{P\&L Stats}
-
-Summary statistics by asset class computed from daily P\&L.
-
-<<pnl_stats_out, engine='python', results='asis'>>=
-print(pnl_stats_latex)
-@
 
 \newpage
 \section{P\&L Recalc Error}
@@ -2225,5 +2162,91 @@ This means:
 \includegraphics[width=0.95\textwidth]{result_entry_exit_recon.pdf}
 \caption{Top: Live straddles vs cumulative entries-exits. Bottom: The difference equals daily exits, confirming that straddles are ``live'' on their exit day.}
 \end{figure}
+
+\newpage
+\appendix
+
+\section{Files Overview}
+
+<<files_table, engine='python', results='asis'>>=
+print(files_latex)
+@
+
+\newpage
+\section{File Contents}
+
+Color-coded reference for all parquet files. Row counts shown as K (thousands) or M (millions).
+
+<<file_contents_table, engine='python', results='asis'>>=
+print(file_contents_latex)
+@
+
+\subsection{Key File Details}
+
+\textbf{Cubes:} All cubes stored in long format with columns (date, asset, dim3, value). Reshape to 3D with \texttt{values.reshape((n\_dates, n\_assets, n\_dim3), order='C')}.
+
+\textbf{P\&L Cubes:} All share dimensions 9,854 dates $\times$ 180 assets $\times$ 10 slices (stagger weights). The \texttt{entry\_weight\_cube} contains unsigned stagger weights (0.25, 0.333) propagated for straddle life.
+
+\textbf{Strategy Cube Slices:} asset\_class, sub\_class, pnl, cap, liquidity, winsorized\_pnl, rank\_rescale, rank\_sum, rank\_sum\_median, rank\_centered, conviction, is\_live, normalized\_signal, risk\_weight, risk\_signal, class\_weight, class\_signal, beta, norm, redistribute, \textbf{hedged} (signed weights), \textbf{wpnl} (weighted P\&L).
+
+\textbf{Signal Types:} Combine correlation (pearson, tau, one, sign) with metric (rsi, calmar, sign, streak, range) = 20 signals.
+
+\textbf{backtest.parquet columns:} Underlying, straddle, Class, Entry, Expiry, EntryWeight, entry\_date, expiry\_date, date, px, fsw, pva, strike, vol, mv, option\_pnl, delta\_pnl, pnl, vega, decay, spot, bidask, delta, RiskAdj, WeightCap, auxUnderlying.
+
+\newpage
+\section{Cube Structure}
+
+All cubes are stored in long format with columns:
+\begin{itemize}
+\item \texttt{date} -- integer index (1-based)
+\item \texttt{asset} -- integer index (1-based)
+\item \texttt{\{dim3\}} -- third dimension index (varies: slice, result, signal, residual)
+\item \texttt{value} -- the data value
+\end{itemize}
+
+Each cube has companion files mapping indices to strings:
+\begin{itemize}
+\item \texttt{\{cube\}\_date.parquet}: date\_string, date
+\item \texttt{\{cube\}\_asset.parquet}: asset\_string, asset
+\item \texttt{\{cube\}\_\{dim3\}.parquet}: \{dim3\}\_string, \{dim3\}
+\end{itemize}
+
+<<cubes_table, engine='python', results='asis'>>=
+print(cubes_latex)
+@
+
+\newpage
+\section{Assets}
+
+<<assets_table, engine='python', results='asis'>>=
+print(assets_latex)
+@
+
+\newpage
+\section{Strategy Cube Slices}
+
+The strategy cube contains \Sexpr{py$n_strategy_slices} result types:
+
+<<strategy_slices, engine='python', results='asis'>>=
+print(strategy_slices_latex)
+@
+
+\section{Signal Types}
+
+<<signals_table, engine='python', results='asis'>>=
+print(signals_latex)
+@
+
+\section{PnL Cube Slices}
+
+<<pnl_slices, engine='python', results='asis'>>=
+print(pnl_slices_latex)
+@
+
+\section{Reference Cube Slices}
+
+<<reference_slices, engine='python', results='asis'>>=
+print(reference_slices_latex)
+@
 
 \end{document}
