@@ -589,7 +589,7 @@ for i in range(0, len(signal_names), 8):
 
 signal_hedged_all_latex = '\n\n'.join(signal_hedged_tables_latex)
 
-# --- Reference P&L Stats (using hedged_01 from reference cube) ---
+# --- Reference P&L Stats (using hedged_01 and wpnl from reference cube) ---
 # Load reference cube
 ref_cube_df = pd.read_parquet(f"{RESULT_DIR}/reference.parquet")
 ref_date_df = pd.read_parquet(f"{RESULT_DIR}/reference_date.parquet")
@@ -606,116 +606,181 @@ ref_cube = ref_cube_sorted['value'].values.reshape((n_ref_dates, n_ref_assets, n
 # Get slice indices
 result_names = ref_result_df['result_string'].tolist()
 hedged_01_idx = result_names.index('hedged_01')
+wpnl_idx = result_names.index('wpnl')
 asset_class_idx = result_names.index('asset_class')
 
-# Extract slices: hedged_01 weights and asset_class
+# Extract slices
 hedged_01_weights = ref_cube[:, :, hedged_01_idx]  # (dates, assets)
+wpnl_from_ref = ref_cube[:, :, wpnl_idx]  # (dates, assets) - stored wpnl
 asset_classes = ref_cube[0, :, asset_class_idx]  # asset class per asset (constant over time)
-
-# Load pnl_cube (already loaded earlier, but ensure we have it)
-pnl_cube_ref, _, _, _ = load_cube_as_3d(RESULT_DIR, 'pnl_cube')
-# Sum over slices to get total pnl per date/asset
-pnl_2d = pnl_cube_ref.sum(axis=2)  # (dates, assets)
-
-# Compute weighted P&L
-wpnl_ref = pnl_2d * hedged_01_weights  # (dates, assets)
 
 # Map asset class codes to names (0=commodity, 1=equity, 2=fx, 3=rates, 4=stonks)
 class_map = {0: 'commodity', 1: 'equity', 2: 'fx', 3: 'rates', 4: 'stonks'}
 
-# Compute stats by asset class
-def compute_pnl_stats(daily_pnl):
-    """Compute P&L statistics from daily P&L series."""
-    pnl = daily_pnl * 10000  # to bps
-    pve = np.clip(pnl, 0, None)  # positive values only
-    nve = np.clip(pnl, None, 0)  # negative values only
+# Daily wpnl (rowwise sum of wpnl from reference cube)
+daily_wpnl_ref = wpnl_from_ref.sum(axis=1) * 10000  # to bps
+daily_wpnl_ref_nz = daily_wpnl_ref[daily_wpnl_ref != 0]
+ref_wpnl_sharpe_nz = (daily_wpnl_ref_nz.mean() / daily_wpnl_ref_nz.std() * np.sqrt(252)) if len(daily_wpnl_ref_nz) > 1 and daily_wpnl_ref_nz.std() > 0 else 0
 
-    nz_pnl = pnl[pnl != 0]
-    nz_pve = pve[pve != 0]
-    nz_nve = nve[nve != 0]
+# Long/short P&L from hedged_01 sign
+long_mask = hedged_01_weights > 0
+short_mask = hedged_01_weights < 0
 
-    stats = {}
-    stats['mean_pnl'] = pnl.mean() if len(pnl) > 0 else 0
-    stats['mean_pve'] = pve.mean() if len(pve) > 0 else 0
-    stats['mean_nve'] = nve.mean() if len(nve) > 0 else 0
+# Compute long/short wpnl by asset class
+ref_long_pnl_by_class = {}
+ref_short_pnl_by_class = {}
 
-    stats['sd_nz_pnl'] = nz_pnl.std() if len(nz_pnl) > 1 else 0
-    stats['sd_nz_pve'] = nz_pve.std() if len(nz_pve) > 1 else 0
-    stats['sd_nz_nve'] = nz_nve.std() if len(nz_nve) > 1 else 0
-
-    stats['sharpe_pnl'] = (stats['mean_pnl'] / stats['sd_nz_pnl'] * np.sqrt(252)) if stats['sd_nz_pnl'] > 0 else 0
-    stats['sharpe_pve'] = (stats['mean_pve'] / stats['sd_nz_pve'] * np.sqrt(252)) if stats['sd_nz_pve'] > 0 else 0
-    stats['sharpe_nve'] = (stats['mean_nve'] / stats['sd_nz_nve'] * np.sqrt(252)) if stats['sd_nz_nve'] > 0 else 0
-
-    # Drawdown
-    cumsum = np.cumsum(pnl)
-    running_max = np.maximum.accumulate(cumsum)
-    drawdown = running_max - cumsum
-    stats['dd_pnl'] = np.max(drawdown) if len(drawdown) > 0 else 0
-
-    # Hit rate
-    stats['hit_pnl'] = (pnl > 0).sum() / len(pnl[pnl != 0]) if len(pnl[pnl != 0]) > 0 else 0
-    stats['hit_pve'] = (pve > 0).sum() / len(pve[pve != 0]) if len(pve[pve != 0]) > 0 else 0
-    stats['hit_nve'] = (nve < 0).sum() / len(nve[nve != 0]) if len(nve[nve != 0]) > 0 else 0
-
-    # Correlation between pve and nve (on days where both exist)
-    pve_series = pd.Series(pve)
-    nve_series = pd.Series(nve)
-    both_nz = (pve != 0) & (nve != 0)
-    if both_nz.sum() > 10:
-        stats['cor_xy_nz'] = pve_series[both_nz].corr(nve_series[both_nz]) * 100
-    else:
-        stats['cor_xy_nz'] = 0
-
-    return stats
-
-ref_stats_by_class = {}
 for cls_code, cls_name in class_map.items():
-    mask = asset_classes == cls_code
-    if mask.sum() > 0:
-        cls_pnl = wpnl_ref[:, mask].sum(axis=1)  # daily P&L for this class
-        ref_stats_by_class[cls_name] = compute_pnl_stats(cls_pnl)
+    cls_mask = asset_classes == cls_code
+    if cls_mask.sum() > 0:
+        long_pnl_cls = (wpnl_from_ref[:, cls_mask] * long_mask[:, cls_mask]).sum(axis=1) * 10000
+        short_pnl_cls = (wpnl_from_ref[:, cls_mask] * short_mask[:, cls_mask]).sum(axis=1) * 10000
+        ref_long_pnl_by_class[cls_name] = pd.Series(long_pnl_cls)
+        ref_short_pnl_by_class[cls_name] = pd.Series(short_pnl_cls)
 
-# Total (all classes)
-total_pnl = wpnl_ref.sum(axis=1)
-ref_stats_by_class['all'] = compute_pnl_stats(total_pnl)
+# Total long/short
+long_pnl_total = (wpnl_from_ref * long_mask).sum(axis=1) * 10000
+short_pnl_total = (wpnl_from_ref * short_mask).sum(axis=1) * 10000
+ref_long_pnl_by_class['all'] = pd.Series(long_pnl_total)
+ref_short_pnl_by_class['all'] = pd.Series(short_pnl_total)
 
-# Build dataframe similar to signal_hedged_stats
-stat_names = ['mean_pnl', 'mean_pve', 'mean_nve', 'sd_nz_pnl', 'sd_nz_pve', 'sd_nz_nve',
-              'sharpe_pnl', 'sharpe_pve', 'sharpe_nve', 'dd_pnl', 'hit_pnl', 'hit_pve', 'hit_nve', 'cor_xy_nz']
+# Daily wpnl by asset class
+ref_daily_pnl_by_class = {}
+for cls_code, cls_name in class_map.items():
+    cls_mask = asset_classes == cls_code
+    if cls_mask.sum() > 0:
+        ref_daily_pnl_by_class[cls_name] = pd.Series(wpnl_from_ref[:, cls_mask].sum(axis=1) * 10000)
+ref_daily_pnl_by_class['all'] = pd.Series(wpnl_from_ref.sum(axis=1) * 10000)
+
+def compute_max_drawdown_ref(pnl_series):
+    cumulative = pnl_series.cumsum()
+    running_max = cumulative.cummax()
+    drawdown = cumulative - running_max
+    return drawdown.min()
+
+# Compute stats (matching P&L Stats format)
 ref_stats_rows = []
-for stat_name in stat_names:
-    row = {'name': stat_name}
-    for cls in ['commodity', 'equity', 'fx', 'rates', 'stonks', 'all']:
-        row[cls] = ref_stats_by_class.get(cls, {}).get(stat_name, 0)
-    ref_stats_rows.append(row)
+class_order = sorted([c for c in ref_daily_pnl_by_class.keys() if c != 'all']) + ['all']
+
+for cls in class_order:
+    pnl = ref_daily_pnl_by_class[cls]
+    pnl_nz = pnl[pnl != 0]
+
+    mean_pnl = pnl_nz.mean() if len(pnl_nz) > 0 else 0
+    mean_abs_pnl = pnl_nz.abs().mean() if len(pnl_nz) > 0 else 0
+    sharpe = (pnl_nz.mean() / pnl_nz.std()) * np.sqrt(256) if len(pnl_nz) > 1 and pnl_nz.std() > 0 else 0
+    hit_ratio = (pnl_nz > 0).sum() / len(pnl_nz) * 100 if len(pnl_nz) > 0 else 0
+    max_dd = compute_max_drawdown_ref(pnl_nz)
+
+    # Long/short stats
+    long_pnl_cls = ref_long_pnl_by_class.get(cls, pd.Series([0]))
+    short_pnl_cls = ref_short_pnl_by_class.get(cls, pd.Series([0]))
+
+    long_nz = long_pnl_cls[long_pnl_cls != 0]
+    short_nz = short_pnl_cls[short_pnl_cls != 0]
+
+    mean_pve_pnl = long_nz.mean() if len(long_nz) > 0 else 0
+    mean_nve_pnl = short_nz.mean() if len(short_nz) > 0 else 0
+    mean_abs_pve_pnl = long_nz.abs().mean() if len(long_nz) > 0 else 0
+    mean_abs_nve_pnl = short_nz.abs().mean() if len(short_nz) > 0 else 0
+
+    pve_sharpe = (long_nz.mean() / long_nz.std()) * np.sqrt(256) if len(long_nz) > 1 and long_nz.std() > 0 else 0
+    nve_sharpe = (short_nz.mean() / short_nz.std()) * np.sqrt(256) if len(short_nz) > 1 and short_nz.std() > 0 else 0
+
+    pve_hit_ratio = (long_nz > 0).sum() / len(long_nz) * 100 if len(long_nz) > 0 else 0
+    nve_hit_ratio = (short_nz > 0).sum() / len(short_nz) * 100 if len(short_nz) > 0 else 0
+
+    # CorLS: correlation of long to short P&L (exclude rows where either is zero)
+    both_nz_mask = (long_pnl_cls != 0) & (short_pnl_cls != 0)
+    long_both_nz = long_pnl_cls[both_nz_mask]
+    short_both_nz = short_pnl_cls[both_nz_mask]
+    if len(long_both_nz) > 1 and len(short_both_nz) > 1:
+        cor_ls = long_both_nz.corr(short_both_nz)
+    else:
+        cor_ls = 0
+
+    ref_stats_rows.append({
+        'class': cls,
+        'mean_pnl': mean_pnl,
+        'mean_pve_pnl': mean_pve_pnl,
+        'mean_nve_pnl': mean_nve_pnl,
+        'mean_abs_pnl': mean_abs_pnl,
+        'mean_abs_pve_pnl': mean_abs_pve_pnl,
+        'mean_abs_nve_pnl': mean_abs_nve_pnl,
+        'sharpe': sharpe,
+        'pve_sharpe': pve_sharpe,
+        'nve_sharpe': nve_sharpe,
+        'hit_ratio': hit_ratio,
+        'pve_hit_ratio': pve_hit_ratio,
+        'nve_hit_ratio': nve_hit_ratio,
+        'drawdown': max_dd,
+        'cor_ls': cor_ls
+    })
 
 ref_stats_df = pd.DataFrame(ref_stats_rows)
+ref_stats_df.set_index('class', inplace=True)
+ref_stats_t = ref_stats_df.T
 
-# Generate LaTeX table
+# Generate LaTeX table (same format as P&L Stats)
 def ref_stats_to_latex(df):
-    cols = ['commodity', 'equity', 'fx', 'rates', 'stonks', 'all']
-    abbrevs = [col_abbrev[c] for c in cols]
-
     lines = []
     lines.append(r'\begin{table}[H]')
     lines.append(r'\centering')
-    lines.append(r'\caption{Reference P\&L Statistics (hedged\_01 weights)}')
-    lines.append(r'\scriptsize')
-    lines.append(r'\begin{tabular}{l|rrrrrr}')
+    lines.append(r'\caption{Reference P\&L Statistics (hedged\_01 weights, daily bps)}')
+    lines.append(r'\label{tab:ref_pnl_stats}')
+    lines.append(r'\small')
+
+    n_classes = len(df.columns) - 1
+    lines.append(r'\begin{tabular}{l' + 'r' * n_classes + '|r}')
     lines.append(r'\toprule')
-    lines.append('Statistic & ' + ' & '.join(abbrevs) + r' \\')
+    lines.append('Statistic & ' + ' & '.join(df.columns) + r' \\')
     lines.append(r'\midrule')
 
-    for _, row in df.iterrows():
-        stat_name = row['name'].replace('_', r'\_')
-        is_sharpe = (row['name'] == 'sharpe_pnl')
-        cells = [stat_name]
-        for col in cols:
-            val = format_val(row[col])
-            if is_sharpe and col == 'all':
-                val = r'\textbf{' + val + '}'
-            cells.append(val)
+    row_labels = {
+        'mean_pnl': 'Mean P\\&L',
+        'mean_pve_pnl': 'Mean(pve P\\&L)',
+        'mean_nve_pnl': 'Mean(nve P\\&L)',
+        'mean_abs_pnl': 'Mean $|$P\\&L$|$',
+        'mean_abs_pve_pnl': 'Mean $|$pve P\\&L$|$',
+        'mean_abs_nve_pnl': 'Mean $|$nve P\\&L$|$',
+        'sharpe': 'Sharpe (ann.)',
+        'pve_sharpe': 'pve Sharpe',
+        'nve_sharpe': 'nve Sharpe',
+        'hit_ratio': 'Hit Ratio (\\%)',
+        'pve_hit_ratio': 'pve Hit (\\%)',
+        'nve_hit_ratio': 'nve Hit (\\%)',
+        'drawdown': 'Max Drawdown',
+        'cor_ls': 'CorLS'
+    }
+
+    row_order = [
+        'mean_pnl', 'mean_pve_pnl', 'mean_nve_pnl',
+        'mean_abs_pnl', 'mean_abs_pve_pnl', 'mean_abs_nve_pnl',
+        'sharpe', 'pve_sharpe', 'nve_sharpe',
+        'hit_ratio', 'pve_hit_ratio', 'nve_hit_ratio',
+        'drawdown', 'cor_ls'
+    ]
+
+    for stat in row_order:
+        if stat not in df.index:
+            continue
+        cells = [row_labels.get(stat, stat)]
+        for cls in df.columns:
+            val = df.loc[stat, cls]
+            if stat in ('mean_pnl', 'mean_pve_pnl', 'mean_nve_pnl',
+                        'mean_abs_pnl', 'mean_abs_pve_pnl', 'mean_abs_nve_pnl'):
+                cells.append(f'{val:.2f}')
+            elif stat in ('sharpe', 'pve_sharpe', 'nve_sharpe'):
+                formatted = f'{val:.2f}'
+                if stat == 'sharpe' and cls == 'all':
+                    formatted = r'\textbf{' + formatted + '}'
+                cells.append(formatted)
+            elif stat == 'cor_ls':
+                cells.append(f'{val * 100:.2f}')
+            elif stat in ('hit_ratio', 'pve_hit_ratio', 'nve_hit_ratio'):
+                cells.append(f'{val:.1f}')
+            else:
+                cells.append(f'{int(round(val)):,}')
         lines.append(' & '.join(cells) + r' \\')
 
     lines.append(r'\bottomrule')
@@ -723,7 +788,10 @@ def ref_stats_to_latex(df):
     lines.append(r'\end{table}')
     return '\n'.join(lines)
 
-ref_stats_latex = ref_stats_to_latex(ref_stats_df)
+ref_stats_latex = ref_stats_to_latex(ref_stats_t)
+
+# Bullet point for wpnl sharpe_nz
+ref_wpnl_bullet = f"\\textbf{{Stored wpnl Sharpe (nz):}} {ref_wpnl_sharpe_nz:.2f}"
 
 # --- Load and Plot wpnl from strategy cube ---
 # Load strategy cube data for wpnl slice
@@ -1892,6 +1960,12 @@ P\&L statistics computed using the reference implementation weights (hedged\_01 
 <<ref_pnl_stats, engine='python', results='asis'>>=
 print(ref_stats_latex)
 @
+
+\begin{itemize}
+<<ref_wpnl_bullet, engine='python', results='asis'>>=
+print(f"\\item {ref_wpnl_bullet}")
+@
+\end{itemize}
 
 \newpage
 \section{P\&L Stats}
