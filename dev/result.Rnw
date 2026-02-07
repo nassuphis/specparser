@@ -1230,6 +1230,169 @@ def pnl_stats_to_latex(df):
 
 pnl_stats_latex = pnl_stats_to_latex(pnl_stats_t)
 
+# --- Year-over-Year Performance Table ---
+annual_pnl = daily_pnl.groupby(daily_pnl.index.year)
+annual_rows = []
+for year, group in annual_pnl:
+    nz = group[group != 0]
+    if len(nz) < 10:
+        continue
+    ann_sharpe = (nz.mean() / nz.std()) * np.sqrt(256) if nz.std() > 0 else 0
+    ann_mean = nz.mean()
+    ann_hit = (nz > 0).sum() / len(nz) * 100
+    ann_cumsum = nz.cumsum()
+    ann_dd = (ann_cumsum.cummax() - ann_cumsum).max()
+    ann_total = nz.sum()
+    annual_rows.append({
+        'year': year, 'sharpe': ann_sharpe, 'mean_pnl': ann_mean,
+        'hit_ratio': ann_hit, 'drawdown': -ann_dd, 'total_pnl': ann_total
+    })
+annual_df = pd.DataFrame(annual_rows)
+
+def annual_to_latex(df):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Year-over-Year Performance (daily bps)}')
+    lines.append(r'\label{tab:annual_perf}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{l|rrrrr}')
+    lines.append(r'\toprule')
+    lines.append(r'Year & Sharpe & Mean P\&L & Hit (\%) & Max DD & Total P\&L \\')
+    lines.append(r'\midrule')
+    for _, row in df.iterrows():
+        cells = [
+            str(int(row['year'])),
+            f"{row['sharpe']:.2f}",
+            f"{row['mean_pnl']:.2f}",
+            f"{row['hit_ratio']:.1f}",
+            f"{int(round(row['drawdown'])):,}",
+            f"{int(round(row['total_pnl'])):,}"
+        ]
+        lines.append(' & '.join(cells) + r' \\')
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+annual_perf_latex = annual_to_latex(annual_df)
+
+# --- Signal Quality Ranking ---
+# Extract sharpe_pnl for 'all' column from signal_hedged_stats_df and rank
+signal_sharpes = signal_hedged_stats_df[
+    (signal_hedged_stats_df['name'] == 'sharpe_pnl')
+][['signal', 'all']].copy()
+signal_sharpes.columns = ['signal', 'sharpe_all']
+signal_sharpes = signal_sharpes.sort_values('sharpe_all', ascending=False).reset_index(drop=True)
+
+# Also get sharpe by asset class
+signal_rank_cols = ['commodity', 'equity', 'fx', 'rates', 'stonks', 'all']
+signal_rank_rows = []
+for _, row in signal_sharpes.iterrows():
+    sig = row['signal']
+    sig_data = signal_hedged_stats_df[
+        (signal_hedged_stats_df['signal'] == sig) & (signal_hedged_stats_df['name'] == 'sharpe_pnl')
+    ]
+    if len(sig_data) > 0:
+        r = {'signal': sig}
+        for col in signal_rank_cols:
+            r[col] = sig_data.iloc[0][col]
+        signal_rank_rows.append(r)
+signal_rank_df = pd.DataFrame(signal_rank_rows)
+
+def signal_rank_to_latex(df):
+    cols = ['commodity', 'equity', 'fx', 'rates', 'stonks', 'all']
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Signal Quality Ranking by Sharpe (hedged, all classes)}')
+    lines.append(r'\label{tab:signal_ranking}')
+    lines.append(r'\small')
+    lines.append(r'\begin{tabular}{l|rrrrr|r}')
+    lines.append(r'\toprule')
+    lines.append(r'Signal & Cmdty & Eqty & FX & Rates & Stnks & All \\')
+    lines.append(r'\midrule')
+    for _, row in df.iterrows():
+        sig_esc = row['signal'].replace('_', r'\_')
+        cells = [sig_esc]
+        for col in cols:
+            val = row[col]
+            formatted = f'{val:.2f}'
+            if col == 'all':
+                formatted = r'\textbf{' + formatted + '}'
+            cells.append(formatted)
+        lines.append(' & '.join(cells) + r' \\')
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+signal_ranking_latex = signal_rank_to_latex(signal_rank_df)
+
+# --- Tail Risk Metrics ---
+# VaR and CVaR at 95% and 99%
+def compute_tail_risk(pnl_series):
+    nz = pnl_series[pnl_series != 0]
+    if len(nz) < 10:
+        return {}
+    var95 = np.percentile(nz, 5)
+    var99 = np.percentile(nz, 1)
+    cvar95 = nz[nz <= var95].mean()
+    cvar99 = nz[nz <= var99].mean()
+    return {'var95': var95, 'var99': var99, 'cvar95': cvar95, 'cvar99': cvar99}
+
+tail_risk_rows = []
+class_order_tr = sorted([c for c in class_daily_pnl.keys() if c != 'Total']) + ['Total']
+for cls in class_order_tr:
+    tr = compute_tail_risk(class_daily_pnl[cls])
+    tr['class'] = cls
+    tail_risk_rows.append(tr)
+tail_risk_df = pd.DataFrame(tail_risk_rows)
+
+# Monthly tail risk
+monthly_total_pnl = daily_pnl.resample('ME').sum()
+monthly_total_nz = monthly_total_pnl[monthly_total_pnl != 0]
+monthly_tr = compute_tail_risk(monthly_total_nz)
+
+def tail_risk_to_latex(df, monthly_tr):
+    lines = []
+    lines.append(r'\begin{table}[H]')
+    lines.append(r'\centering')
+    lines.append(r'\caption{Tail Risk Metrics (bps)}')
+    lines.append(r'\label{tab:tail_risk}')
+    lines.append(r'\small')
+    n_cls = len(df) - 1
+    lines.append(r'\begin{tabular}{l|' + 'r' * n_cls + '|r}')
+    lines.append(r'\toprule')
+    cls_names = df['class'].tolist()
+    lines.append('Metric & ' + ' & '.join(cls_names) + r' \\')
+    lines.append(r'\midrule')
+
+    for metric, label in [('var95', 'Daily VaR (5\\%)'), ('cvar95', 'Daily CVaR (5\\%)'),
+                           ('var99', 'Daily VaR (1\\%)'), ('cvar99', 'Daily CVaR (1\\%)')]:
+        cells = [label]
+        for _, row in df.iterrows():
+            cells.append(f'{row[metric]:.1f}')
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\midrule')
+    # Monthly tail risk (only for Total)
+    for metric, label in [('var95', 'Monthly VaR (5\\%)'), ('cvar95', 'Monthly CVaR (5\\%)')]:
+        cells = [label]
+        for i in range(len(df)):
+            if df.iloc[i]['class'] == 'Total':
+                cells.append(f'{monthly_tr.get(metric, 0):.0f}')
+            else:
+                cells.append('--')
+        lines.append(' & '.join(cells) + r' \\')
+
+    lines.append(r'\bottomrule')
+    lines.append(r'\end{tabular}')
+    lines.append(r'\end{table}')
+    return '\n'.join(lines)
+
+tail_risk_latex = tail_risk_to_latex(tail_risk_df, monthly_tr)
+
 # --- P&L Recalc Error Matrix ---
 # Monthly sum of absolute errors: stored wpnl vs computed (inception-weighted hedged)
 
@@ -1890,12 +2053,34 @@ print(signal_hedged_all_latex)
 @
 
 \newpage
+\section{Signal Quality Ranking}
+
+Signals ranked by Sharpe ratio (``all'' column, descending). Sharpe computed from hedged signal weights.
+
+<<signal_ranking, engine='python', results='asis'>>=
+print(signal_ranking_latex)
+@
+
+\newpage
 \section{P\&L Stats}
 
 Summary statistics by asset class computed from daily P\&L.
 
 <<pnl_stats_out, engine='python', results='asis'>>=
 print(pnl_stats_latex)
+@
+
+<<tail_risk_out, engine='python', results='asis'>>=
+print(tail_risk_latex)
+@
+
+\newpage
+\section{Annual Performance}
+
+Year-by-year Sharpe ratio, mean daily P\&L, hit ratio, maximum drawdown, and total P\&L.
+
+<<annual_perf, engine='python', results='asis'>>=
+print(annual_perf_latex)
 @
 
 \newpage
